@@ -47,7 +47,7 @@ Out of scope: setlists and transitions, mixer UI, routing matrix, MIDI, guide-vo
 
 | ID | Specs | Route | Status | Commit |
 |----|-------|-------|--------|--------|
-| T1 | S2 (+ public domain helpers for bar and click queries in source time) | delegated (context backstop) | in progress | — |
+| T1 | S2 (+ public domain helpers for bar and click queries in source time) | delegated (context backstop) | built, verification pending | 64638b4, 1e35bd3 |
 | T2 | S3 | delegated (context backstop) | pending | — |
 | T3 | S1, S4, S5 | delegated (context backstop) | pending | — |
 | T4 | S6 | delegated (context backstop) | pending | — |
@@ -60,3 +60,4 @@ Route evidence: the parent session is past the ~150k-token context backstop. Ord
 - **L2** (2026-10-30): Decision 1 recorded in docs/architecture.md: Rust core + SwiftUI (iPhone, iPad, Mac) + Compose (Android) + Tauri with React (Windows, Linux); `uniffi` 0.32.2 (MPL-2.0) for Swift and Kotlin, `tauri` 2.12.5 (Apache-2.0 OR MIT). Implementation of this feature waits for the user's go; the shell order (S6) is the only open product decision, and it is needed only before T4.
 - **L3** (2026-10-30, user, verbatim): "Desktop first (Tauri)"
 - **L4** (2026-10-30): branch `feat/live-playback` created from `feat/core-render-pipeline` (cc2235a). Tasks reordered: T1 live transport (S2), T2 streaming (S3), T3 `app` API + `cpal` + `play-cli` (S1, S4, S5), T4 desktop shell (S6).
+- **L5** (2026-10-30): T1 delivered as 64638b4 (domain `BeatGrid`: `clicks_in`, `next_bar_line`, `bar_and_beat`; `compile` now uses it, output unchanged) and 1e35bd3 (`engine::live`: `Player::process`, `Controller` over `rtrb` 0.4.1, `StemSource` + `MemorySource`, `Status`). 125 tests; parent re-ran the suite. Live output equals `render_offline` bit-exactly with no commands, for buffer sizes 1/7/64/256/1024. Writer decisions to confirm: a queued jump overrides and switches off infinite; next bar = first bar line at or after the next frame, else section end; live loop always waits for the section end; pause/stop/resume/click ramp over 256 frames; stop, end of panic and end of arrangement reset to position 0; fade is linear, 3 s default, track stems only; click on/off affects only the generated click (a recorded click stem keeps playing — product call); back to start while playing crossfades; up to 8 overlapping tails; output rate must equal the song rate. Open for T2: `StemSource` needs a readiness query and a prefetch hint for the defer-the-jump rule. Risk: item 5 (`rtrb`), item 4 (SPSC queue is the cross-thread channel), item 3 checked (shared `compile` and mixing code refactored with unchanged output).
