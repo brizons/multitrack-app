@@ -1,14 +1,14 @@
 # Architecture Proposal — Open-Source Live Multitrack Player
 
-**Recommendation:** a Rust audio engine built as a hexagonal core, with a Flutter UI connected through `flutter_rust_bridge`. The default build uses only permissive or weak-copyleft dependencies, so the app can ship on every store, including the Apple App Store. This document supports the [MVP spec](mvp-spec.md).
+**Decision:** a Rust audio engine built as a hexagonal core, shared by a native UI per platform: SwiftUI for iPhone, iPad and Mac, Jetpack Compose for Android, and Tauri with React for Windows and Linux. The default build uses only permissive or weak-copyleft dependencies, so the app can ship on every store, including the Apple App Store. This document supports the [MVP spec](mvp-spec.md).
 
-> **Status:** Proposed. Decision 1 (stack) and Decision 5 (project license) need the maintainers' sign-off before any code is written.
+> **Status:** Decision 1 (stack) decided on 2026-10-30. Decision 5 (project license) still needs sign-off. The Rust core (`domain`, `engine`, `library`, `render-cli`) is built and reviewed on `feat/core-render-pipeline`.
 
 ## Decisions at a glance
 
 | # | Decision | Proposal | Status |
 |---|----------|----------|--------|
-| 1 | Engine and UI stack | Rust engine + Flutter UI | **Decision needed** |
+| 1 | Engine and UI stack | Rust core + native UI per platform (SwiftUI, Compose, Tauri) | Decided |
 | 2 | Engine model | One sample clock driving a compiled timeline | Proposed |
 | 3 | Threads | Real-time audio thread fed by lock-free queues | Proposed |
 | 4 | Key and tempo change (v0.2) | Offline render with Signalsmith Stretch | Proposed |
@@ -18,11 +18,12 @@
 ## System overview
 
 ```text
-┌──────────────────── Flutter UI (Dart) ────────────────────┐
-│  Library · Setlist · Performance · Mixer · Routing · MIDI │
-└──────────────┬──────────────────────────▲─────────────────┘
-      commands │                          │ state snapshots (~30 Hz)
-┌──────────────▼──────────────────────────┴─────────────────┐
+┌─ SwiftUI ───────┐ ┌─ Compose ─────────┐ ┌─ Tauri + React ─┐
+│ iPhone·iPad·Mac │ │      Android      │ │ Windows · Linux │
+└────────┬────────┘ └─────────┬─────────┘ └────────┬────────┘
+   UniFFI (Swift)      UniFFI (Kotlin)      Tauri commands
+         │                    │                    │
+┌────────▼────────────────────▼────────────────────▼─────────┐
 │  app        use cases, library, MIDI mapping, settings    │
 ├───────────────────────────────────────────────────────────┤
 │  domain     Song, Arrangement, Setlist, TempoMap,         │
@@ -36,23 +37,36 @@
      cpal          midir       file system   symphonia, signalsmith-stretch
 ```
 
-Dependencies point inward: `domain` knows nothing about audio devices, files, or Flutter. Every external system sits behind a port, so a platform adapter can be swapped without touching the engine.
+Each shell sends commands and reads state snapshots (~30 Hz) through the same `app` API. Dependencies point inward: `domain` knows nothing about audio devices, files, or any UI. Every external system sits behind a port, so a platform adapter can be swapped without touching the engine.
 
 ## Decision 1 — Engine and UI stack
 
-| Criterion | A. JUCE (C++) for everything | **B. Rust engine + Flutter UI** | C. Rust engine + Tauri (React UI) |
-|-----------|------------------------------|-------------------------------|-----------------------------------|
-| Audio I/O maturity | Best: CoreAudio, WASAPI, ASIO, ALSA, JACK, Oboe built in | Good: `cpal` covers all six platforms; mobile multichannel is less proven | Same as B |
-| MIDI (incl. mobile) | Built in, plus Bluetooth LE MIDI pairing | `midir`: CoreMIDI (iOS too), Android API 29+; no BLE pairing UI | Same as B |
-| License impact | AGPLv3 unless we buy a commercial license | Permissive (Apache, MIT, MPL) | Permissive |
+**Decided (2026-10-30): one Rust core, one native shell per platform family.**
+
+| Shell | Platforms | Language | Talks to the core through |
+|-------|-----------|----------|---------------------------|
+| `apps/apple` | iPhone, iPad, Mac (one SwiftUI multiplatform app) | Swift | UniFFI-generated Swift bindings (`uniffi` 0.32, MPL-2.0) |
+| `apps/android` | Android tablets and phones | Kotlin | UniFFI-generated Kotlin bindings |
+| `apps/desktop` | Windows, Linux | TypeScript (React) + Rust | Tauri 2 commands calling the core directly (Apache-2.0 OR MIT) |
+
+| Criterion | JUCE (C++) for everything | Rust core + one shared UI (Flutter) | **Rust core + native shells** |
+|-----------|---------------------------|-------------------------------------|-------------------------------|
+| Audio I/O maturity | Best, built in | `cpal` behind the `AudioOutput` port | Same as Flutter; native adapters are natural per shell |
+| License impact | AGPLv3 unless commercial | Permissive | Permissive |
 | Apple App Store | Blocked under AGPL | Allowed | Allowed |
-| Touch UI on tablets | Custom-drawn, more work | Strong on all six platforms | Webview; mobile support is younger |
-| Memory safety in real-time code | Manual | Enforced by the compiler | Enforced by the compiler |
-| Skills fit (React/TypeScript team) | C++ and JUCE | Rust and Dart | Rust and React |
+| Native feel and OS integration (audio session, USB permissions, Files) | Custom-drawn | Good | Best |
+| UI work | One codebase | One codebase | Three shells |
+| Feature parity | Automatic | Automatic | Must be kept on purpose |
+| Languages | C++ | Rust, Dart | Rust, Swift, Kotlin, TypeScript |
 
-**Why B:** it is the only option that keeps every store and any project license open while giving a strong touch UI on all six platforms. The audio I/O gap against JUCE is real, but it sits behind the `AudioOutput` port, so a weak platform can get a native adapter later without touching the engine.
+**Why native shells:** the best feel on each platform, natural access to platform audio and device APIs (AVAudioSession on iPhone and iPad, USB permissions on Android), and every store stays open.
 
-**What would change this:** if spike S1 or S2 (see [Risks and spikes](#risks-and-spikes)) shows that `cpal` cannot drive multichannel USB output on Android or iPadOS, write a native adapter for that platform. Moving to JUCE only makes sense if the project accepts AGPL and drops the App Store.
+**How the cost stays bounded:**
+- All behavior lives in the core: validation, timeline compilation, transport, queued jumps, mixing. The `app` crate exposes one API of commands and state snapshots; shells only render snapshots and send commands.
+- Shells share one design (the screens in the design canvas) and one set of acceptance tests written against the `app` API.
+- Shells are built one at a time: a shell starts only when the previous one plays a setlist end to end.
+
+**What would change this:** if keeping three shells in parity becomes the bottleneck, a shared UI layer (Compose Multiplatform for Android and desktop) can replace two shells without touching the core.
 
 ## Decision 2 — Engine model: one clock, compiled timeline
 
@@ -78,7 +92,7 @@ Song + Arrangement + Settings ──compile()──▶ RenderPlan
 | Audio (OS callback) | Renders the current plan: mix, click, guide, routing | Reads per-stem ring buffers (`rtrb`); publishes state through `triple_buffer` |
 | Disk | Decodes stems ahead of the playhead and prefetches jump targets | Writes the ring buffers |
 | Control | Runs use cases, compiles plans, handles MIDI input | Sends commands to the audio thread over a lock-free queue |
-| UI | Flutter; draws state snapshots | Calls the `app` API; polls snapshots at about 30 Hz |
+| UI | Native shell (SwiftUI, Compose or Tauri); draws state snapshots | Calls the `app` API; polls snapshots at about 30 Hz |
 
 Real-time checklist for every line that runs in the audio callback:
 
@@ -115,7 +129,8 @@ Render transposed and time-stretched stems **offline**, into a cache keyed by ke
 | `midir` (MIDI) | 0.11.1 | MIT | Yes |
 | `symphonia` (decoding) | 0.6.1 | MPL-2.0 | Yes |
 | `signalsmith-stretch` | 0.1.3 | MIT | Yes (v0.2) |
-| `flutter_rust_bridge` | 2.13.0 | MIT | Yes |
+| `uniffi` (Swift and Kotlin bindings) | 0.32.2 | MPL-2.0 | Yes |
+| `tauri` (desktop shell) | 2.12.5 | Apache-2.0 OR MIT | Yes |
 | `rtrb` (ring buffer) | 0.4.1 | MIT or Apache-2.0 | Yes |
 | `triple_buffer` | 9.0.0 | MPL-2.0 | Yes |
 | ASIO SDK (Windows) | — | GPLv3 or proprietary | Opt-in feature only |
@@ -136,9 +151,13 @@ crates/
   library/      song package read/write, import, transcode
   io-cpal/      AudioOutput adapter
   io-midir/     MidiInput adapter
-  app/          use cases; the API exposed to Flutter
+  app/          use cases; the one API every shell calls
+  ffi/          UniFFI bindings of `app` for Swift and Kotlin
   render-cli/   headless renderer for tests and CI
-app/            Flutter UI
+apps/
+  apple/        SwiftUI app for iPhone, iPad and Mac
+  android/      Jetpack Compose app
+  desktop/      Tauri + React app for Windows and Linux
 docs/
 ```
 
@@ -163,7 +182,7 @@ Run these before building the UI. Each one is a few days and decides whether Dec
 | S1 | Can `cpal` open 8 outputs on an Android tablet with a class-compliant USB interface? | Distinct audio on all 8 outputs on two tablets from different makers |
 | S2 | Same on iPadOS | Distinct audio on all 8 outputs |
 | S3 | Can a low-end Android tablet decode 32 FLAC stems in real time? | Under 50% of one core at 48 kHz |
-| S4 | Flutter → Rust → audio round trip for transport commands | Under 50 ms from tap to sound |
+| S4 | Shell → Rust → audio round trip for transport commands (UniFFI and Tauri commands) | Under 50 ms from tap to sound |
 
 Android USB multichannel varies by device maker, and the official Android docs still describe 1–2 channels for USB host mode. S1 is the highest risk in the project.
 
@@ -183,6 +202,6 @@ Static analysis of the shipped macOS binary, used only to understand the archite
 
 ## Next step
 
-1. Approve or amend Decisions 1 and 5.
-2. Run spikes S1–S4.
-3. Build `domain` and `render-cli` first: most of the logic, no hardware needed.
+1. Settle Decision 5 (project license).
+2. Build live playback — the `app` API, the real-time engine with `cpal`, and the first shell — as planned in [odd/tasks/live-playback.md](../odd/tasks/live-playback.md).
+3. Run spikes S1–S4 when the hardware is available (an Android tablet, an iPad and a multichannel USB interface).
