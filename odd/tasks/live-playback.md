@@ -39,7 +39,7 @@ Requirements quote `docs/mvp-spec.md` and `docs/architecture.md` verbatim. Items
 
 ### S6 — First shell (`apps/…`)
 - The Perform screen from the design canvas, reduced to: song map with playhead and queued-jump marker, section pads with Now/Next, transport, fade, hold-to-panic, jump timing toggle, loop and infinite.
-- **Decision needed:** which shell goes first. Recommendation: `apps/desktop` (Tauri + React) — it reuses the team's React skills, runs on the development Mac, and the desktop `cpal` backends are the most mature, so it validates the engine with the least platform risk. Alternative: `apps/apple` (SwiftUI), closer to the main live-use device (iPad) but adds UniFFI and audio-session work up front.
+- **Decided (L3):** the first shell is `apps/desktop` (Tauri 2 + React), developed and run on the development Mac; it ships for Windows and Linux.
 
 Out of scope: setlists and transitions, mixer UI, routing matrix, MIDI, guide-voice playback, pads, key and tempo change, the other two shells.
 
@@ -47,14 +47,16 @@ Out of scope: setlists and transitions, mixer UI, routing matrix, MIDI, guide-vo
 
 | ID | Specs | Route | Status | Commit |
 |----|-------|-------|--------|--------|
-| T1 | S1 | delegated (context backstop) | pending | — |
-| T2 | S2, S3 | delegated (context backstop) | pending | — |
-| T3 | S4, S5 | delegated (context backstop) | pending | — |
-| T4 | S6 | delegated (context backstop) | blocked on the shell decision | — |
+| T1 | S2 (+ public domain helpers for bar and click queries in source time) | delegated (context backstop) | in progress | — |
+| T2 | S3 | delegated (context backstop) | pending | — |
+| T3 | S1, S4, S5 | delegated (context backstop) | pending | — |
+| T4 | S6 | delegated (context backstop) | pending | — |
 
-Route evidence: the parent session is past the ~150k-token context backstop. T1 and T2 share the snapshot and command types, so they run sequentially; T3 needs T2's engine. Forecast: ~2,500 authored lines. Risk forecast: item 4 (concurrency: audio thread, disk thread, lock-free queues) for T2 and T3, item 5 (new crates `cpal`, `rtrb`) for T3 — each gets an independent verifier and the native review.
+Route evidence: the parent session is past the ~150k-token context backstop. Order: the live transport first (highest risk, testable offline with in-memory sources), then streaming behind the same source interface, then the `app` API with real threads, `cpal` and `play-cli`, then the shell. Each task needs the previous one, so they run sequentially. Forecast: ~2,500 authored lines. Risk forecast: item 4 (concurrency: audio thread, disk thread, lock-free queues) for T2 and T3, item 5 (new crates `cpal`, `rtrb`) for T3 — each gets an independent verifier and the native review.
 
 ## Log
 
 - **L1** (2026-10-30, user, verbatim): "Native per platform"
 - **L2** (2026-10-30): Decision 1 recorded in docs/architecture.md: Rust core + SwiftUI (iPhone, iPad, Mac) + Compose (Android) + Tauri with React (Windows, Linux); `uniffi` 0.32.2 (MPL-2.0) for Swift and Kotlin, `tauri` 2.12.5 (Apache-2.0 OR MIT). Implementation of this feature waits for the user's go; the shell order (S6) is the only open product decision, and it is needed only before T4.
+- **L3** (2026-10-30, user, verbatim): "Desktop first (Tauri)"
+- **L4** (2026-10-30): branch `feat/live-playback` created from `feat/core-render-pipeline` (cc2235a). Tasks reordered: T1 live transport (S2), T2 streaming (S3), T3 `app` API + `cpal` + `play-cli` (S1, S4, S5), T4 desktop shell (S6).
