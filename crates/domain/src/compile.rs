@@ -5,6 +5,7 @@
 
 use thiserror::Error;
 
+use crate::grid::BeatGrid;
 use crate::package::SectionType;
 use crate::song::{Section, Song};
 use crate::timeline::Timeline;
@@ -97,7 +98,8 @@ pub struct Segment {
 /// One click tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClickEvent {
-    /// Output sample of the tick.
+    /// Sample of the tick: an output sample in a [`RenderPlan`], a source
+    /// sample in [`crate::BeatGrid::clicks_in`].
     pub at: u64,
     /// Which of the four independently mixed click levels plays it (F3.2).
     pub level: ClickLevel,
@@ -169,7 +171,7 @@ pub fn compile(
         .collect();
     let segments = segments(&sections, options.seam_crossfade, song.length());
     let timeline = Timeline::new(song);
-    let clicks = clicks(&timeline, &segments);
+    let clicks = clicks(&BeatGrid::new(song), &segments);
     let cues = cues(&timeline, &sections, &segments, options);
     let length = segments
         .last()
@@ -214,16 +216,13 @@ fn segments(sections: &[&Section], seam_crossfade: u64, song_length: u64) -> Vec
 
 /// Maps the source ticks inside each segment to output positions, so clicks
 /// stay aligned with the audio after rearranging.
-fn clicks(timeline: &Timeline<'_>, segments: &[Segment]) -> Vec<ClickEvent> {
-    let ticks = timeline.ticks();
-    let mut clicks = Vec::with_capacity(ticks.len());
+fn clicks(grid: &BeatGrid, segments: &[Segment]) -> Vec<ClickEvent> {
+    let mut clicks = Vec::new();
     for segment in segments {
         let src_end = segment.src_start + segment.len;
-        let first = ticks.partition_point(|tick| tick.at < segment.src_start);
         clicks.extend(
-            ticks[first..]
+            grid.clicks_in(segment.src_start..src_end)
                 .iter()
-                .take_while(|tick| tick.at < src_end)
                 .map(|tick| ClickEvent {
                     at: segment
                         .out_start
