@@ -5,7 +5,7 @@
 //! manifest and the facts the library layer reads from the stem headers
 //! ([`StemInfo`]); it never touches files.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -206,8 +206,9 @@ struct VersionHeader {
     format_version: u32,
 }
 
-/// Longest accepted song, in hours. **Assumption:** the cap keeps the click and
-/// plan sizes bounded.
+/// Longest accepted song, and longest accepted arrangement (every repeat
+/// counted), in hours. **Assumption:** the cap keeps the click and plan sizes
+/// bounded.
 pub const MAX_SONG_HOURS: u64 = 24;
 
 /// Why a `stems[].file` path is rejected: it must stay inside the song folder.
@@ -424,6 +425,17 @@ pub enum ValidationError {
         /// The unknown section id.
         section: String,
     },
+    /// An arrangement plays longer than [`MAX_SONG_HOURS`] in total, counting
+    /// every repeat of its sections.
+    #[error(
+        "arrangement \"{arrangement}\" plays longer than {MAX_SONG_HOURS} hours ({max} samples at the package sampleRate); arrangements are limited like songs"
+    )]
+    ArrangementTooLong {
+        /// Arrangement id.
+        arrangement: String,
+        /// The longest accepted length in samples.
+        max: u64,
+    },
 }
 
 /// A finding that does not block playback.
@@ -532,6 +544,9 @@ pub fn validate(
     check_time_signature_map(&package.time_signature_map, &mut errors);
     check_sections(&package.sections, song_end, &mut errors);
     check_arrangements(package, &mut errors);
+    if let Some(song_end) = song_end {
+        check_arrangement_lengths(package, song_end, &mut errors);
+    }
 
     match (stem_lengths, song_end) {
         (Some(lengths), Some(song_end)) if errors.is_empty() => Ok(Validated {
@@ -771,6 +786,51 @@ fn check_arrangements(package: &SongPackage, errors: &mut Vec<ValidationError>) 
                     arrangement: arrangement.id.clone(),
                     section: id.clone(),
                 });
+            }
+        }
+    }
+}
+
+/// Rejects an arrangement that plays longer than [`MAX_SONG_HOURS`], so a
+/// manifest repeating a long section cannot make `compile` exhaust memory. The
+/// sum stops at the first section past the cap, so the check stays fast however
+/// many sections the arrangement lists.
+fn check_arrangement_lengths(
+    package: &SongPackage,
+    song_end: u64,
+    errors: &mut Vec<ValidationError>,
+) {
+    let max = MAX_SONG_HOURS * 3_600 * u64::from(package.sample_rate);
+    // A zero sample rate and a song over the cap are reported on their own.
+    if package.sample_rate == 0 || song_end > max {
+        return;
+    }
+    let markers = &package.sections;
+    let lengths: HashMap<&str, u64> = markers
+        .iter()
+        .enumerate()
+        .map(|(index, marker)| {
+            let end = markers
+                .get(index + 1)
+                .map_or(song_end, |next| next.start.min(song_end));
+            (marker.id.as_str(), end.saturating_sub(marker.start))
+        })
+        .collect();
+    for arrangement in &package.arrangements {
+        let mut total = 0u64;
+        // Unknown section ids are reported by `check_arrangements`.
+        for length in arrangement
+            .sections
+            .iter()
+            .filter_map(|id| lengths.get(id.as_str()))
+        {
+            total = total.saturating_add(*length);
+            if total > max {
+                errors.push(ValidationError::ArrangementTooLong {
+                    arrangement: arrangement.id.clone(),
+                    max,
+                });
+                break;
             }
         }
     }

@@ -67,10 +67,10 @@ fn positions(plan: &RenderPlan, levels: &[ClickLevel]) -> Vec<u64> {
 fn has_accent_at(plan: &RenderPlan, at: u64) -> bool {
     plan.clicks
         .iter()
-        .any(|c| c.at == at && c.level == ClickLevel::Accent)
+        .any(|c| c.at == at && c.level == ClickLevel::Downbeat)
 }
 
-const BEATS: [ClickLevel; 2] = [ClickLevel::Accent, ClickLevel::Quarter];
+const BEATS: [ClickLevel; 2] = [ClickLevel::Downbeat, ClickLevel::Beat];
 
 fn assert_contiguous(plan: &RenderPlan) {
     assert!(!plan.segments.is_empty());
@@ -173,7 +173,7 @@ fn f2_3_repeated_chorus_plays_twice_with_one_crossfaded_seam() {
             .all(|(i, c)| c.at == i as u64 * 6_000)
     );
     assert_eq!(
-        positions(&plan, &[ClickLevel::Accent]),
+        positions(&plan, &[ClickLevel::Downbeat]),
         (0..16).map(|bar| bar * 96_000).collect::<Vec<_>>()
     );
     assert!(has_accent_at(&plan, plan.segments[3].out_start));
@@ -272,17 +272,17 @@ fn constant_tempo_clicks_land_on_exact_samples() {
 
     assert_eq!(plan.clicks.len(), 32);
     assert_clicks_sorted(&plan);
-    assert_eq!(positions(&plan, &[ClickLevel::Accent]), [0, 96_000]);
+    assert_eq!(positions(&plan, &[ClickLevel::Downbeat]), [0, 96_000]);
     assert_eq!(
-        positions(&plan, &[ClickLevel::Quarter]),
+        positions(&plan, &[ClickLevel::Beat]),
         [24_000, 48_000, 72_000, 120_000, 144_000, 168_000]
     );
     assert_eq!(
-        positions(&plan, &[ClickLevel::Eighth]),
+        positions(&plan, &[ClickLevel::HalfBeat]),
         (0..8).map(|n| 12_000 + n * 24_000).collect::<Vec<_>>()
     );
     assert_eq!(
-        positions(&plan, &[ClickLevel::Sixteenth]),
+        positions(&plan, &[ClickLevel::QuarterBeat]),
         (0..16).map(|n| 6_000 + n * 12_000).collect::<Vec<_>>()
     );
 }
@@ -295,22 +295,22 @@ fn subdivisions_split_each_beat_into_eighths_and_sixteenths() {
     assert_eq!(
         plan.clicks[..9],
         [
-            click(0, ClickLevel::Accent),
-            click(6_000, ClickLevel::Sixteenth),
-            click(12_000, ClickLevel::Eighth),
-            click(18_000, ClickLevel::Sixteenth),
-            click(24_000, ClickLevel::Quarter),
-            click(30_000, ClickLevel::Sixteenth),
-            click(36_000, ClickLevel::Eighth),
-            click(42_000, ClickLevel::Sixteenth),
-            click(48_000, ClickLevel::Quarter),
+            click(0, ClickLevel::Downbeat),
+            click(6_000, ClickLevel::QuarterBeat),
+            click(12_000, ClickLevel::HalfBeat),
+            click(18_000, ClickLevel::QuarterBeat),
+            click(24_000, ClickLevel::Beat),
+            click(30_000, ClickLevel::QuarterBeat),
+            click(36_000, ClickLevel::HalfBeat),
+            click(42_000, ClickLevel::QuarterBeat),
+            click(48_000, ClickLevel::Beat),
         ]
     );
     let count = |level| plan.clicks.iter().filter(|c| c.level == level).count();
-    assert_eq!(count(ClickLevel::Accent), 1);
-    assert_eq!(count(ClickLevel::Quarter), 3);
-    assert_eq!(count(ClickLevel::Eighth), 4);
-    assert_eq!(count(ClickLevel::Sixteenth), 8);
+    assert_eq!(count(ClickLevel::Downbeat), 1);
+    assert_eq!(count(ClickLevel::Beat), 3);
+    assert_eq!(count(ClickLevel::HalfBeat), 4);
+    assert_eq!(count(ClickLevel::QuarterBeat), 8);
 }
 
 #[test]
@@ -328,11 +328,11 @@ fn clicks_follow_a_tempo_change_on_a_bar_line() {
         ]
     );
     assert_eq!(
-        positions(&plan, &[ClickLevel::Accent]),
+        positions(&plan, &[ClickLevel::Downbeat]),
         [0, 96_000, 224_000]
     );
     assert_eq!(
-        positions(&plan, &[ClickLevel::Eighth])[4..6],
+        positions(&plan, &[ClickLevel::HalfBeat])[4..6],
         [112_000, 144_000]
     );
 }
@@ -348,20 +348,20 @@ fn beat_grid_stays_continuous_across_a_mid_beat_tempo_change() {
         positions(&plan, &BEATS),
         [0, 24_000, 60_000, 108_000, 156_000, 204_000]
     );
-    assert_eq!(positions(&plan, &[ClickLevel::Accent]), [0, 156_000]);
+    assert_eq!(positions(&plan, &[ClickLevel::Downbeat]), [0, 156_000]);
     let first: Vec<(u64, ClickLevel)> = plan.clicks[..9].iter().map(|c| (c.at, c.level)).collect();
     assert_eq!(
         first,
         [
-            (0, ClickLevel::Accent),
-            (6_000, ClickLevel::Sixteenth),
-            (12_000, ClickLevel::Eighth),
-            (18_000, ClickLevel::Sixteenth),
-            (24_000, ClickLevel::Quarter),
-            (30_000, ClickLevel::Sixteenth),
-            (36_000, ClickLevel::Eighth),
-            (48_000, ClickLevel::Sixteenth),
-            (60_000, ClickLevel::Quarter),
+            (0, ClickLevel::Downbeat),
+            (6_000, ClickLevel::QuarterBeat),
+            (12_000, ClickLevel::HalfBeat),
+            (18_000, ClickLevel::QuarterBeat),
+            (24_000, ClickLevel::Beat),
+            (30_000, ClickLevel::QuarterBeat),
+            (36_000, ClickLevel::HalfBeat),
+            (48_000, ClickLevel::QuarterBeat),
+            (60_000, ClickLevel::Beat),
         ]
     );
 }
@@ -374,11 +374,11 @@ fn meter_change_restarts_bars_with_an_accent() {
         .build();
     let plan = plan(&song, "default");
     assert_eq!(
-        positions(&plan, &[ClickLevel::Accent]),
+        positions(&plan, &[ClickLevel::Downbeat]),
         [0, 96_000, 192_000, 264_000]
     );
     assert_eq!(
-        positions(&plan, &[ClickLevel::Quarter]),
+        positions(&plan, &[ClickLevel::Beat]),
         [
             24_000, 48_000, 72_000, 120_000, 144_000, 168_000, 216_000, 240_000, 288_000, 312_000
         ]
@@ -414,11 +414,11 @@ fn clicks_follow_source_positions_after_rearranging() {
         [
             ClickEvent {
                 at: 0,
-                level: ClickLevel::Sixteenth
+                level: ClickLevel::QuarterBeat
             },
             ClickEvent {
                 at: 6_000,
-                level: ClickLevel::Eighth
+                level: ClickLevel::HalfBeat
             },
         ]
     );
@@ -835,5 +835,5 @@ fn tempo_and_meter_points_far_beyond_the_song_end_do_not_panic() {
         .build();
     let plan = plan(&song, "default");
     assert_eq!(plan.clicks.len(), 5 * 16, "five bars of 4/4 at 120 bpm");
-    assert_eq!(positions(&plan, &[ClickLevel::Accent]).len(), 5);
+    assert_eq!(positions(&plan, &[ClickLevel::Downbeat]).len(), 5);
 }

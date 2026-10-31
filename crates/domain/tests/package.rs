@@ -793,6 +793,59 @@ fn rejects_songs_longer_than_24_hours() {
 }
 
 #[test]
+fn rejects_arrangements_longer_than_24_hours() {
+    let max = MAX_SONG_HOURS * 3_600 * u64::from(RATE);
+    // A 23-hour song: s2 is 23 hours minus 640 000 samples long.
+    let song_length = 23 * 3_600 * u64::from(RATE);
+    let infos = [
+        info("drums", RATE, song_length),
+        info("click", RATE, song_length),
+    ];
+    let mut package = spec_package();
+    package.arrangements.push(domain::Arrangement {
+        id: "endless".into(),
+        name: "Endless".into(),
+        sections: vec!["s2".to_owned(); 1_000_000],
+        infinite_loop: Vec::new(),
+    });
+
+    let started = Instant::now();
+    let errors = errors_of(&package, &infos);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "rejected quickly"
+    );
+    assert_eq!(
+        errors,
+        [ValidationError::ArrangementTooLong {
+            arrangement: "endless".into(),
+            max
+        }]
+    );
+    assert_message_names(&errors[0], &["\"endless\"", "24 hours"]);
+
+    // Exactly 24 hours is accepted: s2 (640 000 samples) repeated to the cap.
+    let mut package = spec_package();
+    let repeats = usize::try_from(max / 640_000).unwrap();
+    assert_eq!(max % 640_000, 0);
+    package.arrangements.push(domain::Arrangement {
+        id: "full-day".into(),
+        name: "Full day".into(),
+        sections: vec!["s2".to_owned(); repeats],
+        infinite_loop: Vec::new(),
+    });
+    assert!(validate(&package, &spec_infos()).is_ok(), "24 hours fits");
+    package.arrangements[1].sections.push("s2".to_owned());
+    assert_eq!(
+        errors_of(&package, &spec_infos()),
+        [ValidationError::ArrangementTooLong {
+            arrangement: "full-day".into(),
+            max
+        }]
+    );
+}
+
+#[test]
 fn rejects_stem_files_outside_the_song_folder() {
     let cases = [
         ("empty", "", StemPathProblem::Empty),

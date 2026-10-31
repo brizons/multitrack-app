@@ -72,13 +72,13 @@ impl Oracle {
                     break;
                 }
                 let level = if tick % per_bar == 0 {
-                    ClickLevel::Accent
+                    ClickLevel::Downbeat
                 } else if tick % 4 == 0 {
-                    ClickLevel::Quarter
+                    ClickLevel::Beat
                 } else if tick % 2 == 0 {
-                    ClickLevel::Eighth
+                    ClickLevel::HalfBeat
                 } else {
-                    ClickLevel::Sixteenth
+                    ClickLevel::QuarterBeat
                 };
                 ticks.push((numerator as f64 / denominator as f64, level));
             }
@@ -137,7 +137,7 @@ fn tempo_and_meter_changes_at_odd_positions_match_the_exact_oracle() {
         assert!(
             plan.clicks
                 .iter()
-                .any(|c| c.at == meter_at && c.level == ClickLevel::Accent),
+                .any(|c| c.at == meter_at && c.level == ClickLevel::Downbeat),
             "bars restart with an accent at {meter_at}"
         );
     }

@@ -110,12 +110,12 @@ impl<'a> Timeline<'a> {
 
 fn level_of(tick: u64, ticks_per_bar: u64) -> ClickLevel {
     if tick.is_multiple_of(ticks_per_bar) {
-        ClickLevel::Accent
+        ClickLevel::Downbeat
     } else if tick.is_multiple_of(TICKS_PER_BEAT) {
-        ClickLevel::Quarter
+        ClickLevel::Beat
     } else if tick.is_multiple_of(2) {
-        ClickLevel::Eighth
+        ClickLevel::HalfBeat
     } else {
-        ClickLevel::Sixteenth
+        ClickLevel::QuarterBeat
     }
 }

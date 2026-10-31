@@ -107,17 +107,17 @@ pub struct ClickEvent {
 /// denominator note, so a beat is one denominator note: the levels are the bar
 /// start, the other beats, the half-beats, and the quarter-beats. In 4/4 they
 /// are the accent, quarter, eighth, and sixteenth notes of F3.2; in 6/8 a
-/// `Quarter` tick falls on every eighth note.
+/// `Beat` tick falls on every eighth note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ClickLevel {
-    /// Beat 1 of a bar.
-    Accent,
+    /// Beat 1 of a bar (the accent).
+    Downbeat,
     /// Every other beat.
-    Quarter,
+    Beat,
     /// Halfway between two beats.
-    Eighth,
+    HalfBeat,
     /// A quarter and three quarters of the way between two beats.
-    Sixteenth,
+    QuarterBeat,
 }
 
 /// One guide cue announcing a section.
@@ -158,12 +158,14 @@ pub fn compile(
             .ok_or_else(|| CompileError::UnknownArrangement {
                 id: arrangement_id.to_owned(),
             })?;
-    // `validate` guarantees the arrangement is not empty and every reference
-    // resolves, so nothing is skipped.
     let sections: Vec<&Section> = arrangement
         .sections
         .iter()
-        .filter_map(|id| song.section(id))
+        .map(|id| {
+            song.section(id).expect(
+                "`validate` guarantees every arrangement section id names a section of the song",
+            )
+        })
         .collect();
     let segments = segments(&sections, options.seam_crossfade, song.length());
     let timeline = Timeline::new(song);
