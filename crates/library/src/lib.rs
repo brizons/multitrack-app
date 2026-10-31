@@ -8,9 +8,11 @@
 #![warn(missing_docs)]
 
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{self, BufReader};
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter};
+use std::path::{Component, Path, PathBuf};
+use std::process;
 
 use domain::{
     ManifestError, Song, SongPackage, Stem, StemInfo, ValidationError, ValidationWarning, validate,
@@ -58,6 +60,16 @@ pub enum LoadError {
     /// The package breaks one or more rules; every problem is listed.
     #[error("the song package has {} problem(s)", .0.len())]
     Invalid(Vec<SongProblem>),
+    /// A stem's samples do not fit in memory.
+    #[error("stem \"{id}\" file \"{file}\" has {samples} samples, more than fit in memory")]
+    StemTooLarge {
+        /// Stem id.
+        id: String,
+        /// Stem file, as in the manifest.
+        file: String,
+        /// Samples to decode.
+        samples: u64,
+    },
     /// A stem passed validation but its audio could not be decoded.
     #[error("stem \"{id}\" file \"{file}\" cannot be decoded: {source}")]
     Decode {
@@ -118,7 +130,22 @@ pub enum WriteError {
         /// Number of samples given.
         samples: usize,
     },
-    /// The file could not be created or written.
+    /// The audio does not fit in a WAV file, whose sizes are 32-bit.
+    #[error(
+        "the render is {frames} frames ({}) long, but a WAV file holds at most 4 GiB of audio: {max_frames} frames of stereo 32-bit float, {} at {sample_rate} Hz",
+        minutes_seconds(*frames, *sample_rate),
+        minutes_seconds(*max_frames, *sample_rate)
+    )]
+    TooLong {
+        /// Frames to write.
+        frames: u64,
+        /// [`MAX_WAV_STEREO_F32_FRAMES`].
+        max_frames: u64,
+        /// Sample rate of the audio.
+        sample_rate: u32,
+    },
+    /// The file could not be created or written. An existing file at `path`
+    /// is left as it was.
     #[error("cannot write {}: {source}", path.display())]
     Wav {
         /// Output path.
@@ -154,14 +181,16 @@ pub fn load_song(dir: &Path) -> Result<LoadedSong, LoadError> {
     let mut readers = Vec::with_capacity(package.stems.len());
     for stem in &package.stems {
         match open_stem(&folder, stem) {
-            Ok(reader) => {
+            Ok(Some(opened)) => {
                 infos.push(StemInfo {
                     id: stem.id.clone(),
-                    sample_rate: reader.spec().sample_rate,
-                    length_samples: u64::from(reader.duration()),
+                    sample_rate: opened.reader.spec().sample_rate,
+                    length_samples: u64::from(opened.reader.duration()),
                 });
-                readers.push(Some(reader));
+                readers.push(Some(opened));
             }
+            // `validate` reports the path; nothing was touched on disk.
+            Ok(None) => readers.push(None),
             Err(problem) => {
                 file_problems.push(problem);
                 readers.push(None);
@@ -190,9 +219,26 @@ pub fn load_song(dir: &Path) -> Result<LoadedSong, LoadError> {
 
 type StemReader = WavReader<BufReader<File>>;
 
-/// Opens the stem's WAV file after checking that it resolves inside `folder`
-/// (already canonical) and that its format is supported.
-fn open_stem(folder: &Path, stem: &Stem) -> Result<StemReader, SongProblem> {
+/// A stem file that passed every check, open for decoding.
+struct OpenedStem {
+    reader: StemReader,
+    /// Most samples the file can hold, from its size on disk.
+    max_samples: u64,
+}
+
+/// Opens the stem's WAV file after these checks, in order:
+///
+/// 1. Its path is relative with no `..` component, as this platform reads
+///    paths. Nothing on disk is touched before this check; a path that fails
+///    it returns `None` and [`domain::validate`] reports it.
+/// 2. It resolves, symlinks included, inside `folder` (already canonical).
+/// 3. It is a regular file, so opening it cannot block (a FIFO would).
+///
+/// Then the file is opened and its format checked.
+fn open_stem(folder: &Path, stem: &Stem) -> Result<Option<OpenedStem>, SongProblem> {
+    if !is_plain_relative(&stem.file) {
+        return Ok(None);
+    }
     let unreadable = |reason: String| SongProblem::StemUnreadable {
         id: stem.id.clone(),
         file: stem.file.clone(),
@@ -206,7 +252,27 @@ fn open_stem(folder: &Path, stem: &Stem) -> Result<StemReader, SongProblem> {
             file: stem.file.clone(),
         });
     }
-    let reader = WavReader::open(&resolved).map_err(|error| unreadable(error.to_string()))?;
+    let checked = fs::metadata(&resolved).map_err(|error| unreadable(error.to_string()))?;
+    if !checked.is_file() {
+        return Err(unreadable("it is not a regular file".to_owned()));
+    }
+    // Remaining window: a folder entry on `resolved` could be swapped for a
+    // symlink between the checks above and this open. The standard library
+    // cannot open a path relative to a folder handle without following
+    // symlinks (that needs `openat2` with `RESOLVE_BENEATH` or similar), so a
+    // swap to a FIFO can still block here. A swap to another file is caught
+    // below by comparing the opened file with the checked one.
+    let file = File::open(&resolved).map_err(|error| unreadable(error.to_string()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| unreadable(error.to_string()))?;
+    if !opened.is_file() || !same_file(&checked, &opened) {
+        return Err(unreadable(
+            "it changed while it was being opened".to_owned(),
+        ));
+    }
+    let reader =
+        WavReader::new(BufReader::new(file)).map_err(|error| unreadable(error.to_string()))?;
     let spec = reader.spec();
     let supported = matches!(
         (spec.sample_format, spec.bits_per_sample),
@@ -219,7 +285,36 @@ fn open_stem(folder: &Path, stem: &Stem) -> Result<StemReader, SongProblem> {
             format: describe(spec),
         });
     }
-    Ok(reader)
+    let bytes_per_sample = u64::from(spec.bits_per_sample.div_ceil(8));
+    Ok(Some(OpenedStem {
+        reader,
+        max_samples: opened.len() / bytes_per_sample,
+    }))
+}
+
+/// Whether `file` is a non-empty relative path whose components are all plain
+/// names (or `.`): no root, drive, or `..`, as this platform reads it. The
+/// cross-platform rule, with `\` as a separator everywhere, is
+/// [`domain::validate`]'s.
+fn is_plain_relative(file: &str) -> bool {
+    !file.is_empty()
+        && Path::new(file)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+}
+
+/// Whether two metadata snapshots describe the same file.
+#[cfg(unix)]
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Whether two metadata snapshots describe the same file; without file
+/// identities in the standard library, compare size and modification time.
+#[cfg(not(unix))]
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.len() == b.len() && a.modified().ok() == b.modified().ok()
 }
 
 /// A WAV format in words, such as "8-bit integer, 1 channel".
@@ -279,7 +374,11 @@ fn problem_stem(problem: &SongProblem) -> Option<&str> {
 
 /// Decodes a supported WAV stem to interleaved `f32`: integer samples are
 /// divided by `2^(bits - 1)`, float samples are kept as they are.
-fn decode(stem: &Stem, mut reader: StemReader) -> Result<StemAudio, LoadError> {
+fn decode(stem: &Stem, opened: OpenedStem) -> Result<StemAudio, LoadError> {
+    let OpenedStem {
+        mut reader,
+        max_samples,
+    } = opened;
     let spec = reader.spec();
     let frames = u64::from(reader.duration());
     let decode_error = |source| LoadError::Decode {
@@ -287,7 +386,18 @@ fn decode(stem: &Stem, mut reader: StemReader) -> Result<StemAudio, LoadError> {
         file: stem.file.clone(),
         source,
     };
-    let mut samples = Vec::with_capacity(reader.len() as usize);
+    // A header can claim more samples than its file holds: reserve no more
+    // than the file can contain, and fail cleanly if even that does not fit.
+    let capacity = u64::from(reader.len()).min(max_samples);
+    let mut samples = Vec::new();
+    usize::try_from(capacity)
+        .ok()
+        .and_then(|capacity| samples.try_reserve_exact(capacity).ok())
+        .ok_or_else(|| LoadError::StemTooLarge {
+            id: stem.id.clone(),
+            file: stem.file.clone(),
+            samples: capacity,
+        })?;
     match spec.sample_format {
         SampleFormat::Int => {
             // 2^-(bits - 1) is exact in f32, so the division adds no rounding.
@@ -311,7 +421,43 @@ fn decode(stem: &Stem, mut reader: StemReader) -> Result<StemAudio, LoadError> {
     })
 }
 
+/// Bytes before the samples in the files [`write_wav_stereo_f32`] writes: the
+/// RIFF header, a `WAVE_FORMAT_EXTENSIBLE` fmt chunk, and the data chunk header.
+const WAV_HEADER_BYTES: u64 = 68;
+
+/// Bytes per stereo 32-bit float frame.
+const STEREO_F32_FRAME_BYTES: u64 = 8;
+
+/// Most frames a stereo 32-bit float WAV file can hold. The RIFF chunk size
+/// (the file size minus 8 bytes) is stored in 32 bits, so header and samples
+/// together must stay within 4 GiB.
+pub const MAX_WAV_STEREO_F32_FRAMES: u64 =
+    (u32::MAX as u64 - (WAV_HEADER_BYTES - 8)) / STEREO_F32_FRAME_BYTES;
+
+/// Checks that `frames` of stereo 32-bit float audio fit in a WAV file, so a
+/// render can be rejected before any audio is produced.
+pub fn check_wav_stereo_f32_frames(frames: u64, sample_rate: u32) -> Result<(), WriteError> {
+    if frames > MAX_WAV_STEREO_F32_FRAMES {
+        return Err(WriteError::TooLong {
+            frames,
+            max_frames: MAX_WAV_STEREO_F32_FRAMES,
+            sample_rate,
+        });
+    }
+    Ok(())
+}
+
+/// `frames` at `sample_rate` as `m:ss`, rounded down.
+fn minutes_seconds(frames: u64, sample_rate: u32) -> String {
+    let seconds = frames / u64::from(sample_rate.max(1));
+    format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
 /// Writes interleaved stereo `samples` as a 32-bit float WAV file.
+///
+/// The samples go to a temporary file in the same folder, which is flushed to
+/// disk and then renamed over `path`. If anything fails, the temporary file is
+/// removed and an existing file at `path` is left byte-identical.
 pub fn write_wav_stereo_f32(
     path: &Path,
     sample_rate: u32,
@@ -322,19 +468,91 @@ pub fn write_wav_stereo_f32(
             samples: samples.len(),
         });
     }
+    check_wav_stereo_f32_frames(samples.len() as u64 / 2, sample_rate)?;
+    let wav_error = |source| WriteError::Wav {
+        path: path.to_owned(),
+        source,
+    };
+    let (temporary, file) = Temporary::create_beside(path)
+        .map_err(hound::Error::IoError)
+        .map_err(wav_error)?;
+    write_samples(file, sample_rate, samples).map_err(wav_error)?;
+    temporary
+        .rename_to(path)
+        .map_err(hound::Error::IoError)
+        .map_err(wav_error)
+}
+
+/// Writes the WAV file, flushes it to disk, and closes it.
+fn write_samples(mut file: File, sample_rate: u32, samples: &[f32]) -> hound::Result<()> {
     let spec = WavSpec {
         channels: 2,
         sample_rate,
         bits_per_sample: 32,
         sample_format: SampleFormat::Float,
     };
-    let wav_error = |source| WriteError::Wav {
-        path: path.to_owned(),
-        source,
-    };
-    let mut writer = WavWriter::create(path, spec).map_err(wav_error)?;
+    let mut writer = WavWriter::new(BufWriter::new(&mut file), spec)?;
     for &sample in samples {
-        writer.write_sample(sample).map_err(wav_error)?;
+        writer.write_sample(sample)?;
     }
-    writer.finalize().map_err(wav_error)
+    writer.finalize()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// The path of a file being written next to its final path; the file is
+/// removed on drop unless it was renamed into place.
+struct Temporary {
+    path: PathBuf,
+    renamed: bool,
+}
+
+impl Temporary {
+    /// Creates `.<name>.<pid>-<n>.tmp` in the folder of `target`, never
+    /// reusing an existing file.
+    fn create_beside(target: &Path) -> io::Result<(Self, File)> {
+        let name = target.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "the path has no file name")
+        })?;
+        let folder = match target.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let mut last_error = None;
+        for attempt in 0..100 {
+            let mut temporary_name = OsString::from(".");
+            temporary_name.push(name);
+            temporary_name.push(format!(".{}-{attempt}.tmp", process::id()));
+            let path = folder.join(temporary_name);
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    let temporary = Self {
+                        path,
+                        renamed: false,
+                    };
+                    return Ok((temporary, file));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::other("no free temporary file name")))
+    }
+
+    /// Renames the (closed) file over `target`.
+    fn rename_to(mut self, target: &Path) -> io::Result<()> {
+        fs::rename(&self.path, target)?;
+        self.renamed = true;
+        Ok(())
+    }
+}
+
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        if !self.renamed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }

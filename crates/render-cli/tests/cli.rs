@@ -2,7 +2,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use domain::{
     Arrangement, SectionMarker, SectionType, SongPackage, Stem, StemRole, TempoPoint,
@@ -17,9 +18,22 @@ const LENGTH: usize = 32_000;
 /// A song folder with an `intro` and a `verse` (one bar each), the Default
 /// arrangement and a `reversed` one, and two stems of `LENGTH` frames.
 fn song_folder(dir: &Path, drums: &[i32]) -> PathBuf {
+    write_song(dir, &package(), drums, LENGTH)
+}
+
+/// Writes `package` with a `drums` stem holding `drums` and a silent `bass`
+/// stem of `bass_frames` frames.
+fn write_song(dir: &Path, package: &SongPackage, drums: &[i32], bass_frames: usize) -> PathBuf {
     let song = dir.join("song");
     fs::create_dir_all(song.join("stems")).unwrap();
-    let package = SongPackage {
+    fs::write(song.join("song.json"), package.to_json().unwrap()).unwrap();
+    write_wav(&song.join("stems/drums.wav"), drums);
+    write_wav(&song.join("stems/bass.wav"), &vec![0; bass_frames]);
+    song
+}
+
+fn package() -> SongPackage {
+    SongPackage {
         format_version: 1,
         title: "Cli Test".to_owned(),
         artist: None,
@@ -40,11 +54,7 @@ fn song_folder(dir: &Path, drums: &[i32]) -> PathBuf {
             arrangement("default", &["intro", "verse"]),
             arrangement("reversed", &["verse", "intro", "verse"]),
         ],
-    };
-    fs::write(song.join("song.json"), package.to_json().unwrap()).unwrap();
-    write_wav(&song.join("stems/drums.wav"), drums);
-    write_wav(&song.join("stems/bass.wav"), &vec![0; LENGTH]);
-    song
+    }
 }
 
 fn stem(id: &str) -> Stem {
@@ -93,6 +103,16 @@ fn render_cli(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("render-cli runs")
+}
+
+/// File names in `dir`, sorted.
+fn entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
 }
 
 fn path(path: &Path) -> &str {
@@ -315,4 +335,135 @@ fn help_describes_every_flag() {
             "help does not mention {part:?}:\n{help}"
         );
     }
+}
+
+#[test]
+fn a_rejected_command_leaves_an_existing_output_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let song = song_folder(dir.path(), &vec![0; LENGTH]);
+    let out = dir.path().join("out.wav");
+    fs::write(&out, "previous render").unwrap();
+
+    let unknown = render_cli(&[path(&song), "--output", path(&out), "--arrangement", "nope"]);
+    let bogus = render_cli(&[path(&song), "--output", path(&out), "--bogus"]);
+
+    assert_eq!(unknown.status.code(), Some(1));
+    assert_eq!(bogus.status.code(), Some(2));
+    assert_eq!(fs::read(&out).unwrap(), b"previous render");
+    assert_eq!(entries(dir.path()), ["out.wav", "song"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_write_leaves_an_existing_output_untouched_and_no_partial_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let song = song_folder(dir.path(), &vec![1_000; LENGTH]);
+    let out = dir.path().join("out.wav");
+    let first = render_cli(&[path(&song), "--output", path(&out)]);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+    let before = fs::read(&out).unwrap();
+    let entries_before = entries(dir.path());
+
+    // A 1-block file size limit makes the write fail with EFBIG.
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"trap "" XFSZ; ulimit -f 1; exec "$0" "$@""#)
+        .arg(env!("CARGO_BIN_EXE_render-cli"))
+        .args([
+            path(&song),
+            "--output",
+            path(&out),
+            "--arrangement",
+            "reversed",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).starts_with("error: cannot write"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fs::read(&out).unwrap(), before, "the old render is intact");
+    assert_eq!(entries(dir.path()), entries_before, "no partial file");
+}
+
+#[test]
+fn an_output_over_the_wav_size_limit_is_rejected_before_rendering() {
+    // 6 711 repeats of a 10 s section at 8 kHz: 536 910 000 frames, inside the
+    // 24-hour cap but over the 4 GiB a WAV file can hold.
+    let mut package = package();
+    package.sections.truncate(1);
+    package.arrangements = vec![
+        arrangement("default", &["intro"]),
+        arrangement("marathon", &["intro"; 6_711]),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let song = write_song(dir.path(), &package, &vec![0; 80_000], 80_000);
+    let out = dir.path().join("out.wav");
+
+    let started = Instant::now();
+    let output = render_cli(&[
+        path(&song),
+        "--output",
+        path(&out),
+        "--arrangement",
+        "marathon",
+    ]);
+
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "rejected before rendering"
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    let errors = stderr(&output);
+    assert_eq!(errors.lines().count(), 1, "{errors}");
+    assert!(errors.starts_with("error: "), "{errors}");
+    assert!(
+        errors.contains("1118:28 at 8000 Hz"),
+        "names the longest duration: {errors}"
+    );
+    assert!(!out.exists());
+    assert_eq!(entries(dir.path()), ["song"]);
+}
+
+#[test]
+fn control_characters_in_the_title_keep_the_summary_on_one_line() {
+    let mut package = package();
+    package.title = "Two\nLines\tand \u{1b} escape".to_owned();
+    let dir = tempfile::tempdir().unwrap();
+    let song = write_song(dir.path(), &package, &vec![0; LENGTH], LENGTH);
+    let out = dir.path().join("out.wav");
+
+    let output = render_cli(&[path(&song), "--output", path(&out)]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let summary = stdout(&output);
+    assert_eq!(summary.lines().count(), 1, "{summary:?}");
+    assert!(
+        summary.starts_with(r#"rendered "Two\nLines\tand \u{1b} escape" (arrangement"#),
+        "{summary:?}"
+    );
+}
+
+#[test]
+fn a_closed_stdout_does_not_panic_once_the_file_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let song = song_folder(dir.path(), &vec![0; LENGTH]);
+    let out = dir.path().join("out.wav");
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_render-cli"))
+        .args([path(&song), "--output", path(&out)])
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stderr(&output), "");
+    assert_eq!(read_wav(&out).len(), 2 * LENGTH);
 }

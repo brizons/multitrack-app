@@ -6,13 +6,14 @@
 
 #![forbid(unsafe_code)]
 
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
 use domain::{CompileOptions, DEFAULT_ARRANGEMENT_ID, RenderPlan, compile};
 use engine::{ClickSettings, MixSettings, audible_click_count, render_offline};
-use library::{LoadError, load_song, write_wav_stereo_f32};
+use library::{LoadError, check_wav_stereo_f32_frames, load_song, write_wav_stereo_f32};
 
 /// Render a song package offline to a stereo 32-bit float WAV file.
 #[derive(Debug, Parser)]
@@ -40,25 +41,49 @@ fn main() -> ExitCode {
     let args = Args::parse();
     match run(&args) {
         Ok(summary) => {
-            println!("{summary}");
+            // The file is written: a closed stdout does not make this a failure.
+            print_line(&mut io::stdout().lock(), &summary);
             ExitCode::SUCCESS
         }
         Err(errors) => {
+            let mut stderr = io::stderr().lock();
             for error in errors {
-                eprintln!("error: {error}");
+                print_line(&mut stderr, &format!("error: {error}"));
             }
             ExitCode::from(1)
         }
     }
 }
 
+/// Writes `text` as one line, with control characters (newlines included)
+/// escaped. Write errors, such as a closed pipe, are ignored: the exit code
+/// already says how the run went.
+fn print_line(out: &mut impl Write, text: &str) {
+    let line: String = text
+        .chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect();
+    let _ = writeln!(out, "{line}");
+}
+
 /// Renders as `args` asks and returns the summary line, or every error.
 fn run(args: &Args) -> Result<String, Vec<String>> {
     let loaded = load_song(&args.song_dir).map_err(load_errors)?;
+    let mut stderr = io::stderr().lock();
     for warning in &loaded.warnings {
-        eprintln!("warning: {warning}");
+        print_line(&mut stderr, &format!("warning: {warning}"));
     }
+    drop(stderr);
     let plan = compile(&loaded.song, &args.arrangement, &CompileOptions::default())
+        .map_err(|error| vec![error.to_string()])?;
+    // Reject before rendering: the output buffer would be as large as the file.
+    check_wav_stereo_f32_frames(plan.length, plan.sample_rate)
         .map_err(|error| vec![error.to_string()])?;
     let settings = MixSettings {
         click: ClickSettings {

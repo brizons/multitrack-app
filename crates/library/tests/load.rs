@@ -346,3 +346,94 @@ fn writes_stereo_32_bit_float_wav() {
     let error = write_wav_stereo_f32(&missing, 44_100, &samples).unwrap_err();
     assert!(error.to_string().contains("out.wav"), "{error}");
 }
+
+/// Runs `load_song` on another thread and gives up after five seconds, so a
+/// loader that opens a FIFO (and blocks) fails the test instead of hanging it.
+#[cfg(unix)]
+fn load_within_five_seconds(path: &std::path::Path) -> Result<library::LoadedSong, LoadError> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let path = path.to_owned();
+    std::thread::spawn(move || {
+        let _ = sender.send(load_song(&path));
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("load_song returns without opening a FIFO")
+}
+
+#[cfg(unix)]
+fn mkfifo(path: &std::path::Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "mkfifo {}", path.display());
+}
+
+#[cfg(unix)]
+#[test]
+fn escaping_stem_paths_are_rejected_without_opening_the_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("outside.fifo");
+    mkfifo(&fifo);
+    let song = dir.path().join("song");
+    fs::create_dir_all(song.join("stems")).unwrap();
+    symlink(&fifo, song.join("stems/link.wav")).unwrap();
+    let absolute = fifo.to_str().unwrap().to_owned();
+    write_manifest(
+        &song,
+        &manifest(
+            RATE,
+            &[
+                ("parent", "../outside.fifo", StemRole::Track),
+                ("absolute", &absolute, StemRole::Track),
+                ("link", "stems/link.wav", StemRole::Track),
+            ],
+        ),
+    );
+
+    let problems = problems(load_within_five_seconds(&song).unwrap_err());
+
+    let mut found: Vec<(String, &str)> = problems
+        .iter()
+        .map(|problem| match problem {
+            SongProblem::Validation(ValidationError::InvalidStemPath { id, .. }) => {
+                (id.clone(), "invalid path")
+            }
+            SongProblem::StemOutsideFolder { id, .. } => (id.clone(), "outside"),
+            other => panic!("unexpected problem {other}"),
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            ("absolute".to_owned(), "invalid path"),
+            ("link".to_owned(), "outside"),
+            ("parent".to_owned(), "invalid path"),
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_inside_the_song_folder_is_rejected_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    mkfifo(&path.join("pipe.wav"));
+    write_manifest(
+        path,
+        &manifest(RATE, &[("pipe", "pipe.wav", StemRole::Track)]),
+    );
+
+    let problems = problems(load_within_five_seconds(path).unwrap_err());
+
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        matches!(&problems[0], SongProblem::StemUnreadable { id, reason, .. }
+            if id == "pipe" && reason.contains("not a regular file")),
+        "{problems:?}"
+    );
+}
