@@ -98,8 +98,7 @@ pub struct Segment {
 /// One click tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClickEvent {
-    /// Sample of the tick: an output sample in a [`RenderPlan`], a source
-    /// sample in [`crate::BeatGrid::clicks_in`].
+    /// Output sample of the tick (source ticks are [`crate::SourceClick`]).
     pub at: u64,
     /// Which of the four independently mixed click levels plays it (F3.2).
     pub level: ClickLevel,
@@ -194,12 +193,14 @@ fn segments(sections: &[&Section], seam_crossfade: u64, song_length: u64) -> Vec
         let len = section.length();
         let mut fade_in = 0;
         if let Some(outgoing) = segments.last_mut() {
-            let outgoing_end = outgoing.src_start + outgoing.len;
-            if outgoing_end != section.start {
-                let source_left = song_length.saturating_sub(outgoing_end);
-                fade_in = seam_crossfade.min(len).min(source_left);
-                outgoing.fade_out = fade_in;
-            }
+            fade_in = seam_fade(
+                seam_crossfade,
+                outgoing.src_start + outgoing.len,
+                section.start,
+                len,
+                song_length,
+            );
+            outgoing.fade_out = fade_in;
         }
         segments.push(Segment {
             section_id: section.id.clone(),
@@ -212,6 +213,26 @@ fn segments(sections: &[&Section], seam_crossfade: u64, song_length: u64) -> Vec
         out_start = out_start.saturating_add(len);
     }
     segments
+}
+
+/// Length of the crossfade at a seam (see [`Segment`]): 0 when the incoming
+/// section starts at `outgoing_end`, where the outgoing one stopped reading;
+/// otherwise `crossfade`, capped by the incoming length and by the source
+/// audio left after `outgoing_end`. `compile` and the live player both use it.
+pub fn seam_fade(
+    crossfade: u64,
+    outgoing_end: u64,
+    incoming_start: u64,
+    incoming_len: u64,
+    song_length: u64,
+) -> u64 {
+    if outgoing_end == incoming_start {
+        0
+    } else {
+        crossfade
+            .min(incoming_len)
+            .min(song_length.saturating_sub(outgoing_end))
+    }
 }
 
 /// Maps the source ticks inside each segment to output positions, so clicks

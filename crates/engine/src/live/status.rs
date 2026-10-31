@@ -50,6 +50,20 @@ pub struct QueuedJump {
     /// Output frame where it executes, given the current position and jump
     /// timing.
     pub executes_at: u64,
+    /// Boundaries it has already passed because a source did not have the
+    /// target ready.
+    pub deferrals: u32,
+}
+
+/// Where the click the musicians hear comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickSource {
+    /// Synthesized from the tempo map; [`super::Command::SetClick`] turns it
+    /// on and off.
+    Generated,
+    /// The song's `click` stem, which plays like any other stem;
+    /// [`super::Command::SetClick`] does not affect it.
+    Recorded,
 }
 
 /// Where the fade of the `track` stems stands.
@@ -98,6 +112,8 @@ pub struct Status {
     pub fade: FadeStatus,
     /// Whether the generated click is on.
     pub click: bool,
+    /// Whether the song's click is generated or a recorded stem.
+    pub click_source: ClickSource,
     /// Reads a stem source could not serve; each one played silence for
     /// that stem.
     pub underruns: u64,

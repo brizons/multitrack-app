@@ -82,7 +82,7 @@ Song + Arrangement + Settings ──compile()──▶ RenderPlan
 |------|-------------|
 | One sample counter drives every stem reader. | Zero drift between stems by construction. |
 | `compile()` is a pure function. | It can be unit- and property-tested without audio. |
-| A live change (jump, loop, fade) recompiles the plan from a boundary and swaps it at that boundary sample. | Live edits are sample-exact and never touch audio mid-buffer. |
+| A live change (jump, loop, fade) takes effect at a boundary sample: the live player walks the arrangement and applies the same seam rule as `compile` (`domain::seam_fade`), so with no live change it reproduces the compiled plan bit for bit. | Live edits are sample-exact and never touch audio mid-buffer. |
 | A queued jump starts prefetching the target audio right away; if it is not ready at the boundary, the jump moves to the next boundary. | The engine never plays silence or glitches to honor a jump. |
 
 ## Decision 3 — Threads and real-time rules

@@ -7,7 +7,7 @@ mod common;
 use common::{RATE, SongSpec, info, marker};
 use domain::{
     BarBeat, BeatGrid, ClickEvent, ClickLevel, CompileOptions, RenderPlan, SectionType, Song,
-    compile, validate,
+    SourceClick, compile, validate,
 };
 
 const BAR: u64 = 96_000;
@@ -62,7 +62,7 @@ fn clicks_in_the_whole_song_equal_the_default_plan_clicks() {
     let grid = BeatGrid::new(&song);
     let plan = plan(&song, "default");
 
-    assert_eq!(grid.clicks_in(0..song.length()), plan.clicks.as_slice());
+    assert_eq!(mapped(&grid, 0..song.length(), 0), plan.clicks);
     assert!(grid.clicks_in(5..5).is_empty());
     assert!(grid.clicks_in(song.length()..u64::MAX).is_empty());
 }
@@ -101,10 +101,13 @@ fn clicks_in_a_partial_range_keep_only_the_ticks_inside_it() {
     for _ in 0..500 {
         let start = rng.next(song.length());
         let end = start + rng.next(3 * BAR);
-        let expected: Vec<ClickEvent> = all
+        let expected: Vec<SourceClick> = all
             .iter()
             .filter(|click| (start..end).contains(&click.at))
-            .copied()
+            .map(|click| SourceClick {
+                at: click.at,
+                level: click.level,
+            })
             .collect();
         assert_eq!(
             grid.clicks_in(start..end),

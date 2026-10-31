@@ -2,6 +2,8 @@
 //!
 //! [`load_song`] reads a song folder (`song.json` plus WAV stems), validates it
 //! with the `domain` crate, and decodes every stem to `f32` for the engine.
+//! [`open_streaming`] checks the same folder but streams the stems from disk
+//! for the live player, with memory that does not grow with song length.
 //! [`write_wav_stereo_f32`] writes a rendered mix.
 
 #![forbid(unsafe_code)]
@@ -15,11 +17,16 @@ use std::path::{Component, Path, PathBuf};
 use std::process;
 
 use domain::{
-    ManifestError, Song, SongPackage, Stem, StemInfo, ValidationError, ValidationWarning, validate,
+    ManifestError, Song, SongPackage, Stem, StemInfo, Validated, ValidationError,
+    ValidationWarning, validate,
 };
 use engine::StemAudio;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use thiserror::Error;
+
+mod stream;
+
+pub use stream::{DiskMonitor, Gate, StreamCapacity, StreamConfig, StreamingSong, open_streaming};
 
 /// Name of the manifest inside a song folder.
 pub const MANIFEST_FILE: &str = "song.json";
@@ -79,6 +86,12 @@ pub enum LoadError {
         file: String,
         /// The decoder error.
         source: hound::Error,
+    },
+    /// The thread that streams the stems could not be started.
+    #[error("cannot start the disk thread: {source}")]
+    DiskThread {
+        /// The error from the operating system.
+        source: io::Error,
     },
 }
 
@@ -165,6 +178,21 @@ pub enum WriteError {
 /// second time as missing its audio information, and a stem whose path breaks
 /// the package rules reports only that rule.
 pub fn load_song(dir: &Path) -> Result<LoadedSong, LoadError> {
+    let (validated, opened) = open_package(dir)?;
+    let stems = opened
+        .into_iter()
+        .map(|(stem, opened)| decode(&stem, opened))
+        .collect::<Result<_, _>>()?;
+    Ok(LoadedSong {
+        song: validated.song,
+        warnings: validated.warnings,
+        stems,
+    })
+}
+
+/// Reads and validates the song folder `dir` as [`load_song`] describes, and
+/// opens every stem file, in package order, without decoding it.
+fn open_package(dir: &Path) -> Result<(Validated, Vec<(Stem, OpenedStem)>), LoadError> {
     let manifest_path = dir.join(MANIFEST_FILE);
     let json = fs::read_to_string(&manifest_path).map_err(|source| LoadError::ReadManifest {
         path: manifest_path,
@@ -200,17 +228,14 @@ pub fn load_song(dir: &Path) -> Result<LoadedSong, LoadError> {
 
     match validate(&package, &infos) {
         Ok(validated) if file_problems.is_empty() => {
-            let stems = package
+            // Without problems every stem passed its file checks.
+            let opened = package
                 .stems
-                .iter()
+                .into_iter()
                 .zip(readers)
-                .filter_map(|(stem, reader)| reader.map(|reader| decode(stem, reader)))
-                .collect::<Result<_, _>>()?;
-            Ok(LoadedSong {
-                song: validated.song,
-                warnings: validated.warnings,
-                stems,
-            })
+                .filter_map(|(stem, reader)| reader.map(|reader| (stem, reader)))
+                .collect();
+            Ok((validated, opened))
         }
         Ok(_) => Err(LoadError::Invalid(file_problems)),
         Err(errors) => Err(LoadError::Invalid(merge_problems(file_problems, errors))),
@@ -400,8 +425,7 @@ fn decode(stem: &Stem, opened: OpenedStem) -> Result<StemAudio, LoadError> {
         })?;
     match spec.sample_format {
         SampleFormat::Int => {
-            // 2^-(bits - 1) is exact in f32, so the division adds no rounding.
-            let scale = 1.0 / (1u64 << (spec.bits_per_sample - 1)) as f32;
+            let scale = int_scale(spec.bits_per_sample);
             for sample in reader.samples::<i32>() {
                 samples.push(sample.map_err(decode_error)? as f32 * scale);
             }
@@ -419,6 +443,13 @@ fn decode(stem: &Stem, opened: OpenedStem) -> Result<StemAudio, LoadError> {
         samples,
         frames,
     })
+}
+
+/// The factor that turns a `bits`-bit integer sample into `f32`: 2^-(bits - 1),
+/// exact in f32, so the conversion adds no rounding. Loading and streaming
+/// share it, so both give bit-identical samples.
+fn int_scale(bits: u16) -> f32 {
+    1.0 / (1u64 << (bits - 1)) as f32
 }
 
 /// Bytes before the samples in the files [`write_wav_stereo_f32`] writes: the
