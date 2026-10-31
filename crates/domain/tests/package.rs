@@ -2,10 +2,13 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use common::{RATE, SPEC_EXAMPLE, SPEC_LENGTH, info, spec_infos, spec_package, stem};
 use domain::{
-    IdKind, MapKind, SectionType, SongPackage, StemRole, TempoPoint, TimeSignaturePoint,
-    ValidationError, ValidationWarning, validate,
+    IdKind, MAX_SONG_HOURS, ManifestError, MapKind, SectionType, SongPackage, Stem,
+    StemPathProblem, StemRole, TempoPoint, TimeSignaturePoint, ValidationError, ValidationWarning,
+    validate,
 };
 
 fn errors_of(package: &SongPackage, infos: &[domain::StemInfo]) -> Vec<ValidationError> {
@@ -689,4 +692,221 @@ fn warns_when_stem_lengths_differ_by_more_than_one_second() {
     .unwrap();
     assert!(validated.warnings.is_empty());
     assert_eq!(validated.song.length(), SPEC_LENGTH);
+}
+
+#[test]
+fn checks_format_version_before_the_rest_of_the_shape() {
+    let future = r#"{ "formatVersion": 2, "name": "a future shape", "tracks": [] }"#;
+    let error = SongPackage::from_json(future).expect_err("future version");
+    assert!(
+        matches!(error, ManifestError::UnsupportedFormatVersion { found: 2 }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("unsupported formatVersion 2"));
+
+    let broken = r#"{ "formatVersion": 1, "title": "x" }"#;
+    let error = SongPackage::from_json(broken).expect_err("v1 with missing fields");
+    assert!(matches!(error, ManifestError::Json(_)), "{error:?}");
+    assert!(error.to_string().contains("missing field"));
+
+    let unversioned = r#"{ "title": "x" }"#;
+    let error = SongPackage::from_json(unversioned).expect_err("no version");
+    assert!(matches!(error, ManifestError::Json(_)), "{error:?}");
+    assert!(error.to_string().contains("formatVersion"));
+}
+
+#[test]
+fn rejects_package_without_sections_and_empty_arrangements() {
+    let mut package = spec_package();
+    package.sections.clear();
+    package.arrangements[0].sections.clear();
+    let errors = errors_of(&package, &spec_infos());
+    assert_eq!(
+        errors,
+        [
+            ValidationError::NoSections,
+            ValidationError::EmptyArrangement {
+                arrangement: "default".into()
+            },
+        ]
+    );
+    assert_message_names(&errors[0], &["no sections"]);
+    assert_message_names(&errors[1], &["\"default\"", "no sections"]);
+
+    let mut package = spec_package();
+    package
+        .arrangements
+        .push(common::arrangement("acoustic", &[]));
+    let errors = errors_of(&package, &spec_infos());
+    assert_eq!(
+        errors,
+        [ValidationError::EmptyArrangement {
+            arrangement: "acoustic".into()
+        }]
+    );
+    assert_message_names(&errors[0], &["\"acoustic\""]);
+}
+
+#[test]
+fn rejects_songs_longer_than_24_hours() {
+    let package = spec_package();
+    let max = MAX_SONG_HOURS * 3_600 * u64::from(RATE);
+
+    let started = Instant::now();
+    let errors = errors_of(
+        &package,
+        &[
+            info("drums", RATE, u64::MAX),
+            info("click", RATE, SPEC_LENGTH),
+        ],
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "rejected quickly"
+    );
+    assert_eq!(
+        errors,
+        [ValidationError::SongTooLong {
+            stem: "drums".into(),
+            length: u64::MAX,
+            max
+        }]
+    );
+    assert_message_names(&errors[0], &["\"drums\"", "24 hours"]);
+
+    let exactly = validate(
+        &package,
+        &[info("drums", RATE, max), info("click", RATE, max)],
+    );
+    assert_eq!(exactly.expect("24 hours is accepted").song.length(), max);
+    assert_eq!(
+        errors_of(
+            &package,
+            &[info("drums", RATE, max), info("click", RATE, max + 1)]
+        ),
+        [ValidationError::SongTooLong {
+            stem: "click".into(),
+            length: max + 1,
+            max
+        }]
+    );
+}
+
+#[test]
+fn rejects_stem_files_outside_the_song_folder() {
+    let cases = [
+        ("empty", "", StemPathProblem::Empty),
+        ("root", "/etc/passwd", StemPathProblem::Absolute),
+        ("unc", r"\\server\share\a.wav", StemPathProblem::Absolute),
+        ("drive", r"C:\stems\a.wav", StemPathProblem::Absolute),
+        ("drive_relative", "c:a.wav", StemPathProblem::Absolute),
+        ("parent", "../a.wav", StemPathProblem::ParentDirectory),
+        (
+            "nested",
+            "stems/../../a.wav",
+            StemPathProblem::ParentDirectory,
+        ),
+        (
+            "windows",
+            r"stems\..\..\a.wav",
+            StemPathProblem::ParentDirectory,
+        ),
+        ("trailing", "stems/..", StemPathProblem::ParentDirectory),
+    ];
+    let mut package = spec_package();
+    package.stems = cases
+        .iter()
+        .map(|&(id, file, _)| Stem {
+            id: id.into(),
+            file: file.into(),
+            part: id.into(),
+            role: StemRole::Track,
+        })
+        .collect();
+    let infos: Vec<_> = cases
+        .iter()
+        .map(|&(id, ..)| info(id, RATE, SPEC_LENGTH))
+        .collect();
+    let errors = errors_of(&package, &infos);
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|&(id, file, problem)| ValidationError::InvalidStemPath {
+            id: id.into(),
+            file: file.into(),
+            problem,
+        })
+        .collect();
+    assert_eq!(errors, expected);
+    assert_message_names(&errors[1], &["\"root\"", "/etc/passwd", "absolute"]);
+    assert_message_names(&errors[5], &["\"parent\"", "..", "song folder"]);
+    assert_message_names(&errors[0], &["\"empty\"", "empty"]);
+
+    for file in [
+        "stems/a.wav",
+        "./stems/a.wav",
+        r"stems\a.wav",
+        "stems/..a.wav",
+        "a..b.wav",
+    ] {
+        let mut package = spec_package();
+        package.stems[0].file = file.into();
+        assert!(
+            validate(&package, &spec_infos()).is_ok(),
+            "{file} is inside the folder"
+        );
+    }
+}
+
+#[test]
+fn hostile_values_are_rejected_without_panicking() {
+    for bpm in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e300] {
+        let mut package = spec_package();
+        package.tempo_map[0].bpm = bpm;
+        let errors = errors_of(&package, &spec_infos());
+        assert!(
+            matches!(errors[..], [ValidationError::InvalidBpm { at: 0, .. }]),
+            "bpm {bpm}: {errors:?}"
+        );
+    }
+
+    let mut package = spec_package();
+    package.sections[1].start = u64::MAX;
+    assert_eq!(
+        errors_of(&package, &spec_infos()),
+        [ValidationError::SectionStartBeyondSongEnd {
+            id: "s2".into(),
+            start: u64::MAX,
+            song_end: SPEC_LENGTH
+        }]
+    );
+
+    let zero_length = [info("drums", RATE, 0), info("click", RATE, 0)];
+    assert_eq!(
+        errors_of(&spec_package(), &zero_length),
+        [
+            ValidationError::SectionStartBeyondSongEnd {
+                id: "s1".into(),
+                start: 0,
+                song_end: 0
+            },
+            ValidationError::SectionStartBeyondSongEnd {
+                id: "s2".into(),
+                start: 640_000,
+                song_end: 0
+            },
+        ]
+    );
+
+    for json in [
+        SPEC_EXAMPLE.replace("640000", "18446744073709551616"),
+        SPEC_EXAMPLE.replace("72.0", "1e999"),
+        String::new(),
+        "[]".to_owned(),
+        r#"{ "formatVersion": -1 }"#.to_owned(),
+    ] {
+        assert!(
+            matches!(SongPackage::from_json(&json), Err(ManifestError::Json(_))),
+            "{json:?} is a parse error"
+        );
+    }
 }

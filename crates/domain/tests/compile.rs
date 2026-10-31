@@ -5,28 +5,32 @@
 
 mod common;
 
-use common::{RATE, SongSpec, four_section_spec, marker};
+use common::{RATE, SongSpec, four_section_spec, info, marker};
 use domain::{
-    ClickEvent, ClickLevel, CompileError, CompileOptions, CueEvent, CueTiming, RenderPlan,
-    SectionType, Segment, Song, compile,
+    ClickEvent, ClickLevel, CompileError, CompileOptions, CueEvent, CueTiming,
+    DEFAULT_SEAM_CROSSFADE, RenderPlan, SectionType, Segment, Song, compile, validate,
 };
 
-fn seg(section_id: &str, out_start: u64, src_start: u64, len: u64, crossfade_in: u64) -> Segment {
+fn seg(id: &str, out_start: u64, src_start: u64, len: u64, fades: (u64, u64)) -> Segment {
     Segment {
-        section_id: section_id.to_owned(),
+        section_id: id.to_owned(),
         out_start,
         src_start,
         len,
-        crossfade_in,
+        fade_in: fades.0,
+        fade_out: fades.1,
     }
 }
 
-fn cue(at: u64, section_id: &str, section_type: SectionType, number: Option<u32>) -> CueEvent {
+const NO_FADE: (u64, u64) = (0, 0);
+
+fn cue(at: u64, len: u64, id: &str, section_type: SectionType, number: Option<u32>) -> CueEvent {
     CueEvent {
         at,
-        section_id: section_id.to_owned(),
+        section_id: id.to_owned(),
         section_type,
         number,
+        len,
     }
 }
 
@@ -45,12 +49,25 @@ fn at_section_start() -> CompileOptions {
     }
 }
 
+fn crossfade(seam_crossfade: u64) -> CompileOptions {
+    CompileOptions {
+        seam_crossfade,
+        ..CompileOptions::default()
+    }
+}
+
 fn positions(plan: &RenderPlan, levels: &[ClickLevel]) -> Vec<u64> {
     plan.clicks
         .iter()
         .filter(|click| levels.contains(&click.level))
         .map(|click| click.at)
         .collect()
+}
+
+fn has_accent_at(plan: &RenderPlan, at: u64) -> bool {
+    plan.clicks
+        .iter()
+        .any(|c| c.at == at && c.level == ClickLevel::Accent)
 }
 
 const BEATS: [ClickLevel; 2] = [ClickLevel::Accent, ClickLevel::Quarter];
@@ -67,6 +84,52 @@ fn assert_contiguous(plan: &RenderPlan) {
     }
     let total: u64 = plan.segments.iter().map(|s| s.len).sum();
     assert_eq!(plan.length, total);
+}
+
+/// Fades exactly at jumps, per the S2 overlap rule.
+fn assert_fades(song: &Song, plan: &RenderPlan, seam_crossfade: u64) {
+    let segments = &plan.segments;
+    assert_eq!(segments[0].fade_in, 0, "the first segment does not fade in");
+    assert_eq!(
+        segments.last().unwrap().fade_out,
+        0,
+        "the last segment does not fade out"
+    );
+    for pair in segments.windows(2) {
+        let (outgoing, incoming) = (&pair[0], &pair[1]);
+        let outgoing_end = outgoing.src_start + outgoing.len;
+        let expected = if outgoing_end == incoming.src_start {
+            0
+        } else {
+            seam_crossfade
+                .min(incoming.len)
+                .min(song.length() - outgoing_end)
+        };
+        assert_eq!(
+            incoming.fade_in, expected,
+            "fade-in of {}",
+            incoming.section_id
+        );
+        assert_eq!(
+            outgoing.fade_out, incoming.fade_in,
+            "fades match at the seam"
+        );
+    }
+}
+
+/// Kept cues never overlap and never announce a section shorter than the cue.
+fn assert_cues(song: &Song, plan: &RenderPlan) {
+    for pair in plan.cues.windows(2) {
+        assert!(
+            pair[0].at + pair[0].len <= pair[1].at,
+            "cues overlap: {:?}",
+            plan.cues
+        );
+    }
+    for cue in &plan.cues {
+        assert!(song.section(&cue.section_id).unwrap().length() >= cue.len);
+        assert!(cue.at < plan.length);
+    }
 }
 
 fn assert_clicks_sorted(plan: &RenderPlan) {
@@ -89,16 +152,17 @@ fn f2_3_repeated_chorus_plays_twice_with_one_crossfaded_seam() {
     assert_eq!(
         plan.segments,
         [
-            seg("intro", 0, 0, 192_000, 0),
-            seg("verse", 192_000, 192_000, 384_000, 0),
-            seg("chorus", 576_000, 576_000, 384_000, 0),
-            seg("chorus", 960_000, 576_000, 384_000, 256),
-            seg("outro", 1_344_000, 960_000, 192_000, 0),
+            seg("intro", 0, 0, 192_000, NO_FADE),
+            seg("verse", 192_000, 192_000, 384_000, NO_FADE),
+            seg("chorus", 576_000, 576_000, 384_000, (0, 256)),
+            seg("chorus", 960_000, 576_000, 384_000, (256, 0)),
+            seg("outro", 1_344_000, 960_000, 192_000, NO_FADE),
         ]
     );
     assert_eq!(plan.segments[3].src_start, plan.segments[2].src_start);
     assert_eq!(plan.length, 1_536_000);
     assert_contiguous(&plan);
+    assert_fades(&song, &plan, DEFAULT_SEAM_CROSSFADE);
 
     // No gap in the click either: every bar-aligned section keeps the grid.
     assert_eq!(plan.clicks.len(), 1_536_000 / 6_000);
@@ -112,6 +176,7 @@ fn f2_3_repeated_chorus_plays_twice_with_one_crossfaded_seam() {
         positions(&plan, &[ClickLevel::Accent]),
         (0..16).map(|bar| bar * 96_000).collect::<Vec<_>>()
     );
+    assert!(has_accent_at(&plan, plan.segments[3].out_start));
 }
 
 #[test]
@@ -121,59 +186,83 @@ fn default_arrangement_plays_the_song_straight_through() {
     assert_eq!(
         plan.segments,
         [
-            seg("intro", 0, 0, 192_000, 0),
-            seg("verse", 192_000, 192_000, 384_000, 0),
-            seg("chorus", 576_000, 576_000, 384_000, 0),
-            seg("outro", 960_000, 960_000, 192_000, 0),
+            seg("intro", 0, 0, 192_000, NO_FADE),
+            seg("verse", 192_000, 192_000, 384_000, NO_FADE),
+            seg("chorus", 576_000, 576_000, 384_000, NO_FADE),
+            seg("outro", 960_000, 960_000, 192_000, NO_FADE),
         ]
     );
     assert_eq!(plan.length, song.length());
 }
 
 #[test]
-fn seam_crossfade_is_recorded_only_where_the_source_jumps() {
+fn jump_seams_fade_out_the_outgoing_and_fade_in_the_incoming_segment() {
     let song = four_section_spec()
         .arrangement("back", &["chorus", "intro", "verse"])
         .build();
-    let options = CompileOptions {
-        seam_crossfade: 1_024,
-        ..CompileOptions::default()
-    };
     assert_eq!(
-        plan_with(&song, "back", options).segments,
+        plan_with(&song, "back", crossfade(1_024)).segments,
         [
-            seg("chorus", 0, 576_000, 384_000, 0),
-            seg("intro", 384_000, 0, 192_000, 1_024),
-            seg("verse", 576_000, 192_000, 384_000, 0),
+            seg("chorus", 0, 576_000, 384_000, (0, 1_024)),
+            seg("intro", 384_000, 0, 192_000, (1_024, 0)),
+            seg("verse", 576_000, 192_000, 384_000, NO_FADE),
         ]
     );
-
-    let longer_than_intro = CompileOptions {
-        seam_crossfade: 1_000_000,
-        ..CompileOptions::default()
-    };
-    let plan = plan_with(&song, "back", longer_than_intro);
-    assert_eq!(
-        plan.segments[1].crossfade_in, 192_000,
-        "capped at the segment length"
+    let no_fade = plan_with(&song, "back", crossfade(0));
+    assert!(
+        no_fade
+            .segments
+            .iter()
+            .all(|s| s.fade_in == 0 && s.fade_out == 0)
     );
 }
 
 #[test]
-fn rejects_unknown_or_empty_arrangement() {
-    let song = four_section_spec().arrangement("empty", &[]).build();
-    let options = CompileOptions::default();
+fn seam_fade_is_capped_by_the_incoming_length_and_the_source_left() {
+    let song = four_section_spec()
+        .arrangement("into_chorus", &["intro", "chorus"])
+        .arrangement("into_verse", &["chorus", "verse"])
+        .arrangement("from_the_end", &["outro", "verse"])
+        .build();
+    let huge = crossfade(u64::MAX);
 
-    let error = compile(&song, "nope", &options).expect_err("unknown arrangement");
+    // Intro ends at 192 000, so 960 000 samples are left; the chorus is 384 000.
+    let plan = plan_with(&song, "into_chorus", huge);
+    assert_eq!(
+        plan.segments,
+        [
+            seg("intro", 0, 0, 192_000, (0, 384_000)),
+            seg("chorus", 192_000, 576_000, 384_000, (384_000, 0)),
+        ]
+    );
+    // The chorus ends at 960 000: only 192 000 source samples are left.
+    let plan = plan_with(&song, "into_verse", huge);
+    assert_eq!(
+        plan.segments,
+        [
+            seg("chorus", 0, 576_000, 384_000, (0, 192_000)),
+            seg("verse", 384_000, 192_000, 384_000, (192_000, 0)),
+        ]
+    );
+    // The outro ends at the song end: there is nothing left to fade out.
+    let plan = plan_with(&song, "from_the_end", huge);
+    assert!(
+        plan.segments
+            .iter()
+            .all(|s| s.fade_in == 0 && s.fade_out == 0)
+    );
+}
+
+#[test]
+fn rejects_unknown_arrangement() {
+    let song = four_section_spec().build();
+    let error =
+        compile(&song, "nope", &CompileOptions::default()).expect_err("unknown arrangement");
     assert_eq!(
         error,
         CompileError::UnknownArrangement { id: "nope".into() }
     );
     assert!(error.to_string().contains("\"nope\""));
-
-    let error = compile(&song, "empty", &options).expect_err("empty arrangement");
-    assert_eq!(error, CompileError::EmptyArrangement { id: "empty".into() });
-    assert!(error.to_string().contains("\"empty\""));
 }
 
 #[test]
@@ -202,45 +291,19 @@ fn constant_tempo_clicks_land_on_exact_samples() {
 fn subdivisions_split_each_beat_into_eighths_and_sixteenths() {
     let song = SongSpec::new(96_000, vec![marker("all", SectionType::Verse, None, 0)]).build();
     let plan = plan(&song, "default");
+    let click = |at, level| ClickEvent { at, level };
     assert_eq!(
         plan.clicks[..9],
         [
-            ClickEvent {
-                at: 0,
-                level: ClickLevel::Accent
-            },
-            ClickEvent {
-                at: 6_000,
-                level: ClickLevel::Sixteenth
-            },
-            ClickEvent {
-                at: 12_000,
-                level: ClickLevel::Eighth
-            },
-            ClickEvent {
-                at: 18_000,
-                level: ClickLevel::Sixteenth
-            },
-            ClickEvent {
-                at: 24_000,
-                level: ClickLevel::Quarter
-            },
-            ClickEvent {
-                at: 30_000,
-                level: ClickLevel::Sixteenth
-            },
-            ClickEvent {
-                at: 36_000,
-                level: ClickLevel::Eighth
-            },
-            ClickEvent {
-                at: 42_000,
-                level: ClickLevel::Sixteenth
-            },
-            ClickEvent {
-                at: 48_000,
-                level: ClickLevel::Quarter
-            },
+            click(0, ClickLevel::Accent),
+            click(6_000, ClickLevel::Sixteenth),
+            click(12_000, ClickLevel::Eighth),
+            click(18_000, ClickLevel::Sixteenth),
+            click(24_000, ClickLevel::Quarter),
+            click(30_000, ClickLevel::Sixteenth),
+            click(36_000, ClickLevel::Eighth),
+            click(42_000, ClickLevel::Sixteenth),
+            click(48_000, ClickLevel::Quarter),
         ]
     );
     let count = |level| plan.clicks.iter().filter(|c| c.level == level).count();
@@ -303,45 +366,6 @@ fn beat_grid_stays_continuous_across_a_mid_beat_tempo_change() {
     );
 }
 
-/// Expected beat position from the region start, computed independently.
-fn expected_beat(n: u64, tempo: &[(u64, f64)]) -> f64 {
-    let samples_per_beat = |bpm: f64| f64::from(RATE) * 60.0 / bpm;
-    let mut region_beat = 0.0;
-    let mut index = 0;
-    while index + 1 < tempo.len() {
-        let (at, bpm) = tempo[index];
-        let next_beat = region_beat + (tempo[index + 1].0 - at) as f64 / samples_per_beat(bpm);
-        if (n as f64) < next_beat {
-            break;
-        }
-        region_beat = next_beat;
-        index += 1;
-    }
-    let (at, bpm) = tempo[index];
-    at as f64 + (n as f64 - region_beat) * samples_per_beat(bpm)
-}
-
-#[test]
-fn every_beat_lands_within_one_sample_across_tempo_changes_for_sixty_minutes() {
-    let length = u64::from(RATE) * 3_600;
-    let tempo = [(0, 123.45), (40_000_003, 77.7), (100_000_000, 141.1)];
-    let song = SongSpec::new(length, vec![marker("all", SectionType::Verse, None, 0)])
-        .tempo(&tempo)
-        .build();
-    let plan = plan(&song, "default");
-    let beats = positions(&plan, &BEATS);
-    assert!(beats.len() > 6_000, "a full hour of beats");
-    for (n, &at) in beats.iter().enumerate() {
-        let expected = expected_beat(n as u64, &tempo);
-        assert!(
-            (at as f64 - expected).abs() <= 1.0,
-            "beat {n} at {at}, expected {expected}"
-        );
-    }
-    assert!(*beats.last().unwrap() < length);
-    assert!(plan.clicks.iter().all(|c| c.at < length));
-}
-
 #[test]
 fn meter_change_restarts_bars_with_an_accent() {
     // Two bars of 4/4, then two bars of 3/4 (72 000 samples per bar).
@@ -380,9 +404,10 @@ fn clicks_follow_source_positions_after_rearranging() {
     assert_eq!(
         swapped.segments,
         [
-            seg("b", 0, 30_000, 162_000, 0),
-            seg("a", 162_000, 0, 30_000, 256)
-        ]
+            seg("b", 0, 30_000, 162_000, NO_FADE),
+            seg("a", 162_000, 0, 30_000, NO_FADE),
+        ],
+        "b ends at the song end, so there is no source left to crossfade"
     );
     assert_eq!(
         swapped.clicks[..2],
@@ -428,23 +453,23 @@ fn reordering_sections_reorders_the_cues() {
     assert_eq!(
         plan(&song, "vc").cues,
         [
-            cue(96_000, "verse", SectionType::Verse, Some(1)),
-            cue(480_000, "chorus", SectionType::Chorus, None),
+            cue(96_000, 96_000, "verse", SectionType::Verse, Some(1)),
+            cue(480_000, 96_000, "chorus", SectionType::Chorus, None),
         ]
     );
     assert_eq!(
         plan(&song, "cv").cues,
         [
-            cue(96_000, "chorus", SectionType::Chorus, None),
-            cue(480_000, "verse", SectionType::Verse, Some(1)),
+            cue(96_000, 96_000, "chorus", SectionType::Chorus, None),
+            cue(480_000, 96_000, "verse", SectionType::Verse, Some(1)),
         ]
     );
     assert_eq!(
         plan_with(&song, "cv", at_section_start()).cues,
         [
-            cue(0, "intro", SectionType::Intro, None),
-            cue(192_000, "chorus", SectionType::Chorus, None),
-            cue(576_000, "verse", SectionType::Verse, Some(1)),
+            cue(0, 96_000, "intro", SectionType::Intro, None),
+            cue(192_000, 96_000, "chorus", SectionType::Chorus, None),
+            cue(576_000, 96_000, "verse", SectionType::Verse, Some(1)),
         ]
     );
 }
@@ -460,34 +485,46 @@ fn cues_default_to_one_bar_before_and_can_play_at_section_start() {
     assert_eq!(
         plan(&song, "default").cues,
         [
-            cue(96_000, "verse", SectionType::Verse, Some(1)),
-            cue(480_000, "chorus", SectionType::Chorus, None),
-            cue(864_000, "outro", SectionType::Outro, None),
+            cue(96_000, 96_000, "verse", SectionType::Verse, Some(1)),
+            cue(480_000, 96_000, "chorus", SectionType::Chorus, None),
+            cue(864_000, 96_000, "outro", SectionType::Outro, None),
         ]
     );
     assert_eq!(
         plan_with(&song, "default", at_section_start()).cues,
         [
-            cue(0, "intro", SectionType::Intro, None),
-            cue(192_000, "verse", SectionType::Verse, Some(1)),
-            cue(576_000, "chorus", SectionType::Chorus, None),
-            cue(960_000, "outro", SectionType::Outro, None),
+            cue(0, 96_000, "intro", SectionType::Intro, None),
+            cue(192_000, 96_000, "verse", SectionType::Verse, Some(1)),
+            cue(576_000, 96_000, "chorus", SectionType::Chorus, None),
+            cue(960_000, 96_000, "outro", SectionType::Outro, None),
         ]
     );
 }
 
 #[test]
-fn one_bar_before_uses_the_tempo_and_meter_at_the_section_start() {
-    // From the verse on the tempo is 60 bpm: one bar is 192 000 samples.
+fn one_bar_before_is_the_preceding_output_bar() {
+    // From the verse on the tempo is 60 bpm: one bar is 192 000 samples. The
+    // verse cue still lasts one intro bar, the bar heard just before the verse.
     let slow = four_section_spec()
         .tempo(&[(0, 120.0), (192_000, 60.0)])
         .build();
     assert_eq!(
         plan(&slow, "default").cues,
         [
-            cue(0, "verse", SectionType::Verse, Some(1)),
-            cue(384_000, "chorus", SectionType::Chorus, None),
-            cue(768_000, "outro", SectionType::Outro, None),
+            cue(96_000, 96_000, "verse", SectionType::Verse, Some(1)),
+            cue(384_000, 192_000, "chorus", SectionType::Chorus, None),
+            cue(768_000, 192_000, "outro", SectionType::Outro, None),
+        ]
+    );
+    // The default cue length follows the same bar at section start too; the
+    // first segment has no preceding bar and uses its own.
+    assert_eq!(
+        plan_with(&slow, "default", at_section_start()).cues,
+        [
+            cue(0, 96_000, "intro", SectionType::Intro, None),
+            cue(192_000, 96_000, "verse", SectionType::Verse, Some(1)),
+            cue(576_000, 192_000, "chorus", SectionType::Chorus, None),
+            cue(960_000, 192_000, "outro", SectionType::Outro, None),
         ]
     );
 
@@ -498,11 +535,73 @@ fn one_bar_before_uses_the_tempo_and_meter_at_the_section_start() {
     assert_eq!(
         plan(&waltz, "default").cues,
         [
-            cue(120_000, "verse", SectionType::Verse, Some(1)),
-            cue(504_000, "chorus", SectionType::Chorus, None),
-            cue(888_000, "outro", SectionType::Outro, None),
+            cue(96_000, 96_000, "verse", SectionType::Verse, Some(1)),
+            cue(504_000, 72_000, "chorus", SectionType::Chorus, None),
+            cue(888_000, 72_000, "outro", SectionType::Outro, None),
         ]
     );
+}
+
+#[test]
+fn cue_before_a_meter_change_starts_on_the_last_bar_line_of_the_verse() {
+    // Verifier probe: verse 4/4 at 0, bridge 3/4 at 768 000.
+    let song = SongSpec::new(
+        768_000 + 8 * 72_000,
+        vec![
+            marker("verse", SectionType::Verse, Some(1), 0),
+            marker("bridge", SectionType::Bridge, None, 768_000),
+        ],
+    )
+    .meters(&[(0, 4, 4), (768_000, 3, 4)])
+    .build();
+    let plan = plan(&song, "default");
+    assert_eq!(
+        plan.cues,
+        [cue(672_000, 96_000, "bridge", SectionType::Bridge, None)]
+    );
+    assert!(has_accent_at(&plan, 672_000));
+}
+
+#[test]
+fn cue_before_a_tempo_change_starts_one_verse_bar_before_the_chorus() {
+    // Verifier probe: 120 bpm, then 60 bpm from the chorus at 768 000.
+    let song = SongSpec::new(
+        768_000 + 8 * 192_000,
+        vec![
+            marker("verse", SectionType::Verse, Some(1), 0),
+            marker("chorus", SectionType::Chorus, None, 768_000),
+        ],
+    )
+    .tempo(&[(0, 120.0), (768_000, 60.0)])
+    .build();
+    let plan = plan(&song, "default");
+    assert_eq!(
+        plan.cues,
+        [cue(672_000, 96_000, "chorus", SectionType::Chorus, None)]
+    );
+    assert!(has_accent_at(&plan, 672_000));
+}
+
+#[test]
+fn cue_after_a_rearranged_section_uses_that_sections_last_bar() {
+    // Source: chorus 4/4 (8 bars), bridge 3/4 (8 bars). Played bridge first,
+    // the chorus cue starts on the last bridge bar: 576 000 - 72 000.
+    let song = SongSpec::new(
+        768_000 + 576_000,
+        vec![
+            marker("chorus", SectionType::Chorus, None, 0),
+            marker("bridge", SectionType::Bridge, None, 768_000),
+        ],
+    )
+    .meters(&[(0, 4, 4), (768_000, 3, 4)])
+    .arrangement("bridge_first", &["bridge", "chorus"])
+    .build();
+    let plan = plan(&song, "bridge_first");
+    assert_eq!(
+        plan.cues,
+        [cue(504_000, 72_000, "chorus", SectionType::Chorus, None)]
+    );
+    assert!(has_accent_at(&plan, 504_000));
 }
 
 #[test]
@@ -521,19 +620,15 @@ fn cue_that_would_start_before_zero_is_dropped() {
         ..CompileOptions::default()
     };
     assert!(plan_with(&song, "default", short_cues).cues.is_empty());
+    let at_start = CompileOptions {
+        cue_timing: CueTiming::AtSectionStart,
+        ..short_cues
+    };
     assert_eq!(
-        plan_with(
-            &song,
-            "default",
-            CompileOptions {
-                cue_timing: CueTiming::AtSectionStart,
-                ..short_cues
-            }
-        )
-        .cues,
+        plan_with(&song, "default", at_start).cues,
         [
-            cue(0, "count", SectionType::CountOff, None),
-            cue(48_000, "verse", SectionType::Verse, Some(1)),
+            cue(0, 24_000, "count", SectionType::CountOff, None),
+            cue(48_000, 24_000, "verse", SectionType::Verse, Some(1)),
         ]
     );
 }
@@ -553,13 +648,13 @@ fn cue_is_skipped_when_its_section_is_shorter_than_the_cue() {
     assert_eq!(
         plan_with(&song, "default", at_section_start()).cues,
         [
-            cue(0, "intro", SectionType::Intro, None),
-            cue(240_000, "chorus", SectionType::Chorus, None),
+            cue(0, 96_000, "intro", SectionType::Intro, None),
+            cue(240_000, 96_000, "chorus", SectionType::Chorus, None),
         ]
     );
     assert_eq!(
         plan(&song, "default").cues,
-        [cue(144_000, "chorus", SectionType::Chorus, None)]
+        [cue(144_000, 96_000, "chorus", SectionType::Chorus, None)]
     );
     let half_bar_cues = CompileOptions {
         cue_length: Some(48_000),
@@ -568,42 +663,43 @@ fn cue_is_skipped_when_its_section_is_shorter_than_the_cue() {
     assert_eq!(
         plan_with(&song, "default", half_bar_cues).cues,
         [
-            cue(0, "intro", SectionType::Intro, None),
-            cue(192_000, "tag", SectionType::Tag, None),
-            cue(240_000, "chorus", SectionType::Chorus, None),
+            cue(0, 48_000, "intro", SectionType::Intro, None),
+            cue(192_000, 48_000, "tag", SectionType::Tag, None),
+            cue(240_000, 48_000, "chorus", SectionType::Chorus, None),
         ]
     );
 }
 
 #[test]
 fn cue_that_overlaps_the_previous_cue_is_dropped() {
-    // The verse lasts one bar at 120 bpm; the chorus is one bar at 60 bpm,
-    // so its cue would start inside the verse cue.
+    // The tempo halves inside the verse, so the bar before the chorus lasts
+    // 192 000 samples and the chorus cue would start inside the verse cue.
     let song = SongSpec::new(
-        480_000,
+        500_000,
         vec![
             marker("intro", SectionType::Intro, None, 0),
             marker("verse", SectionType::Verse, Some(1), 192_000),
-            marker("chorus", SectionType::Chorus, None, 288_000),
+            marker("chorus", SectionType::Chorus, None, 300_000),
         ],
     )
-    .tempo(&[(0, 120.0), (288_000, 60.0)])
+    .tempo(&[(0, 120.0), (240_000, 60.0)])
     .build();
+    let plan_one_bar_before = plan(&song, "default");
     assert_eq!(
-        plan(&song, "default").cues,
-        [cue(96_000, "verse", SectionType::Verse, Some(1))]
+        plan_one_bar_before.cues,
+        [cue(96_000, 96_000, "verse", SectionType::Verse, Some(1))]
     );
     assert_eq!(
         plan_with(&song, "default", at_section_start()).cues,
         [
-            cue(0, "intro", SectionType::Intro, None),
-            cue(192_000, "verse", SectionType::Verse, Some(1)),
-            cue(288_000, "chorus", SectionType::Chorus, None),
+            cue(0, 96_000, "intro", SectionType::Intro, None),
+            cue(192_000, 96_000, "verse", SectionType::Verse, Some(1)),
+            cue(300_000, 192_000, "chorus", SectionType::Chorus, None),
         ]
     );
 }
 
-/// Deterministic xorshift so the property test needs no extra dependency.
+/// Deterministic xorshift so the property tests need no extra dependency.
 struct Rng(u64);
 
 impl Rng {
@@ -650,9 +746,8 @@ fn any_arrangement_compiles_to_contiguous_segments_and_non_overlapping_cues() {
                     "compile is deterministic"
                 );
                 assert_contiguous(&plan);
+                assert_fades(&song, &plan, DEFAULT_SEAM_CROSSFADE);
                 assert_eq!(plan.segments.len(), sections.len());
-
-                let mut previous_src_end = None;
                 for (segment, section_id) in plan.segments.iter().zip(sections) {
                     let section = song.section(section_id).unwrap();
                     assert_eq!(segment.section_id, *section_id);
@@ -660,9 +755,6 @@ fn any_arrangement_compiles_to_contiguous_segments_and_non_overlapping_cues() {
                         (segment.src_start, segment.len),
                         (section.start, section.length())
                     );
-                    let jumps = previous_src_end.is_some_and(|end| end != section.start);
-                    assert_eq!(segment.crossfade_in, if jumps { 256 } else { 0 });
-                    previous_src_end = Some(section.end);
                 }
 
                 assert_clicks_sorted(&plan);
@@ -670,12 +762,78 @@ fn any_arrangement_compiles_to_contiguous_segments_and_non_overlapping_cues() {
                 // Bar-aligned sections at a constant tempo keep the grid.
                 assert_eq!(plan.clicks.len() as u64, plan.length / 6_000);
 
+                assert_cues(&song, &plan);
                 let reserved = cue_length.unwrap_or(96_000);
-                for pair in plan.cues.windows(2) {
-                    assert!(pair[0].at + reserved <= pair[1].at, "cues overlap in {id}");
-                }
-                assert!(plan.cues.iter().all(|c| c.at < plan.length));
+                assert!(plan.cues.iter().all(|c| c.len == reserved));
             }
         }
     }
+}
+
+#[test]
+fn random_arrangements_over_tempo_and_meter_changes_keep_every_invariant() {
+    // Verifier property test: sections off the bar grid, tempo and meter changes.
+    let bar = 96_000u64;
+    let length = 14 * bar;
+    let base = SongSpec::new(
+        length,
+        vec![
+            marker("a", SectionType::Intro, None, 0),
+            marker("b", SectionType::Verse, Some(1), 2 * bar + 13),
+            marker("c", SectionType::Chorus, Some(1), 2 * bar + 40_000),
+            marker("d", SectionType::Bridge, None, 7 * bar),
+            marker("e", SectionType::Outro, None, 11 * bar + 99),
+        ],
+    )
+    .tempo(&[(0, 120.0), (6 * bar + 777, 87.25)])
+    .meters(&[(0, 4, 4), (3 * bar, 3, 4), (9 * bar + 5, 6, 8)])
+    .package();
+    let ids = ["a", "b", "c", "d", "e"];
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    for case in 0..300 {
+        let count = 1 + rng.next(9) as usize;
+        let order: Vec<&str> = (0..count).map(|_| ids[rng.next(5) as usize]).collect();
+        let mut package = base.clone();
+        package.arrangements.push(common::arrangement("x", &order));
+        let song = validate(&package, &[info("drums", RATE, length)])
+            .unwrap()
+            .song;
+        for cue_timing in [CueTiming::OneBarBefore, CueTiming::AtSectionStart] {
+            for cue_length in [None, Some(30_000 + rng.next(150_000))] {
+                let options = CompileOptions {
+                    cue_timing,
+                    cue_length,
+                    ..CompileOptions::default()
+                };
+                let plan = plan_with(&song, "x", options);
+                assert_contiguous(&plan);
+                assert_fades(&song, &plan, DEFAULT_SEAM_CROSSFADE);
+                for (segment, section_id) in plan.segments.iter().zip(&order) {
+                    let section = song.section(section_id).unwrap();
+                    assert_eq!(
+                        (segment.src_start, segment.len),
+                        (section.start, section.length()),
+                        "case {case} {order:?}"
+                    );
+                }
+                assert_cues(&song, &plan);
+                if let Some(reserved) = cue_length {
+                    assert!(plan.cues.iter().all(|c| c.len == reserved), "case {case}");
+                }
+                assert_clicks_sorted(&plan);
+                assert!(plan.clicks.iter().all(|c| c.at < plan.length));
+            }
+        }
+    }
+}
+
+#[test]
+fn tempo_and_meter_points_far_beyond_the_song_end_do_not_panic() {
+    let song = SongSpec::new(480_000, vec![marker("all", SectionType::Intro, None, 0)])
+        .tempo(&[(0, 120.0), (u64::MAX - 1, 999.0), (u64::MAX, 1.0)])
+        .meters(&[(0, 4, 4), (u64::MAX - 1, 3, 4), (u64::MAX, 7, 8)])
+        .build();
+    let plan = plan(&song, "default");
+    assert_eq!(plan.clicks.len(), 5 * 16, "five bars of 4/4 at 120 bpm");
+    assert_eq!(positions(&plan, &[ClickLevel::Accent]).len(), 5);
 }

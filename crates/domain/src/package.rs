@@ -164,20 +164,61 @@ pub struct StemInfo {
 
 /// `song.json` could not be parsed or written.
 #[derive(Debug, Error)]
-#[error("song.json: {0}")]
-pub struct ManifestError(serde_json::Error);
+pub enum ManifestError {
+    /// The manifest declares a `formatVersion` this crate cannot read; the
+    /// rest of its shape is not looked at.
+    #[error(
+        "song.json: unsupported formatVersion {found}; this version reads formatVersion {FORMAT_VERSION}"
+    )]
+    UnsupportedFormatVersion {
+        /// The version in the manifest.
+        found: u32,
+    },
+    /// The JSON is malformed or does not have the v1 shape.
+    #[error("song.json: {0}")]
+    Json(serde_json::Error),
+}
 
 impl SongPackage {
-    /// Parses a `song.json` manifest. Only the JSON shape is checked here;
-    /// call [`validate`] for the package rules.
+    /// Parses a `song.json` manifest. `formatVersion` is checked first, so a
+    /// newer manifest reports its version instead of a shape mismatch. Only the
+    /// JSON shape is checked here; call [`validate`] for the package rules.
     pub fn from_json(json: &str) -> Result<Self, ManifestError> {
-        serde_json::from_str(json).map_err(ManifestError)
+        let header: VersionHeader = serde_json::from_str(json).map_err(ManifestError::Json)?;
+        if header.format_version != FORMAT_VERSION {
+            return Err(ManifestError::UnsupportedFormatVersion {
+                found: header.format_version,
+            });
+        }
+        serde_json::from_str(json).map_err(ManifestError::Json)
     }
 
     /// Writes the manifest as pretty-printed JSON.
     pub fn to_json(&self) -> Result<String, ManifestError> {
-        serde_json::to_string_pretty(self).map_err(ManifestError)
+        serde_json::to_string_pretty(self).map_err(ManifestError::Json)
     }
+}
+
+/// The one field every manifest version shares; read before the rest.
+#[derive(Deserialize)]
+struct VersionHeader {
+    #[serde(rename = "formatVersion")]
+    format_version: u32,
+}
+
+/// Longest accepted song, in hours. **Assumption:** the cap keeps the click and
+/// plan sizes bounded.
+pub const MAX_SONG_HOURS: u64 = 24;
+
+/// Why a `stems[].file` path is rejected: it must stay inside the song folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StemPathProblem {
+    /// The path is empty.
+    Empty,
+    /// The path starts at a root (`/`, `\`) or a drive (`C:`).
+    Absolute,
+    /// The path has a `..` component.
+    ParentDirectory,
 }
 
 /// A validated package: the song plus non-fatal findings.
@@ -229,6 +270,30 @@ pub enum ValidationError {
     /// The package lists no stems, so it has no song end.
     #[error("the package lists no stems; the song end is the end of the longest stem")]
     NoStems,
+    /// A stem file path is empty, absolute, or leaves the song folder.
+    #[error(
+        "stem \"{id}\" file \"{file}\" {problem}; it must be a relative path inside the song folder"
+    )]
+    InvalidStemPath {
+        /// Stem id.
+        id: String,
+        /// The rejected path.
+        file: String,
+        /// What is wrong with it.
+        problem: StemPathProblem,
+    },
+    /// The longest stem makes the song longer than [`MAX_SONG_HOURS`].
+    #[error(
+        "stem \"{stem}\" is {length} samples long; songs are limited to {MAX_SONG_HOURS} hours ({max} samples at the package sampleRate)"
+    )]
+    SongTooLong {
+        /// Id of the longest stem.
+        stem: String,
+        /// Its length in samples.
+        length: u64,
+        /// The longest accepted length in samples.
+        max: u64,
+    },
     /// The library layer found no header facts for a listed stem.
     #[error("stem \"{id}\" ({file}) has no audio information; is the file missing or unreadable?")]
     MissingStemInfo {
@@ -307,6 +372,9 @@ pub enum ValidationError {
         /// The rejected denominator.
         denominator: u32,
     },
+    /// The package has no sections, so nothing can play.
+    #[error("the package has no sections; at least one section is needed")]
+    NoSections,
     /// The first section does not start at 0.
     #[error("the first section \"{id}\" starts at {start}; it must start at 0")]
     FirstSectionNotAtZero {
@@ -342,6 +410,12 @@ pub enum ValidationError {
     /// No arrangement has id [`DEFAULT_ARRANGEMENT_ID`].
     #[error("the Default arrangement (id \"{DEFAULT_ARRANGEMENT_ID}\") is missing")]
     MissingDefaultArrangement,
+    /// An arrangement lists no sections.
+    #[error("arrangement \"{arrangement}\" has no sections")]
+    EmptyArrangement {
+        /// Arrangement id.
+        arrangement: String,
+    },
     /// An arrangement references a section id that does not exist.
     #[error("arrangement \"{arrangement}\" references unknown section \"{section}\"")]
     UnknownSectionReference {
@@ -386,6 +460,16 @@ impl fmt::Display for MapKind {
         f.write_str(match self {
             Self::Tempo => "tempoMap",
             Self::TimeSignature => "timeSignatureMap",
+        })
+    }
+}
+
+impl fmt::Display for StemPathProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "is empty",
+            Self::Absolute => "is absolute",
+            Self::ParentDirectory => "has a \"..\" component",
         })
     }
 }
@@ -441,6 +525,9 @@ pub fn validate(
     let song_end = stem_lengths
         .as_ref()
         .map(|lengths| lengths.iter().map(|&(_, length)| length).max().unwrap_or(0));
+    if let Some(lengths) = &stem_lengths {
+        check_song_length(lengths, package.sample_rate, &mut errors);
+    }
     check_tempo_map(&package.tempo_map, &mut errors);
     check_time_signature_map(&package.time_signature_map, &mut errors);
     check_sections(&package.sections, song_end, &mut errors);
@@ -496,6 +583,13 @@ fn check_stems<'a>(
     let mut lengths = Vec::with_capacity(package.stems.len());
     let mut complete = true;
     for stem in &package.stems {
+        if let Some(problem) = stem_path_problem(&stem.file) {
+            errors.push(ValidationError::InvalidStemPath {
+                id: stem.id.clone(),
+                file: stem.file.clone(),
+                problem,
+            });
+        }
         let Some(info) = infos.iter().find(|info| info.id == stem.id) else {
             complete = false;
             errors.push(ValidationError::MissingStemInfo {
@@ -514,6 +608,44 @@ fn check_stems<'a>(
         lengths.push((stem.id.as_str(), info.length_samples));
     }
     complete.then_some(lengths)
+}
+
+/// A stem path must stay inside the song folder on every platform, so both
+/// `/` and `\` separate components and drive prefixes count as absolute.
+fn stem_path_problem(file: &str) -> Option<StemPathProblem> {
+    let bytes = file.as_bytes();
+    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if file.is_empty() {
+        Some(StemPathProblem::Empty)
+    } else if drive || file.starts_with(['/', '\\']) {
+        Some(StemPathProblem::Absolute)
+    } else if file.split(['/', '\\']).any(|component| component == "..") {
+        Some(StemPathProblem::ParentDirectory)
+    } else {
+        None
+    }
+}
+
+/// Rejects a song longer than [`MAX_SONG_HOURS`], naming its first longest stem.
+fn check_song_length(lengths: &[(&str, u64)], sample_rate: u32, errors: &mut Vec<ValidationError>) {
+    // A zero sample rate is reported on its own; there is no meaningful cap.
+    if sample_rate == 0 {
+        return;
+    }
+    let max = MAX_SONG_HOURS * 3_600 * u64::from(sample_rate);
+    let longest = lengths
+        .iter()
+        .copied()
+        .reduce(|longest, stem| if stem.1 > longest.1 { stem } else { longest });
+    if let Some((stem, length)) = longest
+        && length > max
+    {
+        errors.push(ValidationError::SongTooLong {
+            stem: stem.to_owned(),
+            length,
+            max,
+        });
+    }
 }
 
 fn check_positions(
@@ -578,6 +710,9 @@ fn check_sections(
     song_end: Option<u64>,
     errors: &mut Vec<ValidationError>,
 ) {
+    if sections.is_empty() {
+        errors.push(ValidationError::NoSections);
+    }
     if let Some(first) = sections.first()
         && first.start != 0
     {
@@ -620,6 +755,11 @@ fn check_arrangements(package: &SongPackage, errors: &mut Vec<ValidationError>) 
     }
     let known: HashSet<&str> = package.sections.iter().map(|s| s.id.as_str()).collect();
     for arrangement in &package.arrangements {
+        if arrangement.sections.is_empty() {
+            errors.push(ValidationError::EmptyArrangement {
+                arrangement: arrangement.id.clone(),
+            });
+        }
         let mut reported = HashSet::new();
         for id in arrangement
             .sections

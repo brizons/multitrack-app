@@ -19,8 +19,9 @@ pub use compile::{
     DEFAULT_SEAM_CROSSFADE, RenderPlan, Segment, compile,
 };
 pub use package::{
-    Arrangement, DEFAULT_ARRANGEMENT_ID, FORMAT_VERSION, IdKind, MAX_BPM, MIN_BPM, ManifestError,
-    MapKind, SectionMarker, SectionType, SongPackage, Stem, StemInfo, StemRole, TempoPoint,
-    TimeSignaturePoint, Validated, ValidationError, ValidationWarning, validate,
+    Arrangement, DEFAULT_ARRANGEMENT_ID, FORMAT_VERSION, IdKind, MAX_BPM, MAX_SONG_HOURS, MIN_BPM,
+    ManifestError, MapKind, SectionMarker, SectionType, SongPackage, Stem, StemInfo,
+    StemPathProblem, StemRole, TempoPoint, TimeSignaturePoint, Validated, ValidationError,
+    ValidationWarning, validate,
 };
 pub use song::{Section, Song};

@@ -13,9 +13,13 @@ use crate::timeline::Timeline;
 pub const DEFAULT_SEAM_CROSSFADE: u64 = 256;
 
 /// When a guide cue plays relative to the section it announces (F4.2).
+///
+/// "One bar" is the bar the musician hears just before the section in the
+/// output: one bar of the preceding segment, at the tempo and meter of its last
+/// source sample. The first segment has no preceding bar and uses its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CueTiming {
-    /// One bar before the section starts, at the section's start tempo and meter.
+    /// One bar before the section starts.
     #[default]
     OneBarBefore,
     /// Exactly at the section start.
@@ -25,13 +29,13 @@ pub enum CueTiming {
 /// Settings that shape the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompileOptions {
-    /// Crossfade length, in samples, recorded on segments whose source position
-    /// jumps. Default [`DEFAULT_SEAM_CROSSFADE`].
+    /// Crossfade length, in samples, at seams where the source jumps (see
+    /// [`Segment`]). Default [`DEFAULT_SEAM_CROSSFADE`].
     pub seam_crossfade: u64,
     /// When cues play. Default [`CueTiming::OneBarBefore`].
     pub cue_timing: CueTiming,
-    /// Length every cue reserves, in samples; `None` means one bar at the
-    /// announced section's start tempo and meter.
+    /// Length every cue reserves, in samples; `None` means one bar, measured
+    /// as in [`CueTiming`].
     pub cue_length: Option<u64>,
 }
 
@@ -61,6 +65,17 @@ pub struct RenderPlan {
 }
 
 /// One section played from the source.
+///
+/// Segments are contiguous: each `out_start` is the previous `out_start + len`.
+/// At a seam where the source jumps (the incoming `src_start` is not the
+/// outgoing `src_start + len`), the incoming segment has `fade_in = n` and the
+/// outgoing segment has `fade_out = n`. During the first `n` output samples of
+/// the incoming segment the outgoing segment keeps reading its source past its
+/// end, `src_start + len .. src_start + len + n`, fading out while the incoming
+/// one fades in (equal power). `n` is [`CompileOptions::seam_crossfade`] capped
+/// by the incoming `len` and by the source audio left after the outgoing end.
+/// Contiguous seams have both fades at 0, as do the first `fade_in` and the
+/// last `fade_out`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
     /// Id of the section this segment plays.
@@ -71,9 +86,12 @@ pub struct Segment {
     pub src_start: u64,
     /// Number of samples.
     pub len: u64,
-    /// Crossfade the renderer applies at the start of this segment, in samples;
-    /// non-zero only where the source jumps (capped at `len`).
-    pub crossfade_in: u64,
+    /// Samples at the start of this segment that fade in over the previous
+    /// segment's fade-out; 0 unless the source jumps here.
+    pub fade_in: u64,
+    /// Samples this segment keeps playing past its end, fading out under the
+    /// next segment's fade-in; equal to the next segment's `fade_in`.
+    pub fade_out: u64,
 }
 
 /// One click tick.
@@ -85,8 +103,11 @@ pub struct ClickEvent {
     pub level: ClickLevel,
 }
 
-/// Click level. BPM counts the time-signature denominator note, so a "beat"
-/// below is one denominator note.
+/// Click level, relative to the beat. BPM counts the time-signature
+/// denominator note, so a beat is one denominator note: the levels are the bar
+/// start, the other beats, the half-beats, and the quarter-beats. In 4/4 they
+/// are the accent, quarter, eighth, and sixteenth notes of F3.2; in 6/8 a
+/// `Quarter` tick falls on every eighth note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ClickLevel {
     /// Beat 1 of a bar.
@@ -110,6 +131,9 @@ pub struct CueEvent {
     pub section_type: SectionType,
     /// Number of the announced section.
     pub number: Option<u32>,
+    /// Samples the cue reserves from `at`; the next cue never starts earlier
+    /// than `at + len`.
+    pub len: u64,
 }
 
 /// Why a plan could not be compiled.
@@ -119,12 +143,6 @@ pub enum CompileError {
     #[error("unknown arrangement \"{id}\"")]
     UnknownArrangement {
         /// The requested id.
-        id: String,
-    },
-    /// The arrangement lists no sections.
-    #[error("arrangement \"{id}\" has no sections")]
-    EmptyArrangement {
-        /// The arrangement id.
         id: String,
     },
 }
@@ -140,18 +158,14 @@ pub fn compile(
             .ok_or_else(|| CompileError::UnknownArrangement {
                 id: arrangement_id.to_owned(),
             })?;
-    if arrangement.sections.is_empty() {
-        return Err(CompileError::EmptyArrangement {
-            id: arrangement_id.to_owned(),
-        });
-    }
-    // `validate` guarantees every reference resolves, so nothing is skipped.
+    // `validate` guarantees the arrangement is not empty and every reference
+    // resolves, so nothing is skipped.
     let sections: Vec<&Section> = arrangement
         .sections
         .iter()
         .filter_map(|id| song.section(id))
         .collect();
-    let segments = segments(&sections, options.seam_crossfade);
+    let segments = segments(&sections, options.seam_crossfade, song.length());
     let timeline = Timeline::new(song);
     let clicks = clicks(&timeline, &segments);
     let cues = cues(&timeline, &sections, &segments, options);
@@ -167,23 +181,31 @@ pub fn compile(
     })
 }
 
-/// Lays the sections end to end from output sample 0.
-fn segments(sections: &[&Section], seam_crossfade: u64) -> Vec<Segment> {
-    let mut segments = Vec::with_capacity(sections.len());
+/// Lays the sections end to end from output sample 0 and records the
+/// crossfade at every seam where the source jumps (see [`Segment`]).
+fn segments(sections: &[&Section], seam_crossfade: u64, song_length: u64) -> Vec<Segment> {
+    let mut segments: Vec<Segment> = Vec::with_capacity(sections.len());
     let mut out_start = 0u64;
-    let mut previous_src_end = None;
     for section in sections {
         let len = section.length();
-        let jumps = previous_src_end.is_some_and(|end| end != section.start);
+        let mut fade_in = 0;
+        if let Some(outgoing) = segments.last_mut() {
+            let outgoing_end = outgoing.src_start + outgoing.len;
+            if outgoing_end != section.start {
+                let source_left = song_length.saturating_sub(outgoing_end);
+                fade_in = seam_crossfade.min(len).min(source_left);
+                outgoing.fade_out = fade_in;
+            }
+        }
         segments.push(Segment {
             section_id: section.id.clone(),
             out_start,
             src_start: section.start,
             len,
-            crossfade_in: if jumps { seam_crossfade.min(len) } else { 0 },
+            fade_in,
+            fade_out: 0,
         });
         out_start = out_start.saturating_add(len);
-        previous_src_end = Some(section.end);
     }
     segments
 }
@@ -223,8 +245,8 @@ fn cues(
 ) -> Vec<CueEvent> {
     let mut cues = Vec::new();
     let mut previous_end = 0u64;
-    for (section, segment) in sections.iter().zip(segments) {
-        let bar = timeline.bar_length_at(segment.src_start);
+    for (index, (section, segment)) in sections.iter().zip(segments).enumerate() {
+        let bar = bar_before(timeline, segments, index);
         let cue_length = options.cue_length.unwrap_or(bar);
         if segment.len < cue_length {
             continue;
@@ -245,7 +267,24 @@ fn cues(
             section_id: section.id.clone(),
             section_type: section.section_type,
             number: section.number,
+            len: cue_length,
         });
     }
     cues
+}
+
+/// The bar heard just before segment `index` in the output: one bar at the
+/// tempo and meter of the preceding segment's last source sample. The first
+/// segment has nothing before it and uses its own first bar.
+fn bar_before(timeline: &Timeline<'_>, segments: &[Segment], index: usize) -> u64 {
+    match index
+        .checked_sub(1)
+        .and_then(|previous| segments.get(previous))
+    {
+        Some(previous) => {
+            let last_sample = (previous.src_start + previous.len).saturating_sub(1);
+            timeline.bar_length_at(last_sample)
+        }
+        None => timeline.bar_length_at(segments[index].src_start),
+    }
 }

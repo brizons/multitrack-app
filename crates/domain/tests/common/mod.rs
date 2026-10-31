@@ -122,8 +122,17 @@ impl SongSpec {
         self
     }
 
+    /// Validates the package with one track stem of `length` samples.
     pub fn build(self) -> Song {
-        let package = SongPackage {
+        let length = self.length;
+        validate(&self.package(), &[info("drums", RATE, length)])
+            .expect("test song is valid")
+            .song
+    }
+
+    /// The package with one track stem, `drums`.
+    pub fn package(self) -> SongPackage {
+        SongPackage {
             format_version: 1,
             title: "Test Song".to_owned(),
             artist: None,
@@ -146,10 +155,7 @@ impl SongSpec {
             stems: vec![stem("drums", StemRole::Track)],
             sections: self.sections,
             arrangements: self.arrangements,
-        };
-        validate(&package, &[info("drums", RATE, self.length)])
-            .expect("test song is valid")
-            .song
+        }
     }
 }
 
