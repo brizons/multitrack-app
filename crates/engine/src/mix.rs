@@ -1,5 +1,6 @@
 //! Stem playback: copies each segment's source range into the output, with
-//! the equal-power crossfade at seams where the source jumps.
+//! the equal-power crossfade at seams where the source jumps. The live player
+//! reuses [`Envelope`] and [`frame_of`], so both paths compute the same gains.
 
 use std::f64::consts::FRAC_PI_2;
 
@@ -9,7 +10,7 @@ use crate::StemAudio;
 
 /// Gain shape over a run of frames.
 #[derive(Clone, Copy)]
-enum Envelope {
+pub(crate) enum Envelope {
     /// Fades in over the first `n` frames, then stays at 1.
     FadeIn(u64),
     /// Fades out over all `n` frames.
@@ -20,7 +21,7 @@ impl Envelope {
     /// Gain at frame `i` of the run. Over a fade of `n` frames the gains are
     /// `sin` (in) and `cos` (out) of `π/2 · t` with `t = (i + 0.5) / n`, so the
     /// two sides of a seam always sum to unit power.
-    fn at(self, i: u64) -> f32 {
+    pub(crate) fn at(self, i: u64) -> f32 {
         let phase = |n: u64| FRAC_PI_2 * ((i as f64 + 0.5) / n as f64);
         match self {
             Self::FadeIn(n) if i < n => phase(n).sin() as f32,
@@ -79,7 +80,7 @@ fn add_frames(
 }
 
 /// Left and right sample of a mono or stereo stem; mono plays on both sides.
-fn frame_of(stem: &StemAudio, frame: usize) -> (f32, f32) {
+pub(crate) fn frame_of(stem: &StemAudio, frame: usize) -> (f32, f32) {
     if stem.channels == 1 {
         let sample = stem.samples[frame];
         (sample, sample)

@@ -1,6 +1,6 @@
 [package]
 name = "engine"
-description = "Offline renderer: plays a compiled RenderPlan against in-memory stems. No I/O."
+description = "Offline renderer and real-time live player for compiled song plans. No I/O."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,4 @@ publish.workspace = true
 
 [dependencies]
 domain.workspace = true
+rtrb.workspace = true

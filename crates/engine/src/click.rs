@@ -42,6 +42,16 @@ impl ClickBursts {
         Self { tables }
     }
 
+    /// Number of frames in every burst.
+    pub(crate) fn len(&self) -> usize {
+        self.tables[0].len()
+    }
+
+    /// The burst samples for `level`, at level 1.0.
+    pub(crate) fn table(&self, level: ClickLevel) -> &[f32] {
+        &self.tables[level_index(level)]
+    }
+
     /// Adds the burst for `level`, scaled by `gain`, to both channels from
     /// output frame `at`; a gain of 0.0 adds nothing.
     pub(crate) fn add(&self, output: &mut [f32], at: u64, level: ClickLevel, gain: f32) {
@@ -49,7 +59,7 @@ impl ClickBursts {
             return;
         }
         let out_frames = (output.len() / 2) as u64;
-        let burst = &self.tables[level_index(level)];
+        let burst = self.table(level);
         let len = (burst.len() as u64).min(out_frames.saturating_sub(at));
         for (i, sample) in burst.iter().take(len as usize).enumerate() {
             let value = sample * gain;
