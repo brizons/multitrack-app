@@ -3576,8 +3576,11 @@ name = "multitrack-desktop"
 version = "0.1.0"
 dependencies = [
  "app",
+ "domain",
  "gpui",
+ "hound",
  "io-cpal",
+ "tempfile",
 ]
 
 [[package]]

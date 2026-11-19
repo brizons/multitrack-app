@@ -21,3 +21,8 @@ app.workspace = true
 # (Xcode 26 ships it as a separate download). Other platforms ignore it.
 gpui = { workspace = true, features = ["runtime_shaders"] }
 io-cpal.workspace = true
+
+[dev-dependencies]
+domain.workspace = true
+hound.workspace = true
+tempfile.workspace = true
