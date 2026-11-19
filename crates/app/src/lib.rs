@@ -30,8 +30,10 @@
 //! - The seam crossfade of the player and of the disk stream come from one
 //!   option, and the window the disk keeps ahead of the playhead must cover
 //!   [`MAX_BUFFER_FRAMES`].
-//! - A lost device pauses the transport with a clear message; when it comes
-//!   back, the stream opens again with the transport still paused.
+//! - A lost device pauses the transport with a message that says why the
+//!   stream stopped; when it comes back, the stream opens again with the
+//!   transport still paused, and a device that is back but refuses to open
+//!   says why.
 //! - Decode failures and a queued jump waiting for its audio show in
 //!   [`Snapshot::last_error`] until they are over; so do a play that gave up
 //!   waiting for the disk and a lost device.
@@ -52,8 +54,8 @@ pub use engine::live::{FadeState, JumpKind, JumpTiming};
 pub use error::{OpenError, RuntimeError};
 pub use library::{LoadError, SongProblem};
 pub use output::{
-    AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceInfo, MAX_BUFFER_FRAMES, MIN_BUFFER_FRAMES,
-    OutputError, OutputRequest, OutputStream, StreamHealth, StreamInfo,
+    AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceInfo, LossReason, MAX_BUFFER_FRAMES,
+    MIN_BUFFER_FRAMES, OutputError, OutputRequest, OutputStream, StreamHealth, StreamInfo,
 };
 pub use renderer::AudioRenderer;
 pub use session::{

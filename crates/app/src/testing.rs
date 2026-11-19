@@ -3,22 +3,21 @@
 //! [`FakeOutput`] implements [`AudioOutput`]. Nothing runs on its own: the
 //! test calls [`FakeOutput::render`] to run one audio callback, so the
 //! player is driven deterministically. Devices can be unplugged and plugged
-//! back in.
+//! back in, lose their stream for another reason, and change the rates they
+//! run at.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use crate::output::{
-    AudioOutput, DeviceInfo, OutputError, OutputRequest, OutputStream, StreamHealth, StreamInfo,
+    AudioOutput, DeviceInfo, LossReason, OutputError, OutputRequest, OutputStream, StreamHealth,
+    StreamInfo,
 };
 use crate::renderer::AudioRenderer;
 
 /// Name of the device [`FakeOutput::new`] offers.
 pub const FAKE_DEVICE: &str = "Fake Output";
-
-/// Why [`FakeOutput::unplug`] says a stream was lost.
-pub const UNPLUGGED: &str = "the device was unplugged";
 
 /// An in-process audio output; clones share the same devices and stream.
 #[derive(Clone)]
@@ -52,7 +51,7 @@ struct Running {
     id: u64,
     renderer: AudioRenderer,
     device: String,
-    lost: bool,
+    lost: Option<LossReason>,
 }
 
 impl Default for FakeOutput {
@@ -93,21 +92,38 @@ impl FakeOutput {
     /// interleaved stereo output; `None` when no stream plays.
     pub fn render(&self, frames: usize) -> Option<Vec<f32>> {
         let mut state = self.lock();
-        let running = state.stream.as_mut().filter(|running| !running.lost)?;
+        let running = state
+            .stream
+            .as_mut()
+            .filter(|running| running.lost.is_none())?;
         let mut out = vec![0.0f32; 2 * frames];
         running.renderer.render(&mut out);
         Some(out)
     }
 
     /// Removes device `name`: a stream on it stops calling back and reports
-    /// [`StreamHealth::Lost`].
+    /// [`StreamHealth::Lost`] with [`LossReason::Unplugged`].
     pub fn unplug(&self, name: &str) {
         let mut state = self.lock();
         for device in state.devices.iter_mut().filter(|d| d.name == name) {
             device.present = false;
         }
         if let Some(running) = state.stream.as_mut().filter(|r| r.device == name) {
-            running.lost = true;
+            running.lost = Some(LossReason::Unplugged);
+        }
+    }
+
+    /// Ends the stream on device `name` for `reason`; the device stays.
+    pub fn lose(&self, name: &str, reason: LossReason) {
+        if let Some(running) = self.lock().stream.as_mut().filter(|r| r.device == name) {
+            running.lost = Some(reason);
+        }
+    }
+
+    /// From now on, device `name` runs at `rates` (any rate when `None`).
+    pub fn set_rates(&self, name: &str, rates: Option<&[u32]>) {
+        for device in self.lock().devices.iter_mut().filter(|d| d.name == name) {
+            device.rates = rates.map(<[u32]>::to_vec);
         }
     }
 
@@ -120,7 +136,10 @@ impl FakeOutput {
 
     /// Whether a stream is open and playing.
     pub fn is_streaming(&self) -> bool {
-        self.lock().stream.as_ref().is_some_and(|r| !r.lost)
+        self.lock()
+            .stream
+            .as_ref()
+            .is_some_and(|r| r.lost.is_none())
     }
 
     /// Every request [`AudioOutput::open`] accepted, in order.
@@ -212,7 +231,7 @@ impl AudioOutput for FakeOutput {
             id,
             renderer,
             device: info.device.clone(),
-            lost: false,
+            lost: None,
         });
         Ok(Box::new(FakeStream {
             shared: Arc::clone(&self.shared),
@@ -244,9 +263,12 @@ impl OutputStream for FakeStream {
 
     fn health(&self) -> StreamHealth {
         match self.lock().stream.as_ref().filter(|r| r.id == self.id) {
-            Some(running) if !running.lost => StreamHealth::Running,
-            _ => StreamHealth::Lost {
-                reason: UNPLUGGED.to_owned(),
+            Some(Running { lost: None, .. }) => StreamHealth::Running,
+            Some(Running {
+                lost: Some(reason), ..
+            }) => StreamHealth::Lost { reason: *reason },
+            None => StreamHealth::Lost {
+                reason: LossReason::Unplugged,
             },
         }
     }

@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use app::{
-    AudioOutput, AudioRenderer, DeviceInfo, OutputError, OutputRequest, OutputStream, StreamHealth,
-    StreamInfo,
+    AudioOutput, AudioRenderer, DeviceInfo, LossReason, OutputError, OutputRequest, OutputStream,
+    StreamHealth, StreamInfo,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
@@ -181,8 +181,8 @@ where
             write_interleaved(data, channels, &mut stereo, |piece| renderer.render(piece));
         },
         move |error: cpal::Error| {
-            if let Some(code) = loss_code(error.kind()) {
-                health.store(code, Ordering::SeqCst);
+            if let Some(reason) = loss_reason(error.kind()) {
+                health.store(encode(reason), Ordering::SeqCst);
             }
         },
         None,
@@ -203,11 +203,9 @@ impl OutputStream for CpalStream {
     }
 
     fn health(&self) -> StreamHealth {
-        match self.health.load(Ordering::SeqCst) {
-            RUNNING => StreamHealth::Running,
-            code => StreamHealth::Lost {
-                reason: LOSS_REASONS[usize::from(code) - 1].to_owned(),
-            },
+        match decode(self.health.load(Ordering::SeqCst)) {
+            None => StreamHealth::Running,
+            Some(reason) => StreamHealth::Lost { reason },
         }
     }
 }
@@ -354,30 +352,41 @@ pub fn write_interleaved<T>(
 /// A stream that still plays.
 const RUNNING: u8 = 0;
 
-/// Why a stream was lost, by `loss_code - 1`.
-const LOSS_REASONS: [&str; 6] = [
-    "the device was disconnected",
-    "the system invalidated the stream, for example because the device's sample rate changed",
-    "the system moved the stream to another device",
-    "the device is busy with another application",
-    "the audio system stopped",
-    "the audio system reported an error",
+/// Every loss reason, in the order the health atomic encodes them from 1.
+const LOSSES: [LossReason; 6] = [
+    LossReason::Unplugged,
+    LossReason::StreamInvalidated,
+    LossReason::DeviceChanged,
+    LossReason::DeviceBusy,
+    LossReason::HostStopped,
+    LossReason::Failed,
 ];
-
-fn loss_code(kind: ErrorKind) -> Option<u8> {
-    match kind {
-        ErrorKind::Xrun | ErrorKind::RealtimeDenied => None,
-        ErrorKind::DeviceNotAvailable => Some(1),
-        ErrorKind::StreamInvalidated => Some(2),
-        ErrorKind::DeviceChanged => Some(3),
-        ErrorKind::DeviceBusy => Some(4),
-        ErrorKind::HostUnavailable => Some(5),
-        _ => Some(6),
-    }
-}
 
 /// What a stream error means for the session: why the stream is lost, or
 /// `None` when it plays on (an xrun, or real-time priority refused).
-pub fn loss_reason(kind: ErrorKind) -> Option<String> {
-    loss_code(kind).map(|code| LOSS_REASONS[usize::from(code) - 1].to_owned())
+pub fn loss_reason(kind: ErrorKind) -> Option<LossReason> {
+    match kind {
+        ErrorKind::Xrun | ErrorKind::RealtimeDenied => None,
+        ErrorKind::DeviceNotAvailable => Some(LossReason::Unplugged),
+        ErrorKind::StreamInvalidated => Some(LossReason::StreamInvalidated),
+        ErrorKind::DeviceChanged => Some(LossReason::DeviceChanged),
+        ErrorKind::DeviceBusy => Some(LossReason::DeviceBusy),
+        ErrorKind::HostUnavailable => Some(LossReason::HostStopped),
+        _ => Some(LossReason::Failed),
+    }
+}
+
+/// The health atomic's value for a stream lost for `reason`.
+fn encode(reason: LossReason) -> u8 {
+    let index = LOSSES
+        .iter()
+        .position(|&loss| loss == reason)
+        .expect("`LOSSES` lists every reason");
+    index as u8 + 1
+}
+
+/// The loss reason the health atomic holds; `None` while the stream plays.
+fn decode(code: u8) -> Option<LossReason> {
+    code.checked_sub(1)
+        .and_then(|index| LOSSES.get(usize::from(index)).copied())
 }

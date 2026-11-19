@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use app::testing::{FAKE_DEVICE, FakeOutput, UNPLUGGED};
+use app::testing::{FAKE_DEVICE, FakeOutput};
 use app::{
-    Command, DeviceStatus, FadeState, JumpKind, JumpTiming, LoadError, OpenError, OutputError,
-    OutputRequest, RuntimeError, Session, SessionOptions, StreamInfo, TransportState,
+    Command, DeviceStatus, FadeState, JumpKind, JumpTiming, LoadError, LossReason, OpenError,
+    OutputError, OutputRequest, RuntimeError, Session, SessionOptions, StreamInfo, TransportState,
 };
 use common::{
     BAR, POS_CHORUS, POS_OUTRO, RATE, bits, closed_gate, is_silent, offline, open, play_for, start,
@@ -635,7 +635,8 @@ fn unplugging_the_device_pauses_with_a_clear_message_and_plugging_it_back_restor
         lost.device,
         DeviceStatus::Disconnected {
             device: FAKE_DEVICE.to_owned(),
-            reason: UNPLUGGED.to_owned()
+            reason: LossReason::Unplugged,
+            reopen_error: None,
         }
     );
     assert_eq!(lost.transport, TransportState::Paused);
@@ -643,14 +644,14 @@ fn unplugging_the_device_pauses_with_a_clear_message_and_plugging_it_back_restor
         (playing.source_frame..=playing.source_frame + DECLICK_FRAMES).contains(&lost.source_frame),
         "it paused where it was"
     );
-    let error = RuntimeError::DeviceDisconnected {
+    let error = RuntimeError::DeviceLost {
         device: FAKE_DEVICE.to_owned(),
-        reason: UNPLUGGED.to_owned(),
+        reason: LossReason::Unplugged,
     };
     assert_eq!(lost.last_error, Some(error.clone()));
     assert_eq!(
         error.to_string(),
-        "audio device \"Fake Output\" is disconnected (the device was unplugged); playback is paused until it is plugged back in"
+        "audio device \"Fake Output\" was unplugged; playback is paused until it is plugged back in"
     );
 
     // Play waits for the device; other commands apply at once.
@@ -689,6 +690,118 @@ fn unplugging_the_device_pauses_with_a_clear_message_and_plugging_it_back_restor
     let (resumed, _) = start(&mut session, &fake, 256);
     assert!(!is_silent(&resumed));
     assert_eq!(session.poll().transport, TransportState::Playing);
+}
+
+#[test]
+fn a_device_that_comes_back_but_refuses_to_open_says_why_and_the_session_keeps_trying() {
+    let dir = song();
+    let fake = FakeOutput::new();
+    let mut session = open(
+        dir.path(),
+        &fake,
+        SessionOptions {
+            reconnect_interval: Duration::ZERO,
+            ..options(256)
+        },
+    );
+    start(&mut session, &fake, 256);
+    fake.unplug(FAKE_DEVICE);
+    session.poll();
+
+    // It comes back set to 44.1 kHz only.
+    fake.set_rates(FAKE_DEVICE, Some(&[44_100]));
+    fake.plug(FAKE_DEVICE);
+    session.poll();
+    let refused = session.poll();
+
+    let reopen = OutputError::UnsupportedSampleRate {
+        device: FAKE_DEVICE.to_owned(),
+        requested: RATE,
+        supported: vec![(44_100, 44_100)],
+    };
+    assert_eq!(
+        refused.device,
+        DeviceStatus::Disconnected {
+            device: FAKE_DEVICE.to_owned(),
+            reason: LossReason::Unplugged,
+            reopen_error: Some(reopen.clone()),
+        }
+    );
+    let error = RuntimeError::DeviceReopenFailed {
+        device: FAKE_DEVICE.to_owned(),
+        error: reopen,
+    };
+    assert_eq!(refused.last_error, Some(error.clone()));
+    assert_eq!(
+        error.to_string(),
+        "audio device \"Fake Output\" cannot be opened again: audio device \"Fake Output\" cannot play at 8000 Hz, the song's sample rate (nothing resamples); it supports 44100 Hz; playback stays paused"
+    );
+    assert_eq!(session.send(Command::Play), Err(error));
+    assert_eq!(refused.transport, TransportState::Paused);
+
+    // Gone again: it reads as lost again, not as refused.
+    fake.unplug(FAKE_DEVICE);
+    let gone = session.poll();
+    assert!(matches!(
+        gone.device,
+        DeviceStatus::Disconnected {
+            reopen_error: None,
+            ..
+        }
+    ));
+    assert!(matches!(
+        gone.last_error,
+        Some(RuntimeError::DeviceLost {
+            reason: LossReason::Unplugged,
+            ..
+        })
+    ));
+
+    // Set back to the song's rate, it opens and every device error clears.
+    fake.set_rates(FAKE_DEVICE, None);
+    fake.plug(FAKE_DEVICE);
+    let back = session.poll();
+    assert!(matches!(back.device, DeviceStatus::Connected(_)));
+    assert_eq!(back.last_error, None);
+    assert_eq!(back.transport, TransportState::Paused);
+}
+
+#[test]
+fn the_loss_message_names_why_the_stream_stopped() {
+    let dir = song();
+    for (reason, message) in [
+        (
+            LossReason::DeviceBusy,
+            "audio device \"Fake Output\" stopped: the device is busy with another application; playback is paused until the device opens again",
+        ),
+        (
+            LossReason::StreamInvalidated,
+            "audio device \"Fake Output\" stopped: the system invalidated the stream, for example because the device's sample rate changed; playback is paused until the device opens again",
+        ),
+    ] {
+        let fake = FakeOutput::new();
+        let mut session = open(dir.path(), &fake, options(256));
+        start(&mut session, &fake, 256);
+
+        fake.lose(FAKE_DEVICE, reason);
+        let lost = session.poll();
+
+        assert_eq!(
+            lost.device,
+            DeviceStatus::Disconnected {
+                device: FAKE_DEVICE.to_owned(),
+                reason,
+                reopen_error: None,
+            }
+        );
+        assert_eq!(lost.transport, TransportState::Paused);
+        let error = RuntimeError::DeviceLost {
+            device: FAKE_DEVICE.to_owned(),
+            reason,
+        };
+        assert_eq!(lost.last_error, Some(error.clone()));
+        assert_eq!(error.to_string(), message);
+    }
 }
 
 #[test]

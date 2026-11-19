@@ -49,7 +49,7 @@ The status line holds, separated by `|`: the transport (`STOPPED`, `LOADING`, `P
 
 ## Device lost
 
-Unplugging the device pauses playback; the status line says `NO DEVICE` with the reason, and play is refused until the device is back. Other keys still work. When the same device is plugged back in, play-cli opens it again within half a second, with the transport still paused: press space to go on.
+When the device's stream stops, playback pauses; the status line says `NO DEVICE` with the reason (unplugged, stream invalidated by the system, busy with another application, and so on), and play is refused until the device opens again. Other keys still work. play-cli tries to open the same device again every half second, with the transport still paused: press space to go on. When the device is there but refuses to open, for example because it came back at another sample rate, the status line says why instead (`cannot open it again: …`).
 
 To check it by hand: start a song on a USB interface or headphones, unplug them while it plays, wait, plug them back in, and press space.
 

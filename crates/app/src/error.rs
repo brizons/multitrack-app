@@ -1,12 +1,13 @@
 //! Why a session could not open, and what went wrong while it runs.
 
+use std::fmt;
 use std::time::Duration;
 
 use engine::live::LiveError;
 use library::LoadError;
 use thiserror::Error;
 
-use crate::output::{MAX_BUFFER_FRAMES, MIN_BUFFER_FRAMES, OutputError};
+use crate::output::{LossReason, MAX_BUFFER_FRAMES, MIN_BUFFER_FRAMES, OutputError};
 
 /// Why [`crate::Session::open`] failed.
 #[derive(Debug, Error)]
@@ -56,15 +57,24 @@ pub enum RuntimeError {
         /// How long play waited.
         waited: Duration,
     },
-    /// The device stopped (F8 acceptance).
-    #[error(
-        "audio device \"{device}\" is disconnected ({reason}); playback is paused until it is plugged back in"
-    )]
-    DeviceDisconnected {
-        /// The device that played.
+    /// The stream on the device stopped for good (F8 acceptance); the
+    /// transport is paused until the device opens again.
+    #[error("{}", Lost { device, reason: *reason })]
+    DeviceLost {
+        /// Name of the device that played.
         device: String,
-        /// What the port said.
-        reason: String,
+        /// Why the stream stopped.
+        reason: LossReason,
+    },
+    /// The lost device could not be opened again for another reason than
+    /// being absent, such as a device that came back at another sample
+    /// rate; the session keeps trying and the transport stays paused.
+    #[error("audio device \"{device}\" cannot be opened again: {error}; playback stays paused")]
+    DeviceReopenFailed {
+        /// Name of the device that played.
+        device: String,
+        /// Why the last try failed.
+        error: OutputError,
     },
     /// The disk thread could not decode some blocks (advisory A5).
     #[error("the disk could not decode {blocks} block(s) of audio; they play as silence")]
@@ -101,4 +111,27 @@ pub enum RuntimeError {
     /// closed, so this session cannot play any more.
     #[error("the audio output did not release the player; open the song again")]
     PlayerLost,
+}
+
+/// The message of [`RuntimeError::DeviceLost`]: what happened, then what
+/// brings the device back.
+struct Lost<'a> {
+    device: &'a str,
+    reason: LossReason,
+}
+
+impl fmt::Display for Lost<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let device = self.device;
+        match self.reason {
+            LossReason::Unplugged => write!(
+                f,
+                "audio device \"{device}\" was unplugged; playback is paused until it is plugged back in"
+            ),
+            reason => write!(
+                f,
+                "audio device \"{device}\" stopped: {reason}; playback is paused until the device opens again"
+            ),
+        }
+    }
 }

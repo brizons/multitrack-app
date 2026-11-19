@@ -3,8 +3,9 @@
 use std::time::Duration;
 
 use app::{
-    Command, DeviceInfo, DeviceStatus, FadeState, FadeView, JumpKind, JumpTiming, PositionInfo,
-    QueuedView, RuntimeError, Snapshot, SongInfo, StreamInfo, TransportState,
+    Command, DeviceInfo, DeviceStatus, FadeState, FadeView, JumpKind, JumpTiming, LossReason,
+    OutputError, PositionInfo, QueuedView, RuntimeError, Snapshot, SongInfo, StreamInfo,
+    TransportState,
 };
 use play_cli::{Action, action_for_key, device_list, status_line};
 
@@ -186,14 +187,48 @@ fn the_status_line_shows_the_queue_loops_fade_progress_and_problems() {
         },
         device: DeviceStatus::Disconnected {
             device: "Interface".to_owned(),
-            reason: "the device was disconnected".to_owned(),
+            reason: LossReason::Unplugged,
+            reopen_error: None,
         },
         ..snapshot()
     };
     assert_eq!(
         status_line(&looping, &song()),
-        "PAUSED   | bar 3.2 | Verse 1 (2/3) | next: loop Verse 1 in 1.5 s | timing: section end | fade: out | NO DEVICE: \"Interface\" (the device was disconnected)"
+        "PAUSED   | bar 3.2 | Verse 1 (2/3) | next: loop Verse 1 in 1.5 s | timing: section end | fade: out | NO DEVICE: \"Interface\" (the device was unplugged)"
     );
+}
+
+#[test]
+fn the_status_line_says_why_a_lost_device_does_not_open_again() {
+    let busy = Snapshot {
+        transport: TransportState::Paused,
+        device: DeviceStatus::Disconnected {
+            device: "Interface".to_owned(),
+            reason: LossReason::DeviceBusy,
+            reopen_error: None,
+        },
+        ..snapshot()
+    };
+    assert!(
+        status_line(&busy, &song())
+            .ends_with("NO DEVICE: \"Interface\" (the device is busy with another application)")
+    );
+
+    let refused = Snapshot {
+        device: DeviceStatus::Disconnected {
+            device: "Interface".to_owned(),
+            reason: LossReason::Unplugged,
+            reopen_error: Some(OutputError::UnsupportedSampleRate {
+                device: "Interface".to_owned(),
+                requested: 48_000,
+                supported: vec![(44_100, 44_100)],
+            }),
+        },
+        ..busy
+    };
+    assert!(status_line(&refused, &song()).ends_with(
+        "NO DEVICE: \"Interface\" (cannot open it again: audio device \"Interface\" cannot play at 48000 Hz, the song's sample rate (nothing resamples); it supports 44100 Hz)"
+    ));
 }
 
 #[test]

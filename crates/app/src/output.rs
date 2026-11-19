@@ -70,12 +70,44 @@ impl StreamInfo {
 pub enum StreamHealth {
     /// The device calls the renderer.
     Running,
-    /// The device stopped calling the renderer for good: it was unplugged,
-    /// or the system invalidated the stream.
+    /// The device stopped calling the renderer for good.
     Lost {
-        /// What the port knows about why.
-        reason: String,
+        /// Why, as far as the port knows.
+        reason: LossReason,
     },
+}
+
+/// Why a stream stopped for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossReason {
+    /// The device was unplugged or disappeared.
+    Unplugged,
+    /// The system invalidated the stream, for example because the device's
+    /// sample rate changed.
+    StreamInvalidated,
+    /// The system moved the stream to another device.
+    DeviceChanged,
+    /// Another application took the device.
+    DeviceBusy,
+    /// The audio system itself stopped.
+    HostStopped,
+    /// The audio system reported another error.
+    Failed,
+}
+
+impl fmt::Display for LossReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unplugged => "the device was unplugged",
+            Self::StreamInvalidated => {
+                "the system invalidated the stream, for example because the device's sample rate changed"
+            }
+            Self::DeviceChanged => "the system moved the stream to another device",
+            Self::DeviceBusy => "the device is busy with another application",
+            Self::HostStopped => "the audio system stopped",
+            Self::Failed => "the audio system reported an error",
+        })
+    }
 }
 
 /// An open output stream. Dropping it stops the stream and drops the
