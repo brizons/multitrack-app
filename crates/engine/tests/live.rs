@@ -1602,3 +1602,34 @@ fn asking_whether_the_playhead_is_ready_changes_nothing_the_player_plays() {
     };
     assert_eq!(bits(&asking), bits(&plain.output));
 }
+
+#[test]
+fn applied_commands_counts_what_the_player_took_from_the_queue() {
+    let setup = full();
+    let (mut player, mut controller) = player(&setup, 1_024);
+    let mut out = vec![0.0f32; 2 * 1_024];
+    assert_eq!(player.applied_commands(), 0);
+    controller.send(Command::Play).unwrap();
+    for _ in 0..40 {
+        player.process(&mut out);
+    }
+    controller.send(Command::Pause).unwrap();
+    player.process(&mut out);
+    assert_eq!(player.applied_commands(), 2);
+    assert_eq!(player.status().position, POS_VERSE);
+
+    controller.send(Command::BackToStart).unwrap();
+    controller.send(Command::SetInfinite(true)).unwrap();
+    assert_eq!(
+        (player.applied_commands(), player.status().position),
+        (2, POS_VERSE),
+        "nothing is applied before the next buffer"
+    );
+    player.process(&mut []);
+    assert_eq!(player.applied_commands(), 4);
+    let moved = player.status();
+    assert_eq!(
+        (moved.transport, moved.position, moved.source_frame),
+        (Transport::Paused, 0, 0)
+    );
+}

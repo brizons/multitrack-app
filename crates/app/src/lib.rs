@@ -33,7 +33,10 @@
 //! - A lost device pauses the transport with a clear message; when it comes
 //!   back, the stream opens again with the transport still paused.
 //! - Decode failures and a queued jump waiting for its audio show in
-//!   [`Snapshot::last_error`].
+//!   [`Snapshot::last_error`] until they are over; so do a play that gave up
+//!   waiting for the disk and a lost device.
+//! - Play decides whether the disk is ready from a report that describes the
+//!   playhead every command sent before it left, never from an older one.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

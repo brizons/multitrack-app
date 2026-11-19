@@ -401,6 +401,179 @@ fn a_jump_waiting_for_its_audio_shows_as_the_last_error() {
 }
 
 #[test]
+fn the_waiting_jump_error_clears_once_the_jump_executes_or_is_cancelled() {
+    for cancel in [false, true] {
+        let dir = song();
+        let (gate, open_gate) = gate_from(6 * BAR);
+        let fake = FakeOutput::new();
+        let mut session = open(
+            dir.path(),
+            &fake,
+            SessionOptions {
+                disk_gate: Some(gate),
+                ..options(1_024)
+            },
+        );
+        start(&mut session, &fake, 1_024);
+        session
+            .send(Command::QueueJump {
+                position: POS_OUTRO,
+            })
+            .unwrap();
+        let (_, waiting) = play_for(&mut session, &fake, 1_024, 2 * BAR as usize + 1_024);
+        assert_eq!(waiting.position, 1, "the jump moved on to the verse's end");
+        assert!(matches!(
+            waiting.last_error,
+            Some(RuntimeError::JumpWaiting { deferrals: 1, .. })
+        ));
+
+        let done = if cancel {
+            session.send(Command::CancelJump).unwrap();
+            let (_, cancelled) = play_for(&mut session, &fake, 1_024, 1_024);
+            assert_eq!(cancelled.position, 1);
+            cancelled
+        } else {
+            open_gate.store(true, Ordering::SeqCst);
+            let (_, jumped) = play_for(&mut session, &fake, 1_024, 2 * BAR as usize);
+            assert_eq!(jumped.position, POS_OUTRO, "the jump executed");
+            jumped
+        };
+        assert_eq!(done.queued, None);
+        assert_eq!(done.last_error, None, "cancelled: {cancel}");
+    }
+}
+
+#[test]
+fn a_start_timeout_clears_once_play_starts() {
+    let dir = song();
+    let (gate, open_gate) = closed_gate();
+    let fake = FakeOutput::new();
+    let mut session = open(
+        dir.path(),
+        &fake,
+        SessionOptions {
+            disk_gate: Some(gate),
+            start_timeout: Duration::from_millis(50),
+            ..options(256)
+        },
+    );
+    session.send(Command::Play).unwrap();
+    fake.render(256).unwrap();
+    thread::sleep(Duration::from_millis(60));
+    let timed_out = session.poll();
+    assert_eq!(timed_out.transport, TransportState::Stopped);
+    assert!(matches!(
+        timed_out.last_error,
+        Some(RuntimeError::StartTimeout { .. })
+    ));
+
+    open_gate.store(true, Ordering::SeqCst);
+    let (_, playing) = start(&mut session, &fake, 256);
+
+    assert_eq!(playing.transport, TransportState::Playing);
+    assert_eq!(playing.last_error, None);
+}
+
+#[test]
+fn a_decode_failure_clears_once_playback_runs_clean_for_two_read_ahead_windows() {
+    let dir = song();
+    let (gate, open_gate) = gate_from(2 * BAR);
+    let fake = FakeOutput::new();
+    let mut session = open(
+        dir.path(),
+        &fake,
+        SessionOptions {
+            disk_gate: Some(gate),
+            ..options(1_024)
+        },
+    );
+    // The drums lose everything from the verse on, after they were checked.
+    let drums = OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("stems/drums.wav"))
+        .unwrap();
+    drums.set_len(44 + 2 * 2 * BAR).unwrap();
+    open_gate.store(true, Ordering::SeqCst);
+    start(&mut session, &fake, 1_024);
+    let (_, failing) = play_for(&mut session, &fake, 1_024, 2 * BAR as usize + 8_192);
+    assert!(failing.decode_errors > 0 && failing.underruns > 0);
+    assert!(matches!(
+        failing.last_error,
+        Some(RuntimeError::DecodeFailed { .. })
+    ));
+
+    // Back in the intro, every block decodes and every read is served.
+    session.send(Command::BackToStart).unwrap();
+    let (_, soon) = play_for(&mut session, &fake, 1_024, 4_096);
+    assert!(
+        matches!(soon.last_error, Some(RuntimeError::DecodeFailed { .. })),
+        "one clean stretch shorter than the window does not clear it"
+    );
+    // The read-ahead window is 1 s: 8 000 frames at 8 kHz.
+    let (_, clean) = play_for(&mut session, &fake, 1_024, 2 * 8_000);
+
+    assert_eq!(clean.position, 0);
+    assert_eq!(
+        clean.decode_errors, failing.decode_errors,
+        "nothing new failed"
+    );
+    assert_eq!(clean.last_error, None);
+}
+
+#[test]
+fn play_right_after_back_to_start_waits_for_a_report_about_the_new_playhead() {
+    let dir = song();
+    let fake = FakeOutput::new();
+    let mut session = open(dir.path(), &fake, options(256));
+    let monitor = session.disk_monitor();
+    start(&mut session, &fake, 256);
+    play_for(&mut session, &fake, 256, 3 * BAR as usize);
+    session.send(Command::Pause).unwrap();
+    let (_, paused) = play_for(&mut session, &fake, 256, 1_024);
+    assert_eq!(
+        (paused.transport, paused.position),
+        (TransportState::Paused, 1)
+    );
+
+    // Both arrive before the audio thread runs again: the last report is
+    // still about the verse.
+    session.send(Command::BackToStart).unwrap();
+    session.send(Command::Play).unwrap();
+    assert_eq!(session.poll().transport, TransportState::Starting);
+    let (out, moved) = step(&mut session, &fake, &monitor, 256);
+
+    assert!(
+        is_silent(&out),
+        "play is not sent on a report about the old playhead"
+    );
+    assert_eq!(moved.transport, TransportState::Starting);
+    assert_eq!((moved.position, moved.source_frame), (0, 0));
+    let (out, playing) = step(&mut session, &fake, &monitor, 256);
+    assert!(!is_silent(&out));
+    assert_eq!(playing.transport, TransportState::Playing);
+    assert_eq!(playing.source_frame, 256, "it plays from the start");
+    assert_eq!(playing.underruns, 0);
+}
+
+#[test]
+fn play_right_after_pause_while_playing_still_resumes_at_once() {
+    let dir = song();
+    let fake = FakeOutput::new();
+    let mut session = open(dir.path(), &fake, options(256));
+    let monitor = session.disk_monitor();
+    start(&mut session, &fake, 256);
+    let (_, playing) = play_for(&mut session, &fake, 256, 4_096);
+
+    session.send(Command::Pause).unwrap();
+    session.send(Command::Play).unwrap();
+    let (out, snapshot) = step(&mut session, &fake, &monitor, 256);
+
+    assert!(!is_silent(&out));
+    assert_eq!(snapshot.transport, TransportState::Playing);
+    assert_eq!(snapshot.source_frame, playing.source_frame + 256);
+}
+
+#[test]
 fn blocks_the_disk_cannot_decode_show_as_the_last_error() {
     let dir = song();
     let (gate, open_gate) = gate_from(BAR);

@@ -72,7 +72,9 @@ pub enum Command {
     /// Starts or resumes playing. From stopped or paused, it first waits
     /// until the disk has the audio at the playhead (the snapshot says
     /// [`TransportState::Starting`]), at most
-    /// [`SessionOptions::start_timeout`].
+    /// [`SessionOptions::start_timeout`]; the playhead is where every
+    /// command sent before it left it, such as the start after
+    /// [`Command::BackToStart`].
     Play,
     /// Ramps out and holds the position.
     Pause,
@@ -195,7 +197,22 @@ pub struct Snapshot {
     pub underruns: u64,
     /// Blocks the disk thread could not decode.
     pub decode_errors: u64,
-    /// The most recent problem, until a newer one replaces it.
+    /// The most recent problem. A problem tied to a condition clears when
+    /// the condition ends, unless a newer problem replaced it first:
+    ///
+    /// - [`RuntimeError::JumpWaiting`]: when the jump executes, is cancelled
+    ///   or is replaced by one that has not waited.
+    /// - [`RuntimeError::StartTimeout`]: when play is sent again.
+    /// - [`RuntimeError::DecodeFailed`]: once the transport has played two of
+    ///   the disk's read-ahead windows (2 s by default) with no new decode
+    ///   failure and no underrun. The disk reports a failed block at most
+    ///   one window ahead of the playhead, so by then playback is past it.
+    ///   Failed blocks are not decoded again; [`Self::decode_errors`] keeps
+    ///   counting them.
+    ///
+    /// Events stay until a newer problem replaces them: a refused command
+    /// ([`RuntimeError::QueueFull`], [`RuntimeError::UnknownPosition`]) and
+    /// [`RuntimeError::PlayerLost`], which never ends.
     pub last_error: Option<RuntimeError>,
 }
 
@@ -254,6 +271,15 @@ pub struct Session {
     last_error: Option<RuntimeError>,
     decode_errors_seen: u64,
     deferral_seen: Option<(usize, u32)>,
+    /// Commands the controller accepted; a report that has applied as many
+    /// describes the playhead they left.
+    sent: u64,
+    /// Frames the disk keeps decoded ahead of the playhead.
+    ahead_frames: u64,
+    underruns_seen: u64,
+    output_frame_seen: u64,
+    /// Frames played since the last new decode failure or underrun.
+    clean_frames: u64,
 }
 
 impl Session {
@@ -311,6 +337,7 @@ impl Session {
         let first = Report {
             status: player.status(),
             ready: false,
+            applied: 0,
         };
         let (input, reports) = triple_buffer::triple_buffer(&first);
         let mut state = Box::new(AudioState {
@@ -355,6 +382,11 @@ impl Session {
             last_error: None,
             decode_errors_seen: 0,
             deferral_seen: None,
+            sent: 0,
+            ahead_frames: capacity.ahead_frames,
+            underruns_seen: 0,
+            output_frame_seen: 0,
+            clean_frames: 0,
         })
     }
 
@@ -434,6 +466,9 @@ impl Session {
 
     /// Play from stopped or paused waits until the sources have the playhead
     /// ready, so the first buffer is never a silent underrun (advisory A4).
+    /// It decides on a report that describes the playhead every command
+    /// sent so far left; right after back to start, the last report may
+    /// still describe the old playhead, so play waits for the next one.
     fn play(&mut self) -> Result<(), RuntimeError> {
         match &self.link {
             Link::Held { device, reason, .. } => {
@@ -445,12 +480,13 @@ impl Session {
             Link::Lost => return Err(RuntimeError::PlayerLost),
             Link::Streaming { .. } => {}
         }
+        self.clear_error(|error| matches!(error, RuntimeError::StartTimeout { .. }));
         let report = *self.reports.read();
         let silent = matches!(
             report.status.transport,
             Transport::Stopped | Transport::Paused
         );
-        if silent && !report.ready {
+        if silent && !self.can_start(&report) {
             if !matches!(self.start, Some(Start::Waiting { .. })) {
                 self.start = Some(Start::Waiting {
                     deadline: Instant::now() + self.start_timeout,
@@ -472,7 +508,7 @@ impl Session {
             return;
         }
         if let Start::Waiting { deadline } = start {
-            if report.ready {
+            if self.can_start(report) {
                 self.start = Some(Start::Sent);
                 if let Err(error) = self.forward(live::Command::Play) {
                     self.start = None;
@@ -487,10 +523,31 @@ impl Session {
         }
     }
 
+    /// Whether `report` says the playhead is ready, and describes the
+    /// playhead every command sent so far left.
+    fn can_start(&self, report: &Report) -> bool {
+        report.ready && report.applied >= self.sent
+    }
+
+    /// Queues `command` for the player and counts it.
+    fn push(&mut self, command: live::Command) -> Result<(), SendError> {
+        self.controller.send(command)?;
+        self.sent += 1;
+        Ok(())
+    }
+
+    /// Clears the last error when `ended` says the condition behind it is
+    /// over.
+    fn clear_error(&mut self, ended: impl Fn(&RuntimeError) -> bool) {
+        if self.last_error.as_ref().is_some_and(ended) {
+            self.last_error = None;
+        }
+    }
+
     /// Sends `command` to the player. While the device is lost the control
     /// thread holds the player, so it applies the command at once.
     fn forward(&mut self, command: live::Command) -> Result<(), RuntimeError> {
-        self.controller.send(command).map_err(|error| match error {
+        self.push(command).map_err(|error| match error {
             SendError::Full(command) => RuntimeError::QueueFull {
                 command: format!("{command:?}"),
             },
@@ -556,7 +613,7 @@ impl Session {
     /// a panic under way finishes the same way.
     fn pause_now(&mut self, state: &mut AudioState) {
         state.player.process(&mut []);
-        let _ = self.controller.send(live::Command::Pause);
+        let _ = self.push(live::Command::Pause);
         let max_frames = self.request.buffer_frames as usize;
         let mut scratch = vec![0.0f32; 2 * max_frames];
         let longest =
@@ -585,12 +642,7 @@ impl Session {
         match self.output.open(&self.request, renderer) {
             Ok(stream) => {
                 self.link = Link::Streaming { stream, home };
-                if matches!(
-                    self.last_error,
-                    Some(RuntimeError::DeviceDisconnected { .. })
-                ) {
-                    self.last_error = None;
-                }
+                self.clear_error(|error| matches!(error, RuntimeError::DeviceDisconnected { .. }));
             }
             Err(_) => match take_back(home) {
                 Some(state) => {
@@ -606,14 +658,31 @@ impl Session {
         }
     }
 
-    /// Records new decode failures and new deferrals of the queued jump.
+    /// Records new decode failures and new deferrals of the queued jump, and
+    /// clears them once they are over (see [`Snapshot::last_error`]).
     fn watch_disk(&mut self, report: &Report) {
+        let status = &report.status;
+        // The output frame returns to 0 when the transport stops.
+        let played = status
+            .output_frame
+            .checked_sub(self.output_frame_seen)
+            .unwrap_or(status.output_frame);
+        self.output_frame_seen = status.output_frame;
         let errors = self.monitor.decode_errors();
         if errors > self.decode_errors_seen {
             self.decode_errors_seen = errors;
+            self.clean_frames = 0;
             self.last_error = Some(RuntimeError::DecodeFailed { blocks: errors });
+        } else if status.underruns > self.underruns_seen {
+            self.clean_frames = 0;
+        } else {
+            self.clean_frames = self.clean_frames.saturating_add(played);
+            if self.clean_frames >= 2 * self.ahead_frames {
+                self.clear_error(|error| matches!(error, RuntimeError::DecodeFailed { .. }));
+            }
         }
-        match report.status.queued {
+        self.underruns_seen = status.underruns;
+        match status.queued {
             Some(queued) if queued.deferrals > 0 => {
                 let seen = (queued.target, queued.deferrals);
                 if self.deferral_seen != Some(seen) {
@@ -624,7 +693,10 @@ impl Session {
                     });
                 }
             }
-            _ => self.deferral_seen = None,
+            _ => {
+                self.deferral_seen = None;
+                self.clear_error(|error| matches!(error, RuntimeError::JumpWaiting { .. }));
+            }
         }
     }
 

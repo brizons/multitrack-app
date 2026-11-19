@@ -21,6 +21,9 @@ pub(crate) struct Report {
     /// Whether every source can start playing from the playhead; always
     /// true while the transport runs.
     pub(crate) ready: bool,
+    /// Commands the player had applied: the report describes the state
+    /// every command sent up to this count left.
+    pub(crate) applied: u64,
 }
 
 /// The player and the writing end of its snapshot.
@@ -41,7 +44,12 @@ impl AudioState {
     pub(crate) fn publish(&mut self) {
         let status = self.player.status();
         let ready = status.transport.is_running() || self.player.playhead_ready();
-        self.reports.write(Report { status, ready });
+        let applied = self.player.applied_commands();
+        self.reports.write(Report {
+            status,
+            ready,
+            applied,
+        });
     }
 }
 
