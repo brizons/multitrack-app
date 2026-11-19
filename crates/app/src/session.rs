@@ -212,7 +212,8 @@ pub struct Snapshot {
     /// Blocks the disk thread could not decode.
     pub decode_errors: u64,
     /// The most recent problem. A problem tied to a condition clears when
-    /// the condition ends, unless a newer problem replaced it first:
+    /// the condition ends, unless a newer problem replaced it first; it then
+    /// falls back to a decode failure seen earlier, if any (see below):
     ///
     /// - [`RuntimeError::JumpWaiting`]: when the jump executes, is cancelled
     ///   or is replaced by one that has not waited.
@@ -544,11 +545,19 @@ impl Session {
     }
 
     /// Clears the last error when `ended` says the condition behind it is
-    /// over.
+    /// over, falling back to a decode failure that still stands.
     fn clear_error(&mut self, ended: impl Fn(&RuntimeError) -> bool) {
         if self.last_error.as_ref().is_some_and(ended) {
-            self.last_error = None;
+            self.last_error = self.standing_error();
         }
+    }
+
+    /// A problem that outlives any newer one: failed blocks are never
+    /// decoded again, so their audio stays silent for the session.
+    fn standing_error(&self) -> Option<RuntimeError> {
+        (self.decode_errors_seen > 0).then_some(RuntimeError::DecodeFailed {
+            blocks: self.decode_errors_seen,
+        })
     }
 
     /// Sends `command` to the player. While the device is lost the control

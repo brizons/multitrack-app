@@ -40,7 +40,8 @@
 //! - A queued jump waiting for its audio shows in [`Snapshot::last_error`]
 //!   until it is over; so do a play that gave up waiting for the disk and a
 //!   lost device. A decode failure stays until a newer problem replaces it,
-//!   because the failed audio plays as silence every time it comes round.
+//!   and comes back when that problem clears, because the failed audio
+//!   plays as silence every time it comes round.
 //! - Play decides whether the disk is ready from a report that describes the
 //!   playhead every command sent before it left, never from an older one.
 

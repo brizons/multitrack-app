@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use app::testing::{FAKE_DEVICE, FAKE_DEVICE_ID, FakeOutput};
 use app::{
     Command, DeviceChoice, DeviceStatus, FadeState, JumpKind, JumpTiming, LoadError, LossReason,
-    OpenError, OutputError, OutputRequest, RuntimeError, Session, SessionOptions, StreamInfo,
-    TransportState,
+    OpenError, OutputError, OutputRequest, RuntimeError, Session, SessionOptions, Snapshot,
+    StreamInfo, TransportState,
 };
 use common::{
     BAR, POS_CHORUS, POS_OUTRO, RATE, bits, closed_gate, is_silent, offline, open, play_for, start,
@@ -1060,9 +1060,13 @@ fn opening_a_missing_folder_or_arrangement_fails_before_any_device_opens() {
     assert!(matches!(error, OpenError::Output(OutputError::NoDevice)));
 }
 
-/// Committable form of the B1 probe (same helpers as tests/session.rs).
-#[test]
-fn a_failed_section_that_plays_again_after_a_clean_stretch_shows_the_decode_error_again() {
+/// Opens a session on the arrangement `repeat` (intro, chorus, verse,
+/// chorus) whose drums lose the chorus and what follows after the session
+/// checked them; the verse stays whole.
+fn repeat_with_a_failing_chorus(
+    fake: &FakeOutput,
+    extra: SessionOptions,
+) -> (tempfile::TempDir, Session) {
     let dir = song();
     let json = std::fs::read_to_string(dir.path().join("song.json")).unwrap();
     let mut package = domain::SongPackage::from_json(&json).unwrap();
@@ -1077,30 +1081,37 @@ fn a_failed_section_that_plays_again_after_a_clean_stretch_shows_the_decode_erro
     });
     std::fs::write(dir.path().join("song.json"), package.to_json().unwrap()).unwrap();
     let (gate, open_gate) = gate_from(BAR / 2);
-    let fake = FakeOutput::new();
-    let mut session = open(
+    let session = open(
         dir.path(),
-        &fake,
+        fake,
         SessionOptions {
             arrangement: "repeat".to_owned(),
             disk_gate: Some(gate),
-            ..options(256)
+            ..extra
         },
     );
-    // The drums lose the chorus (source bars 4 to 6) and what follows, after
-    // they were checked; the verse stays whole.
+    // The chorus is source bars 4 to 6.
     let drums = OpenOptions::new()
         .write(true)
         .open(dir.path().join("stems/drums.wav"))
         .unwrap();
     drums.set_len(44 + 2 * 4 * BAR).unwrap();
     open_gate.store(true, Ordering::SeqCst);
-    start(&mut session, &fake, 256);
-    let monitor = session.disk_monitor();
+    (dir, session)
+}
 
+/// Plays to the end of the arrangement, calling `each` after every buffer,
+/// and fails when a buffer adds underruns while the snapshot names no
+/// problem. Returns the underruns played.
+fn play_failing_song(
+    session: &mut Session,
+    fake: &FakeOutput,
+    mut each: impl FnMut(&Snapshot, &mut Session),
+) -> u64 {
+    let monitor = session.disk_monitor();
     let mut underruns = 0;
     loop {
-        let (_, snapshot) = step(&mut session, &fake, &monitor, 256);
+        let (_, snapshot) = step(session, fake, &monitor, 256);
         if snapshot.transport == TransportState::Stopped {
             break;
         }
@@ -1111,6 +1122,87 @@ fn a_failed_section_that_plays_again_after_a_clean_stretch_shows_the_decode_erro
             snapshot.position
         );
         underruns = snapshot.underruns;
+        each(&snapshot, session);
     }
+    underruns
+}
+
+#[test]
+fn a_failed_section_that_plays_again_after_a_clean_stretch_shows_the_decode_error_again() {
+    let fake = FakeOutput::new();
+    let (_dir, mut session) = repeat_with_a_failing_chorus(&fake, options(256));
+    start(&mut session, &fake, 256);
+
+    let underruns = play_failing_song(&mut session, &fake, |_, _| {});
+
     assert!(underruns > 0, "the second chorus played its failed blocks");
+}
+
+#[test]
+fn cancelling_a_jump_that_waited_for_failed_audio_shows_the_decode_error_again() {
+    let fake = FakeOutput::new();
+    let (_dir, mut session) = repeat_with_a_failing_chorus(&fake, options(256));
+    start(&mut session, &fake, 256);
+    let mut queued = false;
+    let mut cancelled = false;
+    let mut after_cancel: Option<Option<RuntimeError>> = None;
+
+    // In the verse, queue a jump back to the first chorus: its audio failed,
+    // so the jump waits; cancel it once it does.
+    let underruns = play_failing_song(&mut session, &fake, |snapshot, session| {
+        if snapshot.position == 2 && !queued {
+            session.send(Command::QueueJump { position: 1 }).unwrap();
+            queued = true;
+        }
+        let waiting = matches!(snapshot.last_error, Some(RuntimeError::JumpWaiting { .. }));
+        if !cancelled && waiting {
+            session.send(Command::CancelJump).unwrap();
+            cancelled = true;
+        } else if cancelled && !waiting && after_cancel.is_none() {
+            after_cancel = Some(snapshot.last_error.clone());
+        }
+    });
+
+    assert!(cancelled, "the jump waited for the failed chorus");
+    let after_cancel = after_cancel.expect("the waiting jump ended");
+    assert!(
+        matches!(after_cancel, Some(RuntimeError::DecodeFailed { .. })),
+        "the decode failure is back once the jump is over: {after_cancel:?}"
+    );
+    assert!(underruns > 0, "the second chorus played its failed blocks");
+}
+
+#[test]
+fn a_device_that_plays_again_shows_an_earlier_decode_failure_again() {
+    let fake = FakeOutput::new();
+    let (_dir, mut session) = repeat_with_a_failing_chorus(
+        &fake,
+        SessionOptions {
+            reconnect_interval: Duration::ZERO,
+            ..options(256)
+        },
+    );
+    start(&mut session, &fake, 256);
+    let (_, failing) = play_for(&mut session, &fake, 256, 4 * BAR as usize);
+    assert!(matches!(
+        failing.last_error,
+        Some(RuntimeError::DecodeFailed { .. })
+    ));
+
+    fake.unplug(FAKE_DEVICE_ID);
+    let lost = session.poll();
+    assert!(matches!(
+        lost.last_error,
+        Some(RuntimeError::DeviceLost { .. })
+    ));
+    fake.plug(FAKE_DEVICE_ID);
+    let back = session.poll();
+
+    assert!(matches!(back.device, DeviceStatus::Connected(_)));
+    assert_eq!(
+        back.last_error,
+        Some(RuntimeError::DecodeFailed {
+            blocks: back.decode_errors
+        })
+    );
 }
