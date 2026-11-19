@@ -147,7 +147,8 @@ pub fn status_line(snapshot: &Snapshot, song: &SongInfo) -> String {
 }
 
 /// One line per device, the default marked with `*`, each with its output
-/// channel count (F8.1).
+/// channel count (F8.1) and its id, which `--device` takes when two devices
+/// share a name.
 pub fn device_list(devices: &[DeviceInfo]) -> String {
     if devices.is_empty() {
         return "no audio output device found\n".to_owned();
@@ -158,8 +159,8 @@ pub fn device_list(devices: &[DeviceInfo]) -> String {
         let plural = if device.output_channels == 1 { "" } else { "s" };
         let _ = writeln!(
             list,
-            "{mark} {} ({} output channel{plural})",
-            device.name, device.output_channels
+            "{mark} {} ({} output channel{plural}), id {}",
+            device.name, device.output_channels, device.id
         );
     }
     list

@@ -50,6 +50,7 @@ fn snapshot() -> Snapshot {
         },
         device: DeviceStatus::Connected(StreamInfo {
             device: "Speakers".to_owned(),
+            device_id: "host:speakers".to_owned(),
             sample_rate: 48_000,
             buffer_frames: 256,
             channels: 2,
@@ -233,26 +234,21 @@ fn the_status_line_says_why_a_lost_device_does_not_open_again() {
 
 #[test]
 fn the_device_list_shows_each_device_with_its_output_channels_and_the_default() {
+    let device = |id: &str, name: &str, output_channels, is_default| DeviceInfo {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        output_channels,
+        is_default,
+    };
     let devices = [
-        DeviceInfo {
-            name: "Speakers".to_owned(),
-            output_channels: 2,
-            is_default: true,
-        },
-        DeviceInfo {
-            name: "Interface".to_owned(),
-            output_channels: 18,
-            is_default: false,
-        },
-        DeviceInfo {
-            name: "Meeting".to_owned(),
-            output_channels: 1,
-            is_default: false,
-        },
+        device("host:speakers", "Speakers", 2, true),
+        device("host:usb-1", "Interface", 18, false),
+        device("host:usb-2", "Interface", 18, false),
+        device("host:meeting", "Meeting", 1, false),
     ];
     assert_eq!(
         device_list(&devices),
-        "* Speakers (2 output channels)\n  Interface (18 output channels)\n  Meeting (1 output channel)\n"
+        "* Speakers (2 output channels), id host:speakers\n  Interface (18 output channels), id host:usb-1\n  Interface (18 output channels), id host:usb-2\n  Meeting (1 output channel), id host:meeting\n"
     );
     assert_eq!(device_list(&[]), "no audio output device found\n");
 }

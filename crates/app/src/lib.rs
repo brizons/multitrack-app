@@ -30,6 +30,9 @@
 //! - The seam crossfade of the player and of the disk stream come from one
 //!   option, and the window the disk keeps ahead of the playhead must cover
 //!   [`MAX_BUFFER_FRAMES`].
+//! - The device that opens is pinned by its id ([`DeviceInfo::id`]): the
+//!   session only ever comes back to that device, never to the new default
+//!   output or to another device with the same name.
 //! - A lost device pauses the transport with a message that says why the
 //!   stream stopped; when it comes back, the stream opens again with the
 //!   transport still paused, and a device that is back but refuses to open
@@ -54,7 +57,7 @@ pub use engine::live::{FadeState, JumpKind, JumpTiming};
 pub use error::{OpenError, RuntimeError};
 pub use library::{LoadError, SongProblem};
 pub use output::{
-    AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceInfo, LossReason, MAX_BUFFER_FRAMES,
+    AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceChoice, DeviceInfo, LossReason, MAX_BUFFER_FRAMES,
     MIN_BUFFER_FRAMES, OutputError, OutputRequest, OutputStream, StreamHealth, StreamInfo,
 };
 pub use renderer::AudioRenderer;

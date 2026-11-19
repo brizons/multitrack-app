@@ -4,7 +4,8 @@
 //! test calls [`FakeOutput::render`] to run one audio callback, so the
 //! player is driven deterministically. Devices can be unplugged and plugged
 //! back in, lose their stream for another reason, and change the rates they
-//! run at.
+//! run at. The n-th device added has the id `fake:n`; the methods that act
+//! on one device take its id, since two devices can share a name.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -18,6 +19,9 @@ use crate::renderer::AudioRenderer;
 
 /// Name of the device [`FakeOutput::new`] offers.
 pub const FAKE_DEVICE: &str = "Fake Output";
+
+/// Id of the device [`FakeOutput::new`] offers.
+pub const FAKE_DEVICE_ID: &str = "fake:1";
 
 /// An in-process audio output; clones share the same devices and stream.
 #[derive(Clone)]
@@ -40,6 +44,7 @@ struct State {
 }
 
 struct Device {
+    id: String,
     name: String,
     channels: u16,
     /// `None` for any rate.
@@ -50,6 +55,7 @@ struct Device {
 struct Running {
     id: u64,
     renderer: AudioRenderer,
+    /// Id of the device it plays on.
     device: String,
     lost: Option<LossReason>,
 }
@@ -77,14 +83,19 @@ impl FakeOutput {
     }
 
     /// Adds a device with `channels` outputs that runs at `rates` (any rate
-    /// when `None`). The first device present is the default.
+    /// when `None`); the n-th device added has the id `fake:n`. The first
+    /// device present is the default.
     pub fn with_device(self, name: &str, channels: u16, rates: Option<&[u32]>) -> Self {
-        self.lock().devices.push(Device {
+        let mut state = self.lock();
+        let id = format!("fake:{}", state.devices.len() + 1);
+        state.devices.push(Device {
+            id,
             name: name.to_owned(),
             channels,
             rates: rates.map(<[u32]>::to_vec),
             present: true,
         });
+        drop(state);
         self
     }
 
@@ -101,35 +112,37 @@ impl FakeOutput {
         Some(out)
     }
 
-    /// Removes device `name`: a stream on it stops calling back and reports
-    /// [`StreamHealth::Lost`] with [`LossReason::Unplugged`].
-    pub fn unplug(&self, name: &str) {
+    /// Removes the device with id `id`: a stream on it stops calling back
+    /// and reports [`StreamHealth::Lost`] with [`LossReason::Unplugged`].
+    pub fn unplug(&self, id: &str) {
         let mut state = self.lock();
-        for device in state.devices.iter_mut().filter(|d| d.name == name) {
+        for device in state.devices.iter_mut().filter(|d| d.id == id) {
             device.present = false;
         }
-        if let Some(running) = state.stream.as_mut().filter(|r| r.device == name) {
+        if let Some(running) = state.stream.as_mut().filter(|r| r.device == id) {
             running.lost = Some(LossReason::Unplugged);
         }
     }
 
-    /// Ends the stream on device `name` for `reason`; the device stays.
-    pub fn lose(&self, name: &str, reason: LossReason) {
-        if let Some(running) = self.lock().stream.as_mut().filter(|r| r.device == name) {
+    /// Ends the stream on the device with id `id` for `reason`; the device
+    /// stays.
+    pub fn lose(&self, id: &str, reason: LossReason) {
+        if let Some(running) = self.lock().stream.as_mut().filter(|r| r.device == id) {
             running.lost = Some(reason);
         }
     }
 
-    /// From now on, device `name` runs at `rates` (any rate when `None`).
-    pub fn set_rates(&self, name: &str, rates: Option<&[u32]>) {
-        for device in self.lock().devices.iter_mut().filter(|d| d.name == name) {
+    /// From now on, the device with id `id` runs at `rates` (any rate when
+    /// `None`).
+    pub fn set_rates(&self, id: &str, rates: Option<&[u32]>) {
+        for device in self.lock().devices.iter_mut().filter(|d| d.id == id) {
             device.rates = rates.map(<[u32]>::to_vec);
         }
     }
 
-    /// Puts device `name` back.
-    pub fn plug(&self, name: &str) {
-        for device in self.lock().devices.iter_mut().filter(|d| d.name == name) {
+    /// Puts the device with id `id` back.
+    pub fn plug(&self, id: &str) {
+        for device in self.lock().devices.iter_mut().filter(|d| d.id == id) {
             device.present = true;
         }
     }
@@ -174,6 +187,7 @@ impl AudioOutput for FakeOutput {
             .iter()
             .enumerate()
             .map(|(index, device)| DeviceInfo {
+                id: device.id.clone(),
                 name: device.name.clone(),
                 output_channels: device.channels,
                 is_default: index == 0,
@@ -189,12 +203,13 @@ impl AudioOutput for FakeOutput {
         let mut state = self.lock();
         let present: Vec<&Device> = state.devices.iter().filter(|d| d.present).collect();
         let device = match &request.device {
-            Some(name) => present.iter().find(|d| &d.name == name).ok_or_else(|| {
-                OutputError::DeviceNotFound {
-                    name: name.clone(),
-                    available: present.iter().map(|d| d.name.clone()).collect(),
-                }
-            })?,
+            Some(choice) => {
+                let keys: Vec<(&str, &str)> = present
+                    .iter()
+                    .map(|d| (d.id.as_str(), d.name.as_str()))
+                    .collect();
+                present[choice.find(&keys)?]
+            }
             None => present.first().ok_or(OutputError::NoDevice)?,
         };
         if device.channels < 2 {
@@ -220,6 +235,7 @@ impl AudioOutput for FakeOutput {
         }
         let info = StreamInfo {
             device: device.name.clone(),
+            device_id: device.id.clone(),
             sample_rate: request.sample_rate,
             buffer_frames: request.buffer_frames,
             channels: device.channels,
@@ -230,7 +246,7 @@ impl AudioOutput for FakeOutput {
         state.stream = Some(Running {
             id,
             renderer,
-            device: info.device.clone(),
+            device: info.device_id.clone(),
             lost: None,
         });
         Ok(Box::new(FakeStream {

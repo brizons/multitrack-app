@@ -152,9 +152,9 @@ fn an_unknown_device_exits_with_code_1_before_anything_plays() {
     let errors = stderr(&output);
     // Without any audio system, the host error is reported instead.
     assert!(
-        errors
-            .starts_with("error: no audio output device is named \"No Such Device\"; available: ")
-            || errors.starts_with("error: audio system: "),
+        errors.starts_with(
+            "error: no audio output device has the name or id \"No Such Device\"; available: "
+        ) || errors.starts_with("error: audio system: "),
         "{errors}"
     );
 }
@@ -187,7 +187,7 @@ fn list_devices_prints_one_line_per_device_and_exits_with_code_0() {
     assert!(!list.is_empty());
     assert!(list.lines().all(|line| {
         (line.starts_with("* ") || line.starts_with("  "))
-            && (line.ends_with(" output channels)") || line.ends_with(" output channel)"))
+            && (line.contains(" output channels), id ") || line.contains(" output channel), id "))
     }));
 }
 

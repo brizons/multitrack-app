@@ -16,8 +16,8 @@ use rtrb::Consumer;
 
 use crate::error::{OpenError, RuntimeError};
 use crate::output::{
-    AudioOutput, DEFAULT_BUFFER_FRAMES, LossReason, MAX_BUFFER_FRAMES, MIN_BUFFER_FRAMES,
-    OutputError, OutputRequest, OutputStream, StreamHealth, StreamInfo,
+    AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceChoice, LossReason, MAX_BUFFER_FRAMES,
+    MIN_BUFFER_FRAMES, OutputError, OutputRequest, OutputStream, StreamHealth, StreamInfo,
 };
 use crate::renderer::{AudioRenderer, AudioState, Report};
 use crate::song::SongInfo;
@@ -30,8 +30,10 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct SessionOptions {
     /// Arrangement to play. Default: `default`.
     pub arrangement: String,
-    /// Output device name; `None` for the system default output. Default:
-    /// `None`.
+    /// Output device, by id or name as [`DeviceChoice::Named`] matches it;
+    /// `None` for the system default output. Whichever device opens, the
+    /// session comes back to that one device by its id when it is lost.
+    /// Default: `None`.
     pub device: Option<String>,
     /// Frames per audio callback, [`MIN_BUFFER_FRAMES`] to
     /// [`MAX_BUFFER_FRAMES`] (F8.5). Default: [`DEFAULT_BUFFER_FRAMES`].
@@ -364,17 +366,18 @@ impl Session {
         });
         state.publish();
         let request = OutputRequest {
-            device: options.device.clone(),
+            device: options.device.clone().map(DeviceChoice::Named),
             sample_rate,
             buffer_frames,
         };
         let (renderer, home) = AudioRenderer::new(state);
         let (stream, request) = match output.open(&request, renderer) {
             Ok(stream) => {
-                // Come back to this very device when it is lost, not to
-                // whatever the default output is by then.
+                // Come back to this very device when it is lost, by its id:
+                // not to whatever the default output is by then, nor to
+                // another device with the same name.
                 let request = OutputRequest {
-                    device: Some(stream.info().device.clone()),
+                    device: Some(DeviceChoice::Id(stream.info().device_id.clone())),
                     ..request
                 };
                 (stream, request)

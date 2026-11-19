@@ -78,6 +78,7 @@ impl AudioOutput for Capture {
             renderer: Arc::clone(&self.renderer),
             info: StreamInfo {
                 device: "capture".to_owned(),
+                device_id: "capture".to_owned(),
                 sample_rate: request.sample_rate,
                 buffer_frames: request.buffer_frames,
                 channels: 2,

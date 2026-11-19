@@ -12,10 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use app::testing::{FAKE_DEVICE, FakeOutput};
+use app::testing::{FAKE_DEVICE, FAKE_DEVICE_ID, FakeOutput};
 use app::{
-    Command, DeviceStatus, FadeState, JumpKind, JumpTiming, LoadError, LossReason, OpenError,
-    OutputError, OutputRequest, RuntimeError, Session, SessionOptions, StreamInfo, TransportState,
+    Command, DeviceChoice, DeviceStatus, FadeState, JumpKind, JumpTiming, LoadError, LossReason,
+    OpenError, OutputError, OutputRequest, RuntimeError, Session, SessionOptions, StreamInfo,
+    TransportState,
 };
 use common::{
     BAR, POS_CHORUS, POS_OUTRO, RATE, bits, closed_gate, is_silent, offline, open, play_for, start,
@@ -340,6 +341,7 @@ fn the_device_opens_at_the_songs_sample_rate_or_the_session_says_why_not() {
         session.poll().device,
         DeviceStatus::Connected(StreamInfo {
             device: "Studio".to_owned(),
+            device_id: "fake:1".to_owned(),
             sample_rate: RATE,
             buffer_frames: 256,
             channels: 8
@@ -628,7 +630,7 @@ fn unplugging_the_device_pauses_with_a_clear_message_and_plugging_it_back_restor
     let (_, playing) = play_for(&mut session, &fake, 256, 4_096);
     assert_eq!(playing.transport, TransportState::Playing);
 
-    fake.unplug(FAKE_DEVICE);
+    fake.unplug(FAKE_DEVICE_ID);
     let lost = session.poll();
 
     assert_eq!(
@@ -667,20 +669,22 @@ fn unplugging_the_device_pauses_with_a_clear_message_and_plugging_it_back_restor
     assert!(matches!(waiting.device, DeviceStatus::Disconnected { .. }));
     assert_eq!(fake.opened().len(), 1, "the retry found no device");
 
-    fake.plug(FAKE_DEVICE);
+    fake.plug(FAKE_DEVICE_ID);
     let back = session.poll();
 
-    assert!(matches!(&back.device, DeviceStatus::Connected(info) if info.device == FAKE_DEVICE));
+    assert!(
+        matches!(&back.device, DeviceStatus::Connected(info) if info.device_id == FAKE_DEVICE_ID)
+    );
     assert_eq!(back.transport, TransportState::Paused, "it stays paused");
     assert_eq!(back.last_error, None);
     assert_eq!(
         fake.opened()[1],
         OutputRequest {
-            device: Some(FAKE_DEVICE.to_owned()),
+            device: Some(DeviceChoice::Id(FAKE_DEVICE_ID.to_owned())),
             sample_rate: RATE,
             buffer_frames: 256
         },
-        "the same device, by name"
+        "the same device, by id"
     );
     let (out, still) = play_for(&mut session, &fake, 256, 2_048);
     assert!(is_silent(&out), "nothing plays until play");
@@ -705,12 +709,12 @@ fn a_device_that_comes_back_but_refuses_to_open_says_why_and_the_session_keeps_t
         },
     );
     start(&mut session, &fake, 256);
-    fake.unplug(FAKE_DEVICE);
+    fake.unplug(FAKE_DEVICE_ID);
     session.poll();
 
     // It comes back set to 44.1 kHz only.
-    fake.set_rates(FAKE_DEVICE, Some(&[44_100]));
-    fake.plug(FAKE_DEVICE);
+    fake.set_rates(FAKE_DEVICE_ID, Some(&[44_100]));
+    fake.plug(FAKE_DEVICE_ID);
     session.poll();
     let refused = session.poll();
 
@@ -740,7 +744,7 @@ fn a_device_that_comes_back_but_refuses_to_open_says_why_and_the_session_keeps_t
     assert_eq!(refused.transport, TransportState::Paused);
 
     // Gone again: it reads as lost again, not as refused.
-    fake.unplug(FAKE_DEVICE);
+    fake.unplug(FAKE_DEVICE_ID);
     let gone = session.poll();
     assert!(matches!(
         gone.device,
@@ -758,12 +762,92 @@ fn a_device_that_comes_back_but_refuses_to_open_says_why_and_the_session_keeps_t
     ));
 
     // Set back to the song's rate, it opens and every device error clears.
-    fake.set_rates(FAKE_DEVICE, None);
-    fake.plug(FAKE_DEVICE);
+    fake.set_rates(FAKE_DEVICE_ID, None);
+    fake.plug(FAKE_DEVICE_ID);
     let back = session.poll();
     assert!(matches!(back.device, DeviceStatus::Connected(_)));
     assert_eq!(back.last_error, None);
     assert_eq!(back.transport, TransportState::Paused);
+}
+
+#[test]
+fn a_lost_device_is_found_again_by_its_id_never_by_a_name_another_device_shares() {
+    let dir = song();
+    let fake = FakeOutput::without_devices()
+        .with_device("Twin", 2, None)
+        .with_device("Twin", 2, None);
+    let mut session = open(
+        dir.path(),
+        &fake,
+        SessionOptions {
+            reconnect_interval: Duration::ZERO,
+            ..options(256)
+        },
+    );
+    start(&mut session, &fake, 256);
+    fake.unplug("fake:1");
+    session.poll();
+
+    let waiting = session.poll();
+    assert!(
+        matches!(waiting.device, DeviceStatus::Disconnected { .. }),
+        "the other interface with the same name is not taken: {:?}",
+        waiting.device
+    );
+    assert_eq!(fake.opened().len(), 1);
+
+    fake.plug("fake:1");
+    let back = session.poll();
+    assert!(matches!(&back.device, DeviceStatus::Connected(info) if info.device_id == "fake:1"));
+    assert_eq!(
+        fake.opened()[1].device,
+        Some(DeviceChoice::Id("fake:1".to_owned()))
+    );
+}
+
+#[test]
+fn a_device_is_chosen_by_id_or_by_a_name_only_one_device_has() {
+    let dir = song();
+    let twins = || {
+        FakeOutput::without_devices()
+            .with_device("Studio", 2, None)
+            .with_device("Twin", 2, None)
+            .with_device("Twin", 2, None)
+    };
+    let chosen = |device: &str| {
+        let fake = twins();
+        Session::open(
+            dir.path(),
+            Box::new(fake),
+            SessionOptions {
+                device: Some(device.to_owned()),
+                ..options(256)
+            },
+        )
+        .map(|mut session| match session.poll().device {
+            DeviceStatus::Connected(info) => info.device_id,
+            other => panic!("not connected: {other:?}"),
+        })
+    };
+
+    assert_eq!(chosen("fake:3").unwrap(), "fake:3");
+    assert_eq!(chosen("Studio").unwrap(), "fake:1");
+    assert_eq!(chosen("studio").unwrap(), "fake:1", "ASCII case is ignored");
+    let error = chosen("Twin").unwrap_err();
+    assert!(matches!(
+        &error,
+        OpenError::Output(OutputError::AmbiguousDevice { name, ids })
+            if name == "Twin" && ids == &["fake:2", "fake:3"]
+    ));
+    assert_eq!(
+        error.to_string(),
+        "2 audio output devices are named \"Twin\"; choose one by id: \"fake:2\", \"fake:3\""
+    );
+    let error = chosen("Nowhere").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "no audio output device has the name or id \"Nowhere\"; available: \"Studio\", \"Twin\", \"Twin\""
+    );
 }
 
 #[test]
@@ -783,7 +867,7 @@ fn the_loss_message_names_why_the_stream_stopped() {
         let mut session = open(dir.path(), &fake, options(256));
         start(&mut session, &fake, 256);
 
-        fake.lose(FAKE_DEVICE, reason);
+        fake.lose(FAKE_DEVICE_ID, reason);
         let lost = session.poll();
 
         assert_eq!(
@@ -832,6 +916,7 @@ fn the_snapshot_reports_transport_playhead_section_queue_loop_fade_and_device() 
         fresh.device,
         DeviceStatus::Connected(StreamInfo {
             device: FAKE_DEVICE.to_owned(),
+            device_id: FAKE_DEVICE_ID.to_owned(),
             sample_rate: RATE,
             buffer_frames: 1_024,
             channels: 2

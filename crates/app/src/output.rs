@@ -24,7 +24,12 @@ pub const DEFAULT_BUFFER_FRAMES: u32 = 256;
 /// An audio output device (F8.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
-    /// Name, as [`OutputRequest::device`] takes it.
+    /// What tells the device apart from every other one, even an identical
+    /// interface with the same name; it stays the same while the device is
+    /// unplugged and plugged back in, as far as the system allows (the
+    /// adapter documents how far). [`DeviceChoice`] takes it.
+    pub id: String,
+    /// Name, for people; two devices can share it.
     pub name: String,
     /// Most output channels the device offers.
     pub output_channels: u16,
@@ -32,12 +37,62 @@ pub struct DeviceInfo {
     pub is_default: bool,
 }
 
+/// Which output device a request means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceChoice {
+    /// The device whose [`DeviceInfo::id`] this is. A session pins the
+    /// device it opened this way, so it never comes back to another one.
+    Id(String),
+    /// The device a person named: the one with this id, else the one with
+    /// this name, else the one with this name ignoring ASCII case. A name
+    /// more than one device has is refused ([`OutputError::AmbiguousDevice`]).
+    Named(String),
+}
+
+impl DeviceChoice {
+    /// The index of the device this choice means among `devices`, given as
+    /// `(id, name)` pairs.
+    pub fn find(&self, devices: &[(&str, &str)]) -> Result<usize, OutputError> {
+        let wanted = match self {
+            Self::Id(id) | Self::Named(id) => id.as_str(),
+        };
+        if let Some(index) = devices.iter().position(|&(id, _)| id == wanted) {
+            return Ok(index);
+        }
+        if let Self::Named(name) = self {
+            let exact = |candidate: &str| candidate == name;
+            let loose = |candidate: &str| candidate.eq_ignore_ascii_case(name);
+            for matches in [&exact as &dyn Fn(&str) -> bool, &loose] {
+                let found: Vec<usize> = (0..devices.len())
+                    .filter(|&index| matches(devices[index].1))
+                    .collect();
+                match found[..] {
+                    [] => {}
+                    [index] => return Ok(index),
+                    _ => {
+                        return Err(OutputError::AmbiguousDevice {
+                            name: name.clone(),
+                            ids: found
+                                .iter()
+                                .map(|&index| devices[index].0.to_owned())
+                                .collect(),
+                        });
+                    }
+                }
+            }
+        }
+        Err(OutputError::DeviceNotFound {
+            name: wanted.to_owned(),
+            available: devices.iter().map(|&(_, name)| name.to_owned()).collect(),
+        })
+    }
+}
+
 /// The stream a session asks a port to open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputRequest {
-    /// Device name, as [`DeviceInfo::name`]; `None` for the system default
-    /// output.
-    pub device: Option<String>,
+    /// Which device; `None` for the system default output.
+    pub device: Option<DeviceChoice>,
     /// Frames per second: the song's rate, since nothing resamples.
     pub sample_rate: u32,
     /// Frames per audio callback.
@@ -49,6 +104,8 @@ pub struct OutputRequest {
 pub struct StreamInfo {
     /// Name of the device it plays on.
     pub device: String,
+    /// Id of that device ([`DeviceInfo::id`]).
+    pub device_id: String,
     /// Frames per second.
     pub sample_rate: u32,
     /// Frames per audio callback.
@@ -145,16 +202,28 @@ pub enum OutputError {
     /// The system has no output device.
     #[error("no audio output device is available")]
     NoDevice,
-    /// No device has the requested name.
+    /// No device has the requested name or id.
     #[error(
-        "no audio output device is named \"{name}\"; available: {}",
+        "no audio output device has the name or id \"{name}\"; available: {}",
         Names(available)
     )]
     DeviceNotFound {
-        /// The requested name.
+        /// The requested name or id.
         name: String,
         /// Names of the devices there are.
         available: Vec<String>,
+    },
+    /// More than one device has the requested name.
+    #[error(
+        "{} audio output devices are named \"{name}\"; choose one by id: {}",
+        ids.len(),
+        Names(ids)
+    )]
+    AmbiguousDevice {
+        /// The requested name.
+        name: String,
+        /// Ids of the devices with that name.
+        ids: Vec<String>,
     },
     /// The device cannot run at the song's rate (no resampling).
     #[error(
