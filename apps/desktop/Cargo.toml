@@ -1,0 +1,23 @@
+[package]
+name = "multitrack-desktop"
+description = "Desktop shell for Mac, Windows and Linux: the Perform screen drawn with GPUI, calling the app crate directly."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "multitrack_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "multitrack-desktop"
+path = "src/main.rs"
+
+[dependencies]
+app.workspace = true
+# `runtime_shaders`: on macOS, GPUI compiles its Metal shaders when the app
+# starts instead of at build time, so building needs no Metal Toolchain
+# (Xcode 26 ships it as a separate download). Other platforms ignore it.
+gpui = { workspace = true, features = ["runtime_shaders"] }
+io-cpal.workspace = true

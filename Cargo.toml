@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "apps/desktop",
     "crates/app",
     "crates/domain",
     "crates/engine",
@@ -25,6 +26,7 @@ library = { path = "crates/library" }
 clap = { version = "4.6.7", features = ["derive"] }
 cpal = "0.18.2"
 crossterm = "0.29.0"
+gpui = "=0.2.2"
 hound = "3.5.1"
 rtrb = "0.4.1"
 serde = { version = "1.0", features = ["derive"] }
