@@ -59,7 +59,7 @@ Out of scope: setlists and transitions, mixer UI, routing matrix, MIDI, guide-vo
 | T2 | S3 + S2 defer-the-jump criterion + T1 review and verifier advisories | delegated (context backstop) | done (verified after one correction, review approved; L12–L14) | 04eae93, 2a8f1c8 |
 | T3 | S1, S4, S5 + T2 advisories A3, A4, A6, A9, A5/R1-001 (surfaced) | delegated (context backstop) | done (verified after one correction, review approved in 3 parts; L15–L17) | c394f0c, 2122200, 9662c6e, 3488e07, ca3e179 |
 | T5 | S7 (runs before T4) | delegated (context backstop) | done (verified after one correction, N1 fixed, review approved; L19–L22) | e808c23, 6fd5d52, d24dbd8, 63f58e6, 06a8c28 |
-| T4 | S6 | delegated (context backstop) | pending | — |
+| T4 | S6 | delegated (context backstop) | in progress | — |
 
 Route evidence: the parent session is past the ~150k-token context backstop. Order: the live transport first (highest risk, testable offline with in-memory sources), then streaming behind the same source interface, then the `app` API with real threads, `cpal` and `play-cli`, then the shell. Each task needs the previous one, so they run sequentially. Forecast: ~2,500 authored lines. Risk forecast: item 4 (concurrency: audio thread, disk thread, lock-free queues) for T2 and T3, item 5 (new crates `cpal`, `rtrb`) for T3 and (`gpui`, `gpui-component`) for T4 — each gets an independent verifier and the native review.
 
