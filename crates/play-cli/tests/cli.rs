@@ -190,3 +190,21 @@ fn list_devices_prints_one_line_per_device_and_exits_with_code_0() {
             && (line.ends_with(" output channels)") || line.ends_with(" output channel)"))
     }));
 }
+
+#[test]
+fn list_devices_refuses_a_song_folder_a_device_or_a_buffer_with_code_2() {
+    for args in [
+        &["some/song", "--list-devices"][..],
+        &["--list-devices", "--device", "Studio"],
+        &["--list-devices", "--buffer", "512"],
+    ] {
+        let output = play_cli(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(stdout(&output).is_empty(), "{args:?}: nothing is listed");
+        assert!(
+            stderr(&output).contains("cannot be used with"),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    }
+}

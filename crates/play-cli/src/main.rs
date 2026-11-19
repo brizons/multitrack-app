@@ -60,8 +60,9 @@ struct Args {
     buffer: u32,
 
     /// List the output devices with their output channel counts (the default
-    /// marked with *), then exit.
-    #[arg(long)]
+    /// marked with *), then exit. Cannot be combined with a song folder,
+    /// --device or --buffer.
+    #[arg(long, conflicts_with_all = ["song_dir", "device", "buffer"])]
     list_devices: bool,
 }
 

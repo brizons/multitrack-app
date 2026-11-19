@@ -11,7 +11,7 @@ play-cli <SONG_DIR> [--device <NAME>] [--buffer <FRAMES>] [--list-devices]
 | `<SONG_DIR>` | Song folder: `song.json` plus the WAV stems it lists. The `default` arrangement plays. |
 | `--device <NAME>` | Output device, by the name `--list-devices` prints. Default: the system default output, pinned when the song opens. |
 | `--buffer <FRAMES>` | Frames per audio buffer, 64 to 1024. Default: 256. The status line shows the resulting latency. |
-| `--list-devices` | List the output devices with their output channel counts, the default marked `*`, then exit. |
+| `--list-devices` | List the output devices with their output channel counts, the default marked `*`, then exit. Cannot be combined with a song folder, `--device` or `--buffer` (exit code 2). |
 
 The song plays in stereo on outputs 1 and 2 of the device.
 
