@@ -63,13 +63,15 @@ impl CpalOutput {
         Ok(devices.map(|device| (device.to_string(), device)).collect())
     }
 
-    /// The device named `name`, or the default output pinned by its name.
+    /// The device named `name`, or the default output pinned by its name
+    /// (the default device itself when no listed device has that name).
     fn find(&self, name: Option<&str>) -> Result<(String, cpal::Device), OutputError> {
         let mut devices = self.output_devices()?;
+        let mut default = None;
         let wanted = match name {
             Some(name) => name.to_owned(),
             None => match self.host.default_output_device() {
-                Some(default) => default.to_string(),
+                Some(device) => default.insert(device).to_string(),
                 None => return Err(OutputError::NoDevice),
             },
         };
@@ -81,10 +83,10 @@ impl CpalOutput {
                     .iter()
                     .position(|(candidate, _)| candidate.eq_ignore_ascii_case(&wanted))
             });
-        match index {
-            Some(index) => Ok(devices.swap_remove(index)),
-            None if name.is_none() => Err(OutputError::NoDevice),
-            None => Err(OutputError::DeviceNotFound {
+        match (index, default) {
+            (Some(index), _) => Ok(devices.swap_remove(index)),
+            (None, Some(device)) => Ok((wanted, device)),
+            (None, None) => Err(OutputError::DeviceNotFound {
                 name: wanted,
                 available: devices.into_iter().map(|(name, _)| name).collect(),
             }),
