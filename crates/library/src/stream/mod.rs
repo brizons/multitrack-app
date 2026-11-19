@@ -20,8 +20,9 @@
 //! The source wants the blocks of a few windows, all of them bounded:
 //!
 //! - ahead of the playhead, [`StreamConfig::ahead_ms`] of audio;
-//! - at each prefetch target (a queued jump, the next position when the
-//!   arrangement jumps there, the start), [`StreamConfig::head_ms`];
+//! - at each prefetch target (a queued jump, the current position's start
+//!   for a loop, the next position when the arrangement jumps there, the
+//!   start), [`StreamConfig::head_ms`];
 //! - just past the last few cuts, where a seam's fading-out tail still
 //!   reads, [`StreamConfig::seam_crossfade`] frames.
 //!

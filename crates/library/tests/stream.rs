@@ -499,3 +499,142 @@ fn streaming_sources_report_their_stems() {
     );
     assert_eq!(streams.song.length(), LENGTH);
 }
+
+// Regression tests: live changes in the buffer that holds a seam, with a
+// disk that keeps up.
+
+/// Positions played, in order, from the statuses (one per 1 024 frames).
+fn positions(run: &Run) -> Vec<(u64, usize)> {
+    let mut seen: Vec<(u64, usize)> = Vec::new();
+    let mut last_source = 0;
+    for (i, status) in run.statuses.iter().enumerate() {
+        let at = (i as u64 + 1) * 1_024;
+        if seen.last().is_none_or(|&(_, p)| p != status.position)
+            || status.source_frame < last_source
+        {
+            seen.push((at, status.position));
+        }
+        last_source = status.source_frame;
+    }
+    seen
+}
+
+#[test]
+fn turning_the_infinite_loop_on_just_before_the_section_end_never_plays_silence() {
+    let dir = tempfile::tempdir().unwrap();
+    write_song(dir.path(), RATE, LENGTH);
+    // Default arrangement: the verse ends at 64 000, inside the buffer
+    // 63 488..64 512, where the infinite loop is switched on.
+    let script = [(0, Command::Play), (63_488, Command::SetInfinite(true))];
+    let frames = 4 * 32_768;
+    let (player, monitor) =
+        streaming_player(dir.path(), "default", 1_024, &StreamConfig::default());
+    let streamed = drive(player, 1_024, frames, &script, Some(&monitor), |_| {});
+    let expected = drive(
+        memory_player(dir.path(), "default", 1_024),
+        1_024,
+        frames,
+        &script,
+        None,
+        |_| {},
+    );
+    assert_eq!(streamed.last.underruns, 0, "the loop seam played silence");
+    assert_eq!(bits(&streamed.output), bits(&expected.output));
+}
+
+#[test]
+fn turning_the_infinite_loop_off_just_before_the_section_end_never_plays_silence() {
+    let dir = tempfile::tempdir().unwrap();
+    write_song(dir.path(), RATE, LENGTH);
+    // repeat: intro, chorus, chorus, verse, outro. Position 2 (64 000..96 000)
+    // loops twice; it ends at 160 000, inside the buffer 159 744..160 768,
+    // where the loop is switched off. The verse does not start where the
+    // chorus ends.
+    let script = [
+        (0, Command::Play),
+        (66_560, Command::SetInfinite(true)),
+        (159_744, Command::SetInfinite(false)),
+    ];
+    let frames = 200_704;
+    let (player, monitor) = streaming_player(dir.path(), "repeat", 1_024, &StreamConfig::default());
+    let streamed = drive(player, 1_024, frames, &script, Some(&monitor), |_| {});
+    let expected = drive(
+        memory_player(dir.path(), "repeat", 1_024),
+        1_024,
+        frames,
+        &script,
+        None,
+        |_| {},
+    );
+    assert_eq!(
+        streamed.last.underruns, 0,
+        "the seam into the verse played silence"
+    );
+    assert_eq!(bits(&streamed.output), bits(&expected.output));
+}
+
+#[test]
+fn leaving_a_vamp_just_before_the_section_end_plays_the_next_position_once() {
+    let dir = tempfile::tempdir().unwrap();
+    write_song(dir.path(), RATE, LENGTH);
+    let script = [
+        (0, Command::Play),
+        (66_560, Command::SetInfinite(true)),
+        (159_744, Command::SetInfinite(false)),
+        (159_744, Command::QueueJump { position: 3 }),
+    ];
+    let frames = 200_704;
+    let (player, monitor) = streaming_player(dir.path(), "repeat", 1_024, &StreamConfig::default());
+    let streamed = drive(player, 1_024, frames, &script, Some(&monitor), |_| {});
+    let expected = drive(
+        memory_player(dir.path(), "repeat", 1_024),
+        1_024,
+        frames,
+        &script,
+        None,
+        |_| {},
+    );
+    assert_eq!(
+        positions(&streamed),
+        positions(&expected),
+        "the verse plays once"
+    );
+    assert_eq!(streamed.last.underruns, 0);
+    assert_eq!(bits(&streamed.output), bits(&expected.output));
+}
+
+#[test]
+fn a_deferred_jump_to_the_position_the_arrangement_enters_anyway_does_not_repeat_it() {
+    let dir = tempfile::tempdir().unwrap();
+    write_song(dir.path(), RATE, LENGTH);
+    // repeat: intro, chorus, chorus, verse, outro. The chorus start stays
+    // unbuffered until the second chorus is playing; a jump to the second
+    // chorus is queued during the first.
+    let chorus = 4 * (LENGTH / 7);
+    let open = Arc::new(AtomicBool::new(false));
+    let config = gate(None, chorus..chorus + 4_000, &open);
+    let script = [
+        (0, Command::Play),
+        (36_864, Command::QueueJump { position: 2 }),
+    ];
+    let frames = 4 * 32_768;
+    let (player, monitor) = streaming_player(dir.path(), "repeat", 1_024, &config);
+    let streamed = drive(player, 1_024, frames, &script, Some(&monitor), |at| {
+        if at == 70_656 {
+            open.store(true, Ordering::SeqCst);
+        }
+    });
+    let expected = drive(
+        memory_player(dir.path(), "repeat", 1_024),
+        1_024,
+        frames,
+        &[(0, Command::Play)],
+        None,
+        |_| {},
+    );
+    assert_eq!(
+        positions(&streamed),
+        positions(&expected),
+        "two choruses, then the verse"
+    );
+}

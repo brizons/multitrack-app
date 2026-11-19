@@ -476,15 +476,17 @@ impl Player {
                 continue;
             }
             if self.voice.offset == self.entries[self.voice.position].len {
-                let position = self.voice.position;
-                if self.infinite {
-                    self.seam_to(position);
-                } else if position + 1 < self.entries.len() {
-                    self.seam_to(position + 1);
-                } else {
+                let Some(next) = self.natural_next() else {
                     self.reset();
                     return;
+                };
+                // A jump deferred at this boundary whose target the
+                // arrangement enters on its own has done its job; executing
+                // it later would play the target again.
+                if self.queued.is_some_and(|queued| queued.target == next) {
+                    self.queued = None;
                 }
+                self.seam_to(next);
                 continue;
             }
             return;
@@ -538,32 +540,49 @@ impl Player {
             .all(|stem| stem.source.is_ready(entry.src_start, entry.len))
     }
 
-    /// Source start of the position that follows the current one when no
-    /// jump intervenes, when getting there jumps in the source.
-    fn natural_next(&self) -> Option<u64> {
+    /// Position the arrangement enters at the end of the current one when no
+    /// queued jump executes: the current one again with the infinite loop
+    /// on, else the next one; `None` at the end of the arrangement.
+    fn natural_next(&self) -> Option<usize> {
         let position = self.voice.position;
-        let entry = self.entries[position];
-        let next = if self.infinite {
-            position
-        } else if position + 1 < self.entries.len() {
-            position + 1
+        if self.infinite {
+            Some(position)
         } else {
-            return None;
-        };
-        let start = self.entries[next].src_start;
-        (start != entry.src_start + entry.len).then_some(start)
+            (position + 1 < self.entries.len()).then_some(position + 1)
+        }
+    }
+
+    /// Source start of `position` when entering it at the end of the current
+    /// position jumps in the source; `None` when it follows on contiguously,
+    /// where the window ahead of the playhead already covers it.
+    fn seam_target(&self, position: usize) -> Option<u64> {
+        let current = self.entries[self.voice.position];
+        let start = self.entries[position].src_start;
+        (start != current.src_start + current.len).then_some(start)
     }
 
     /// Sends the sources a new prefetch hint when the playhead jumped or the
-    /// targets changed: the queued target, the natural next position, and
-    /// the start of the arrangement (for back to start and stop).
+    /// targets changed: the queued target; both places the end of the
+    /// current position can go, the next position and its own start (a
+    /// loop), the one the infinite loop selects first; and the start of the
+    /// arrangement (for back to start and stop). Hinting both keeps a loop
+    /// switched on or off just before the end from meeting audio the source
+    /// has not buffered.
     fn update_hints(&mut self) {
         let mut targets = [0; MAX_PREFETCH_TARGETS];
         let mut count = 0;
+        let position = self.voice.position;
+        let next = (position + 1 < self.entries.len()).then_some(position + 1);
+        let (likely, other) = if self.infinite {
+            (Some(position), next)
+        } else {
+            (next, Some(position))
+        };
         let candidates = [
             self.queued
                 .map(|queued| self.entries[queued.target].src_start),
-            self.natural_next(),
+            likely.and_then(|position| self.seam_target(position)),
+            other.and_then(|position| self.seam_target(position)),
             Some(self.entries[0].src_start),
         ];
         for target in candidates.into_iter().flatten() {

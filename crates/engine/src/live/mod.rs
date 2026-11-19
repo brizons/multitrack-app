@@ -13,9 +13,13 @@
 //! exact boundary frame, splitting the buffer there when it falls inside one.
 //! It executes only when every [`StemSource`] reports the target ready;
 //! otherwise it stays queued and moves to the next boundary of the same kind,
-//! so a jump never plays silence. The player tells every source where it is
-//! playing and where it may jump next ([`StemSource::prefetch`]), so a
-//! streaming source can have the audio in memory in time.
+//! so a jump never plays silence. A section end always executes: when the
+//! arrangement enters the queued target there on its own, the queued jump is
+//! dropped instead of playing the target twice. The player tells every source
+//! where it is playing and where it may go next ([`StemSource::prefetch`]),
+//! including both places a section end can go (its own start for a loop, and
+//! the next position), so a streaming source can have the audio in memory in
+//! time.
 //!
 //! Real-time rules: `process` allocates nothing, takes no locks, and does no
 //! I/O. Every buffer is sized at construction from the maximum buffer size,
@@ -44,9 +48,9 @@ pub const DECLICK_FRAMES: u64 = 256;
 pub const PANIC_MILLISECONDS: u64 = 500;
 
 /// Most prefetch targets the player passes to [`StemSource::prefetch`]: the
-/// queued jump target, the start of the position that follows the current
-/// one, and the start of the arrangement.
-pub const MAX_PREFETCH_TARGETS: usize = 3;
+/// queued jump target, the start of the current position (where a loop
+/// goes), the start of the next position, and the start of the arrangement.
+pub const MAX_PREFETCH_TARGETS: usize = 4;
 
 /// Default fade duration, in seconds of output ([`Command::SetFadeDuration`]
 /// changes it).
@@ -111,7 +115,9 @@ pub enum Command {
     /// Queues a jump to arrangement position `position`, replacing any queued
     /// jump. It executes at the boundary [`JumpTiming`] selects, once every
     /// source has the target ready; until then it moves to the next boundary
-    /// of the same kind ([`QueuedJump::deferrals`] counts the moves).
+    /// of the same kind ([`QueuedJump::deferrals`] counts the moves). When
+    /// the arrangement enters `position` on its own at a section end (the
+    /// next position, or the infinite loop), the jump is done and dropped.
     QueueJump {
         /// Index into the arrangement's section list.
         position: usize,
@@ -122,7 +128,12 @@ pub enum Command {
     /// new timing.
     SetJumpTiming(JumpTiming),
     /// Repeats the current position once more: a queued jump to it at the
-    /// end of the current position, whatever the [`JumpTiming`].
+    /// end of the current position, whatever the [`JumpTiming`]. If a source
+    /// does not have the position's start ready at that end, the arrangement
+    /// plays on and the loop stays queued for the same position: it jumps
+    /// back there at the end of the position then playing, or is dropped
+    /// when the arrangement enters that position on its own (the infinite
+    /// loop).
     LiveLoop,
     /// Repeats the current position at each of its ends until switched off.
     /// A queued jump takes priority; a jump to another position switches it

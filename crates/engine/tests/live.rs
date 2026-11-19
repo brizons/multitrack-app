@@ -1374,11 +1374,10 @@ fn the_player_hints_the_queued_target_the_loop_target_and_the_start() {
             (1_024, vec![outro, intro]),
             (2_048, vec![intro]),
             // The seam into the verse is contiguous: same playhead, new epoch.
-            (verse, vec![intro]),
-            (verse + 1_792, vec![verse, intro]),
-            (verse + 2_816, vec![intro]),
-            (verse + 3_840, vec![verse, intro]),
-            (verse + 4_864, vec![intro]),
+            // The verse's own start, where a loop goes, stays hinted the
+            // whole verse, so switching the loop on or off and queuing or
+            // cancelling a live loop send nothing new.
+            (verse, vec![verse, intro]),
         ]
     );
 }
@@ -1399,10 +1398,84 @@ fn the_player_hints_the_next_position_when_the_arrangement_jumps_there() {
             (intro, vec![chorus, intro]),
             // In the first chorus, the second one starts back at its start.
             (chorus, vec![chorus, intro]),
-            // In the second one, the outro follows on contiguously.
-            (chorus, vec![intro]),
+            // In the second one, the outro follows on contiguously; only the
+            // chorus's own start, for a loop, is hinted.
+            (chorus, vec![chorus, intro]),
         ]
     );
+}
+
+#[test]
+fn the_player_hints_both_places_a_section_end_can_go_the_infinite_loop_first() {
+    let setup = Setup {
+        built: spec()
+            .arrangement("live", &["intro", "chorus", "chorus", "verse", "outro"])
+            .built(),
+        arrangement: "live",
+        ..full()
+    };
+    let (intro, verse, chorus, outro) = (INTRO.0, VERSE.0, CHORUS.0, OUTRO.0);
+    // The second chorus starts at output frame 64 000 = `chorus`.
+    let sent = hints(
+        &setup,
+        68 * 1_024,
+        &[
+            (0, Command::Play),
+            (65_536, Command::QueueJump { position: 4 }),
+            (66_560, Command::SetInfinite(true)),
+            (67_584, Command::CancelJump),
+        ],
+    );
+    assert_eq!(
+        sent,
+        vec![
+            (intro, vec![chorus, intro]),
+            (chorus, vec![chorus, intro]),
+            // The second chorus ends into the verse, or back into itself.
+            (chorus, vec![verse, chorus, intro]),
+            (chorus + 1_536, vec![outro, verse, chorus, intro]),
+            (chorus + 2_560, vec![outro, chorus, verse, intro]),
+            (chorus + 3_584, vec![chorus, verse, intro]),
+        ]
+    );
+}
+
+#[test]
+fn a_deferred_jump_is_dropped_when_the_arrangement_enters_its_target_on_its_own() {
+    let setup = Setup {
+        built: spec()
+            .arrangement("repeat", &["intro", "chorus", "chorus", "outro"])
+            .built(),
+        arrangement: "repeat",
+        ..full()
+    };
+    let second_chorus = INTRO.1 + CHORUS.1;
+    // During the first chorus, a jump to the second one, whose start stays
+    // not ready until the second chorus is playing.
+    let run = run_deferred(
+        &setup,
+        round_up(INTRO.1 + 2 * CHORUS.1 + OUTRO.1),
+        &[
+            (0, Command::Play),
+            (33_792, Command::QueueJump { position: 2 }),
+        ],
+        CHORUS.0..CHORUS.0 + 1,
+        second_chorus + 1_536,
+    );
+
+    assert_eq!(
+        run.status(63_488).queued,
+        Some(QueuedJump {
+            target: 2,
+            kind: JumpKind::Jump,
+            executes_at: second_chorus,
+            deferrals: 0,
+        })
+    );
+    let entered = run.status(second_chorus + 1_536);
+    assert_eq!(entered.position, 2, "the arrangement played on into it");
+    assert_eq!(entered.queued, None, "the jump is done, not deferred");
+    assert_plays(&run, &oracle(&setup, &[INTRO, CHORUS, CHORUS, OUTRO]));
 }
 
 #[test]
