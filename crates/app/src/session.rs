@@ -220,16 +220,15 @@ pub struct Snapshot {
     /// - [`RuntimeError::DeviceLost`] and [`RuntimeError::DeviceReopenFailed`]:
     ///   when the device plays again; a reopen failure turns back into the
     ///   loss when the device is absent again.
-    /// - [`RuntimeError::DecodeFailed`]: once the transport has played two of
-    ///   the disk's read-ahead windows (2 s by default) with no new decode
-    ///   failure and no underrun. The disk reports a failed block at most
-    ///   one window ahead of the playhead, so by then playback is past it.
-    ///   Failed blocks are not decoded again; [`Self::decode_errors`] keeps
-    ///   counting them.
     ///
     /// Events stay until a newer problem replaces them: a refused command
-    /// ([`RuntimeError::QueueFull`], [`RuntimeError::UnknownPosition`]) and
-    /// [`RuntimeError::PlayerLost`], which never ends.
+    /// ([`RuntimeError::QueueFull`], [`RuntimeError::UnknownPosition`]),
+    /// [`RuntimeError::PlayerLost`], which never ends, and
+    /// [`RuntimeError::DecodeFailed`]. A decode failure never ends either:
+    /// the disk does not decode a failed block again, so its audio plays as
+    /// silence whenever the arrangement reaches it, and the disk may report
+    /// it long before (prefetch heads are decoded early).
+    /// [`Self::decode_errors`] keeps counting failed blocks.
     pub last_error: Option<RuntimeError>,
 }
 
@@ -294,12 +293,6 @@ pub struct Session {
     /// Commands the controller accepted; a report that has applied as many
     /// describes the playhead they left.
     sent: u64,
-    /// Frames the disk keeps decoded ahead of the playhead.
-    ahead_frames: u64,
-    underruns_seen: u64,
-    output_frame_seen: u64,
-    /// Frames played since the last new decode failure or underrun.
-    clean_frames: u64,
 }
 
 impl Session {
@@ -405,10 +398,6 @@ impl Session {
             decode_errors_seen: 0,
             deferral_seen: None,
             sent: 0,
-            ahead_frames: capacity.ahead_frames,
-            underruns_seen: 0,
-            output_frame_seen: 0,
-            clean_frames: 0,
         })
     }
 
@@ -714,30 +703,15 @@ impl Session {
         }
     }
 
-    /// Records new decode failures and new deferrals of the queued jump, and
-    /// clears them once they are over (see [`Snapshot::last_error`]).
+    /// Records new decode failures, and new deferrals of the queued jump
+    /// until the jump is over (see [`Snapshot::last_error`]).
     fn watch_disk(&mut self, report: &Report) {
         let status = &report.status;
-        // The output frame returns to 0 when the transport stops.
-        let played = status
-            .output_frame
-            .checked_sub(self.output_frame_seen)
-            .unwrap_or(status.output_frame);
-        self.output_frame_seen = status.output_frame;
         let errors = self.monitor.decode_errors();
         if errors > self.decode_errors_seen {
             self.decode_errors_seen = errors;
-            self.clean_frames = 0;
             self.last_error = Some(RuntimeError::DecodeFailed { blocks: errors });
-        } else if status.underruns > self.underruns_seen {
-            self.clean_frames = 0;
-        } else {
-            self.clean_frames = self.clean_frames.saturating_add(played);
-            if self.clean_frames >= 2 * self.ahead_frames {
-                self.clear_error(|error| matches!(error, RuntimeError::DecodeFailed { .. }));
-            }
         }
-        self.underruns_seen = status.underruns;
         match status.queued {
             Some(queued) if queued.deferrals > 0 => {
                 let seen = (queued.target, queued.deferrals);

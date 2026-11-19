@@ -477,7 +477,7 @@ fn a_start_timeout_clears_once_play_starts() {
 }
 
 #[test]
-fn a_decode_failure_clears_once_playback_runs_clean_for_two_read_ahead_windows() {
+fn a_decode_failure_stays_after_a_clean_stretch_because_failed_blocks_never_decode_again() {
     let dir = song();
     let (gate, open_gate) = gate_from(2 * BAR);
     let fake = FakeOutput::new();
@@ -506,12 +506,7 @@ fn a_decode_failure_clears_once_playback_runs_clean_for_two_read_ahead_windows()
 
     // Back in the intro, every block decodes and every read is served.
     session.send(Command::BackToStart).unwrap();
-    let (_, soon) = play_for(&mut session, &fake, 1_024, 4_096);
-    assert!(
-        matches!(soon.last_error, Some(RuntimeError::DecodeFailed { .. })),
-        "one clean stretch shorter than the window does not clear it"
-    );
-    // The read-ahead window is 1 s: 8 000 frames at 8 kHz.
+    // Two of the disk's 1 s read-ahead windows at 8 kHz, all of it clean.
     let (_, clean) = play_for(&mut session, &fake, 1_024, 2 * 8_000);
 
     assert_eq!(clean.position, 0);
@@ -519,7 +514,10 @@ fn a_decode_failure_clears_once_playback_runs_clean_for_two_read_ahead_windows()
         clean.decode_errors, failing.decode_errors,
         "nothing new failed"
     );
-    assert_eq!(clean.last_error, None);
+    assert!(
+        matches!(clean.last_error, Some(RuntimeError::DecodeFailed { .. })),
+        "the failed verse will play as silence again, so the error stays"
+    );
 }
 
 #[test]
@@ -1060,4 +1058,59 @@ fn opening_a_missing_folder_or_arrangement_fails_before_any_device_opens() {
     .err()
     .unwrap();
     assert!(matches!(error, OpenError::Output(OutputError::NoDevice)));
+}
+
+/// Committable form of the B1 probe (same helpers as tests/session.rs).
+#[test]
+fn a_failed_section_that_plays_again_after_a_clean_stretch_shows_the_decode_error_again() {
+    let dir = song();
+    let json = std::fs::read_to_string(dir.path().join("song.json")).unwrap();
+    let mut package = domain::SongPackage::from_json(&json).unwrap();
+    package.arrangements.push(domain::Arrangement {
+        id: "repeat".to_owned(),
+        name: "repeat".to_owned(),
+        sections: ["intro", "chorus", "verse", "chorus"]
+            .iter()
+            .map(|section| (*section).to_owned())
+            .collect(),
+        infinite_loop: Vec::new(),
+    });
+    std::fs::write(dir.path().join("song.json"), package.to_json().unwrap()).unwrap();
+    let (gate, open_gate) = gate_from(BAR / 2);
+    let fake = FakeOutput::new();
+    let mut session = open(
+        dir.path(),
+        &fake,
+        SessionOptions {
+            arrangement: "repeat".to_owned(),
+            disk_gate: Some(gate),
+            ..options(256)
+        },
+    );
+    // The drums lose the chorus (source bars 4 to 6) and what follows, after
+    // they were checked; the verse stays whole.
+    let drums = OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("stems/drums.wav"))
+        .unwrap();
+    drums.set_len(44 + 2 * 4 * BAR).unwrap();
+    open_gate.store(true, Ordering::SeqCst);
+    start(&mut session, &fake, 256);
+    let monitor = session.disk_monitor();
+
+    let mut underruns = 0;
+    loop {
+        let (_, snapshot) = step(&mut session, &fake, &monitor, 256);
+        if snapshot.transport == TransportState::Stopped {
+            break;
+        }
+        assert!(
+            snapshot.underruns == underruns || snapshot.last_error.is_some(),
+            "the drums play silence at frame {} (position {}) and the snapshot names no problem",
+            snapshot.output_frame,
+            snapshot.position
+        );
+        underruns = snapshot.underruns;
+    }
+    assert!(underruns > 0, "the second chorus played its failed blocks");
 }
