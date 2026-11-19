@@ -1533,3 +1533,72 @@ fn the_player_honours_the_configured_seam_crossfade() {
         assert_plays(&jumped, &expected);
     }
 }
+
+#[test]
+fn playhead_ready_asks_every_source_for_the_audio_at_the_playhead() {
+    let setup = full();
+    let probe = Probe::default();
+    *probe.blocked.lock().unwrap() = Some(0..1);
+    let (mut player, mut controller) = Player::new(
+        setup.song(),
+        setup.arrangement,
+        &setup.settings,
+        &config(&setup, 1_024),
+        controlled(&setup, &probe),
+    )
+    .expect("player builds");
+    assert!(!player.playhead_ready(), "the start is not buffered");
+    *probe.blocked.lock().unwrap() = None;
+    assert!(player.playhead_ready());
+
+    controller.send(Command::Play).unwrap();
+    let mut out = vec![0.0f32; 2 * 1_024];
+    for _ in 0..35 {
+        player.process(&mut out);
+    }
+    controller.send(Command::Pause).unwrap();
+    player.process(&mut out);
+    let paused = player.status();
+    assert_eq!(paused.transport, Transport::Paused);
+    assert_eq!(paused.position, POS_VERSE);
+    *probe.blocked.lock().unwrap() = Some(paused.source_frame..paused.source_frame + 1);
+    assert!(
+        !player.playhead_ready(),
+        "it asks for the paused playhead, not the section start"
+    );
+    *probe.blocked.lock().unwrap() = Some(VERSE.0..VERSE.0 + 1);
+    assert!(player.playhead_ready());
+}
+
+#[test]
+fn asking_whether_the_playhead_is_ready_changes_nothing_the_player_plays() {
+    let setup = full();
+    let script = [
+        (0, Command::Play),
+        (
+            1_024,
+            Command::QueueJump {
+                position: POS_OUTRO,
+            },
+        ),
+        (40_960, Command::Pause),
+        (45_056, Command::Play),
+    ];
+    let frames = round_up(INTRO.1 + OUTRO.1 + 8_192);
+    let plain = run(&setup, 64, frames, &script);
+    let asking = {
+        let (mut player, mut controller) = player(&setup, 64);
+        let mut output = vec![0.0f32; 2 * frames as usize];
+        let mut done = 0u64;
+        while done < frames {
+            for &(_, command) in script.iter().filter(|(at, _)| *at == done) {
+                controller.send(command).unwrap();
+            }
+            assert!(player.playhead_ready(), "memory sources are always ready");
+            player.process(&mut output[2 * done as usize..2 * (done + 64) as usize]);
+            done += 64;
+        }
+        output
+    };
+    assert_eq!(bits(&asking), bits(&plain.output));
+}
