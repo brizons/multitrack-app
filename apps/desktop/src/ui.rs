@@ -306,21 +306,17 @@ fn transport(
     } else {
         ("play", "Play")
     };
-    let step = |id: &'static str, name: &'static str, enabled: bool, cx: &mut Context<Perform>| {
-        let action = if name == "previous" {
-            UiAction::PreviousSong
-        } else {
-            UiAction::NextSong
-        };
+    let step = |name: &'static str, action: UiAction, enabled: bool, cx: &mut Context<Perform>| {
         let color = if enabled {
             theme::text()
         } else {
             theme::text_faint()
         };
-        square_button(id, cx, Intent::Ui(action)).child(icon(name, color, 22.))
+        square_button(name, cx, Intent::Ui(action)).child(icon(name, color, 22.))
     };
-    let previous = setlist.map(|setlist| step("previous", "previous", setlist.has_previous, cx));
-    let next = setlist.map(|setlist| step("next", "next", setlist.has_next, cx));
+    let previous =
+        setlist.map(|setlist| step("previous", UiAction::PreviousSong, setlist.has_previous, cx));
+    let next = setlist.map(|setlist| step("next", UiAction::NextSong, setlist.has_next, cx));
     div()
         .flex_none()
         .flex()

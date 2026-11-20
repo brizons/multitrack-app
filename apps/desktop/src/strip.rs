@@ -195,8 +195,8 @@ fn chip(info: &SetlistInfo, state: &app::SetlistState, index: usize) -> Transiti
     }
 }
 
-/// The setlist's problems, one line each, in this order: why each item
-/// that cannot play cannot, each song at another sample rate, each link
+/// The setlist's problems, one line each, in this order: why the library's
+/// songs could not be listed, why each item that cannot play cannot, each song at another sample rate, each link
 /// that plays as Cue next because of it, the last setlist problem, the
 /// control refused, and the device held for the current item's rate.
 fn problems(
@@ -213,7 +213,7 @@ fn problems(
             .map_or_else(String::new, |item| catalog.title(&item.item));
         format!("{} \"{title}\"", index + 1)
     };
-    let mut lines = Vec::new();
+    let mut lines: Vec<String> = catalog.problem().map(str::to_owned).into_iter().collect();
     for (index, item) in info.items.iter().enumerate() {
         for problem in &item.problems {
             lines.push(format!("Item {} cannot play: {problem}", name(index)));

@@ -13,7 +13,7 @@ use app::{
     SetlistCommand, SetlistCommandError, SetlistOpenError, SetlistSession, SetlistSnapshot,
     Snapshot, SongInfo,
 };
-use library::{Library, SETLIST_EXTENSION, SETLISTS_FOLDER};
+use library::{Library, SETLIST_EXTENSION, SETLISTS_FOLDER, SetlistError};
 
 use crate::action::{UiAction, command_for, setlist_command_for};
 use crate::catalog::Catalog;
@@ -110,15 +110,25 @@ impl Source {
                 .map(|prepared| Prepared::Song(dir.clone(), Box::new(prepared)))
                 .map_err(OpenFailure::Song),
             Self::Setlist { library, file } => {
-                let catalog = Library::new(library)
-                    .list_songs()
-                    .map(|listing| Catalog::from_listing(&listing))
-                    .unwrap_or_default();
+                // Kept canonical, so comparing it with the Library
+                // screen's folder needs no file system call.
+                let library = std::fs::canonicalize(library).map_err(|source| {
+                    OpenFailure::Setlist(SetlistOpenError::Library(SetlistError::Folder {
+                        path: library.clone(),
+                        source,
+                    }))
+                })?;
+                let catalog = match Library::new(&library).list_songs() {
+                    Ok(listing) => Catalog::from_listing(&listing),
+                    Err(error) => Catalog::unavailable(format!(
+                        "The library's songs could not be listed, so items show their folder names: {error}"
+                    )),
+                };
                 let prepared =
-                    SetlistSession::prepare(&Library::new(library), file, options.clone())
+                    SetlistSession::prepare(&Library::new(&library), file, options.clone())
                         .map_err(OpenFailure::Setlist)?;
                 Ok(Prepared::Setlist {
-                    library: library.clone(),
+                    library,
                     file: file.clone(),
                     prepared: Box::new(prepared),
                     catalog,
@@ -245,8 +255,16 @@ impl LoadedSetlist {
     }
 
     /// Moves the session on and keeps its snapshot.
+    ///
+    /// A refused previous, next or select is forgotten once the setlist
+    /// moves to another item by itself (an AutoLink, a Crossfade, Cue
+    /// next), since it no longer says anything about where the setlist is.
     pub fn poll(&mut self) {
+        let before = self.snapshot.setlist.current;
         self.snapshot = self.session.poll();
+        if self.snapshot.setlist.current != before {
+            self.refused = None;
+        }
     }
 
     /// Sends the command `action` stands for. A refused item command shows
@@ -340,7 +358,7 @@ impl Show {
     /// it now names the new file.
     pub fn follow_move(&mut self, library: &Path, from: &str, to: &str) {
         if let Self::Setlist(setlist) = self
-            && same_folder(&setlist.library, library)
+            && setlist.library == library
             && setlist.file == from
         {
             setlist.file = to.to_owned();
@@ -482,16 +500,6 @@ fn failure(source: &Source, error: OpenError) -> OpenFailure {
         Source::Song(_) => OpenFailure::Song(error),
         Source::Setlist { .. } => OpenFailure::Setlist(SetlistOpenError::Open(error)),
     }
-}
-
-/// Whether `a` and `b` name one folder: the same path, or the same folder
-/// once symlinks and dots are resolved.
-pub fn same_folder(a: &Path, b: &Path) -> bool {
-    a == b
-        || matches!(
-            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
-            (Ok(a), Ok(b)) if a == b
-        )
 }
 
 /// `path` (absolute) with `.` dropped and each `..` taking off the name

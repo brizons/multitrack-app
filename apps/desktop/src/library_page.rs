@@ -116,7 +116,14 @@ pub struct LibraryPage {
 impl LibraryPage {
     /// The library folder `root`: its setlists, with `file` open in the
     /// editor when given (else the first one), and its songs.
+    ///
+    /// The folder is kept canonical ([`Self::root`]), so it compares with
+    /// the library of a setlist on Perform as a plain path.
     pub fn open(root: &Path, file: Option<&str>) -> Result<Self, SetlistError> {
+        let root = &std::fs::canonicalize(root).map_err(|source| SetlistError::Folder {
+            path: root.to_owned(),
+            source,
+        })?;
         let shelf = Shelf::open(root)?;
         let (catalog, unreadable_songs) = match Library::new(root).list_songs() {
             Ok(listing) => (
@@ -792,15 +799,28 @@ fn item_of(problem: &SetlistValidationError) -> Option<usize> {
 
 /// The library folder (and setlist) the Library screen opens on when it
 /// is shown: the library of the setlist `playing` on Perform, with that
-/// setlist in the editor, but only when no library is `open` yet.
+/// setlist in the editor, when no library is `open` yet or the open one was
+/// followed from another setlist; a library picked with Open library…
+/// stays. Libraries are compared as stored: both canonical.
 pub fn library_to_open(
-    open: Option<&Path>,
+    open: Option<(&Path, Opened)>,
     playing: Option<(&Path, &str)>,
 ) -> Option<(PathBuf, String)> {
-    match (open, playing) {
-        (None, Some((library, file))) => Some((library.to_owned(), file.to_owned())),
-        _ => None,
+    let (library, file) = playing?;
+    match open {
+        Some((_, Opened::Picked)) => None,
+        Some((root, Opened::Followed)) if root == library => None,
+        _ => Some((library.to_owned(), file.to_owned())),
     }
+}
+
+/// How the library the Library screen shows was opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opened {
+    /// Picked with Open library…: it stays until another is picked.
+    Picked,
+    /// Followed from the setlist on Perform: it follows the one playing.
+    Followed,
 }
 
 /// One setlist of the list.

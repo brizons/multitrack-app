@@ -877,20 +877,38 @@ fn renaming_reports_the_move_so_perform_can_follow_it() {
 }
 
 #[test]
-fn the_library_screen_opens_the_playing_setlists_library_only_when_none_is_open() {
-    use openvamp_desktop::library_page::library_to_open;
+fn a_followed_library_follows_the_playing_setlist_and_a_picked_one_stays() {
+    use openvamp_desktop::library_page::{Opened, library_to_open};
 
-    let playing = (Path::new("/music/Library"), "Sunday.setlist.json");
+    let library = Path::new("/music/Library");
+    let other = Path::new("/music/Other");
+    let playing = Some((library, "Sunday.setlist.json"));
+    let opens = Some((library.to_owned(), "Sunday.setlist.json".to_owned()));
+
+    // Nothing open yet: the playing setlist's library.
+    assert_eq!(library_to_open(None, playing), opens);
+    // Opened by following a setlist: it follows the one playing now.
     assert_eq!(
-        library_to_open(None, Some(playing)),
-        Some((
-            Path::new("/music/Library").to_owned(),
-            "Sunday.setlist.json".to_owned()
-        ))
+        library_to_open(Some((other, Opened::Followed)), playing),
+        opens
     );
     assert_eq!(
-        library_to_open(Some(Path::new("/music/Other")), Some(playing)),
+        library_to_open(Some((library, Opened::Followed)), playing),
         None
     );
+    // Picked with Open library…: it stays.
+    assert_eq!(
+        library_to_open(Some((other, Opened::Picked)), playing),
+        None
+    );
+    // Nothing playing: nothing changes.
     assert_eq!(library_to_open(None, None), None);
+    assert_eq!(library_to_open(Some((other, Opened::Followed)), None), None);
+}
+
+#[test]
+fn a_library_opens_at_its_canonical_folder() {
+    let dir = library();
+    let page = LibraryPage::open(&dir.path().join("Songs/.."), None).unwrap();
+    assert_eq!(page.root(), fs::canonicalize(dir.path()).unwrap());
 }

@@ -319,6 +319,8 @@ fn a_playing_setlist_follows_its_file_when_it_moves() {
     )
     .unwrap();
     let show = current.as_mut().unwrap();
+    // The library is kept canonical, the form the Library screen gives.
+    let library = &std::fs::canonicalize(library).unwrap();
 
     show.follow_move(library, "Sunday.setlist.json", "Zed.setlist.json");
     assert_eq!(
@@ -341,5 +343,239 @@ fn a_playing_setlist_follows_its_file_when_it_moves() {
             library: library.to_owned(),
             file: "Zed.setlist.json".to_owned(),
         }
+    );
+}
+
+#[test]
+fn a_setlist_keeps_its_library_folder_canonical() {
+    let dir = tempfile::tempdir().unwrap();
+    write_song(&dir.path().join("One.song"), "First", 8_000);
+    save_setlist(dir.path(), "Sunday", vec![song("One.song")]);
+    let fake = FakeOutput::new();
+    let mut current = None;
+    let source = Source::Setlist {
+        library: dir.path().join("One.song/.."),
+        file: "Sunday.setlist.json".to_owned(),
+    };
+    replace(
+        &mut current,
+        &source,
+        &SessionOptions::default(),
+        output(&fake),
+        |_| {},
+    )
+    .unwrap();
+
+    assert_eq!(
+        current.unwrap().source(),
+        Source::Setlist {
+            library: std::fs::canonicalize(dir.path()).unwrap(),
+            file: "Sunday.setlist.json".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn a_refused_control_is_forgotten_once_the_setlist_moves_on_by_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path();
+    write_song(&library.join("One.song"), "First", 8_000);
+    write_song(&library.join("Two.song"), "Second", 8_000);
+    let mut first = SongItem::new("One.song");
+    first.transition = domain::Transition::AutoLink;
+    let source = save_setlist(
+        library,
+        "Sunday",
+        vec![SetlistItem::Song(first), song("Two.song")],
+    );
+    let fake = FakeOutput::new();
+    let mut current = None;
+    replace(
+        &mut current,
+        &source,
+        &SessionOptions::default(),
+        output(&fake),
+        |_| {},
+    )
+    .unwrap();
+    let show = current.as_mut().unwrap();
+    show.send(UiAction::PreviousSong);
+    run(show, &fake);
+    assert!(
+        setlist_view(show)
+            .problems
+            .iter()
+            .any(|l| l.starts_with("Refused"))
+    );
+
+    show.send(UiAction::TogglePlay);
+    for _ in 0..2_000 {
+        if setlist_view(show).position == "2 of 2" {
+            break;
+        }
+        for monitor in show.setlist().unwrap().session.disk_monitors() {
+            assert!(monitor.wait_idle(Duration::from_secs(10)));
+        }
+        fake.render(256);
+        show.poll();
+    }
+
+    let view = setlist_view(show);
+    assert_eq!(view.position, "2 of 2", "AutoLink moved on");
+    assert!(
+        !view.problems.iter().any(|l| l.starts_with("Refused")),
+        "{:?}",
+        view.problems
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn songs_the_library_cannot_list_show_as_a_note_and_items_keep_their_folder_names() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("Library");
+    write_song(&library.join("One.song"), "First", 8_000);
+    let source = save_setlist(&library, "Sunday", vec![song("One.song")]);
+    // Searchable but not readable: paths inside resolve, the folder does
+    // not list.
+    std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o311)).unwrap();
+    let listable = std::fs::read_dir(&library).is_ok();
+    let fake = FakeOutput::new();
+    let mut current = None;
+    let opened = replace(
+        &mut current,
+        &source,
+        &SessionOptions::default(),
+        output(&fake),
+        |_| {},
+    );
+    std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if listable {
+        // Running as root: the folder stays readable.
+        return;
+    }
+    opened.unwrap();
+
+    let view = setlist_view(current.as_ref().unwrap());
+    assert_eq!(view.items[0].title, "One");
+    assert!(
+        view.problems.iter().any(|line| line.starts_with(
+            "The library's songs could not be listed, so items show their folder names: "
+        )),
+        "{:?}",
+        view.problems
+    );
+}
+
+/// A device that is checked fine but held by another song, so opening a
+/// pick on it fails after the check.
+fn busy_device(dir: &Path) -> (FakeOutput, Option<Show>) {
+    let busy = FakeOutput::new();
+    write_song(&dir.join("Elsewhere.song"), "Elsewhere", 8_000);
+    let mut holder = None;
+    replace(
+        &mut holder,
+        &Source::Song(dir.join("Elsewhere.song")),
+        &SessionOptions::default(),
+        output(&busy),
+        |_| {},
+    )
+    .unwrap();
+    (busy, holder)
+}
+
+#[test]
+fn a_setlist_comes_back_stopped_when_the_pick_cannot_start_on_its_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("Library");
+    write_song(&library.join("One.song"), "First", 8_000);
+    write_song(&dir.path().join("Pick.song"), "Pick", 8_000);
+    let source = save_setlist(&library, "Sunday", vec![song("One.song")]);
+    let device = FakeOutput::new();
+    let mut current = None;
+    replace(
+        &mut current,
+        &source,
+        &SessionOptions::default(),
+        output(&device),
+        |_| {},
+    )
+    .unwrap();
+    let (busy, _holder) = busy_device(&dir.path().join("other"));
+
+    let calls = std::cell::Cell::new(0);
+    let replaced = replace(
+        &mut current,
+        &Source::Song(dir.path().join("Pick.song")),
+        &SessionOptions::default(),
+        || {
+            calls.set(calls.get() + 1);
+            let output = if calls.get() == 1 { &busy } else { &device };
+            Box::new(output.clone()) as Box<dyn AudioOutput>
+        },
+        |_| {
+            device.render(256);
+        },
+    )
+    .expect("the check lets the pick go ahead");
+
+    assert!(replaced.start_error.is_some());
+    assert!(replaced.reopen_error.is_none());
+    let show = current.as_mut().expect("the setlist is back");
+    assert_eq!(setlist_view(show).name, "Sunday");
+    assert_eq!(show.snapshot().transport, app::TransportState::Stopped);
+    let problems = replaced.problems();
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert!(
+        problems[0].starts_with(&format!(
+            "Could not start {} on the audio device: ",
+            dir.path().join("Pick.song").display()
+        )),
+        "{problems:?}"
+    );
+    assert_eq!(
+        problems[1],
+        "\"Sunday\" is loaded again, stopped at the start."
+    );
+}
+
+#[test]
+fn when_the_setlist_cannot_come_back_nothing_is_loaded_and_both_reasons_show() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("Library");
+    write_song(&library.join("One.song"), "First", 8_000);
+    write_song(&dir.path().join("Pick.song"), "Pick", 8_000);
+    let source = save_setlist(&library, "Sunday", vec![song("One.song")]);
+    let device = FakeOutput::new();
+    let mut current = None;
+    replace(
+        &mut current,
+        &source,
+        &SessionOptions::default(),
+        output(&device),
+        |_| {},
+    )
+    .unwrap();
+    let (busy, _holder) = busy_device(&dir.path().join("other"));
+
+    let replaced = replace(
+        &mut current,
+        &Source::Song(dir.path().join("Pick.song")),
+        &SessionOptions::default(),
+        || Box::new(busy.clone()) as Box<dyn AudioOutput>,
+        |_| {
+            device.render(256);
+        },
+    )
+    .unwrap();
+
+    assert!(current.is_none());
+    let problems = replaced.problems();
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert!(
+        problems[1].starts_with("\"Sunday\" could not be loaded again: "),
+        "{problems:?}"
     );
 }

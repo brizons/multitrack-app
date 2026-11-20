@@ -19,8 +19,8 @@ use openvamp_desktop::action::{Intent, Page, UiAction};
 use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
-use openvamp_desktop::library_page::{LibraryPage, library_to_open};
-use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace, same_folder};
+use openvamp_desktop::library_page::{LibraryPage, Opened, library_to_open};
+use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
 use openvamp_desktop::view::PerformView;
 
 use crate::{library_ui, ui};
@@ -45,6 +45,9 @@ pub struct Perform {
     page: Page,
     /// The library folder the Library screen shows, once one is open.
     library: Option<LibraryPage>,
+    /// How [`Self::library`] was opened, which decides whether it follows
+    /// the setlist on Perform.
+    opened: Opened,
     /// Why the last library folder picked did not open.
     library_problem: Option<String>,
     _poll: Task<()>,
@@ -88,6 +91,7 @@ impl Perform {
             asking: false,
             page: Page::Perform,
             library: None,
+            opened: Opened::Followed,
             library_problem: None,
             _poll: poll,
             _quit: quit,
@@ -319,7 +323,7 @@ impl Perform {
                             Ok(source) => screen.open(&source),
                             Err(problem) => screen.problems = vec![problem],
                         },
-                        Pick::Library => screen.open_library(&path, None),
+                        Pick::Library => screen.open_library(&path, None, Opened::Picked),
                     }
                     cx.notify();
                 });
@@ -342,9 +346,12 @@ impl Perform {
             }
             _ => None,
         };
-        let open = self.library.as_ref().map(LibraryPage::root);
+        let open = self
+            .library
+            .as_ref()
+            .map(|library| (library.root(), self.opened));
         if let Some((root, file)) = library_to_open(open, playing) {
-            self.open_library(&root, Some(&file));
+            self.open_library(&root, Some(&file), Opened::Followed);
         }
     }
 
@@ -365,10 +372,11 @@ impl Perform {
 
     /// Opens the library folder `root` on the Library screen, with `file`
     /// in the editor when given.
-    fn open_library(&mut self, root: &Path, file: Option<&str>) {
+    fn open_library(&mut self, root: &Path, file: Option<&str>, opened: Opened) {
         match LibraryPage::open(root, file) {
             Ok(library) => {
                 self.library = Some(library);
+                self.opened = opened;
                 self.library_problem = None;
             }
             Err(error) => {
@@ -399,7 +407,7 @@ impl Perform {
     fn playing_file(&self) -> Option<&str> {
         let library = self.library.as_ref()?;
         match &self.loaded {
-            Some(Show::Setlist(setlist)) if same_folder(&setlist.library, library.root()) => {
+            Some(Show::Setlist(setlist)) if setlist.library == library.root() => {
                 Some(setlist.file.as_str())
             }
             _ => None,

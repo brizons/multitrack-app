@@ -9,12 +9,31 @@ use library::{ArrangementEntry, SongEntry, SongListing};
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Catalog {
     songs: Vec<SongEntry>,
+    /// Why the library's songs could not be listed, when they could not.
+    problem: Option<String>,
 }
 
 impl Catalog {
     /// The catalog of `songs`, in their order.
     pub fn new(songs: Vec<SongEntry>) -> Self {
-        Self { songs }
+        Self {
+            songs,
+            problem: None,
+        }
+    }
+
+    /// No songs, because they could not be listed: `problem` says why.
+    /// Items then show their folder names.
+    pub fn unavailable(problem: String) -> Self {
+        Self {
+            songs: Vec::new(),
+            problem: Some(problem),
+        }
+    }
+
+    /// Why the library's songs could not be listed, when they could not.
+    pub fn problem(&self) -> Option<&str> {
+        self.problem.as_deref()
     }
 
     /// The readable songs of `listing`.
