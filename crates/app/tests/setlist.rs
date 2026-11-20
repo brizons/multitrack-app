@@ -1221,3 +1221,199 @@ fn a_late_autolink_or_crossfade_starts_the_next_item_once_buffered_and_says_so()
         );
     }
 }
+
+/// An output that keeps every renderer it was given, even after its stream
+/// closes, so a lost stream never hands the session's deck back: the
+/// session ends up without a player ([`app::RuntimeError::PlayerLost`]).
+#[derive(Clone, Default)]
+struct KeepsRenderers {
+    kept: std::sync::Arc<std::sync::Mutex<Vec<app::AudioRenderer>>>,
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct KeptStream {
+    info: app::StreamInfo,
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl app::AudioOutput for KeepsRenderers {
+    fn devices(&self) -> Result<Vec<app::DeviceInfo>, app::OutputError> {
+        Ok(Vec::new())
+    }
+
+    fn open(
+        &mut self,
+        request: &app::OutputRequest,
+        renderer: app::AudioRenderer,
+    ) -> Result<Box<dyn app::OutputStream>, app::OutputError> {
+        self.kept.lock().unwrap().push(renderer);
+        Ok(Box::new(KeptStream {
+            info: app::StreamInfo {
+                device: "Keeper".to_owned(),
+                device_id: "keeper".to_owned(),
+                sample_rate: request.sample_rate,
+                buffer_frames: request.buffer_frames,
+                channels: 2,
+            },
+            lost: std::sync::Arc::clone(&self.lost),
+        }))
+    }
+}
+
+impl app::OutputStream for KeptStream {
+    fn info(&self) -> &app::StreamInfo {
+        &self.info
+    }
+
+    fn health(&self) -> app::StreamHealth {
+        if self.lost.load(std::sync::atomic::Ordering::SeqCst) {
+            app::StreamHealth::Lost {
+                reason: app::LossReason::Unplugged,
+            }
+        } else {
+            app::StreamHealth::Running
+        }
+    }
+}
+
+#[test]
+fn a_reopen_with_no_player_left_sends_nothing_and_keeps_describing_the_item() {
+    let shelf = Shelf::new();
+    shelf
+        .song("Songs/A.song", RATE, 0)
+        .song("Songs/Hi.song", 2 * RATE, 10);
+    let mut setlist = Setlist::new("Sunday");
+    setlist.items = vec![
+        song("Songs/A.song", Transition::CueNext),
+        song("Songs/Hi.song", Transition::CueNext),
+    ];
+    let entry = shelf.library.save_setlist(&setlist).unwrap();
+    let output = KeepsRenderers::default();
+    let mut session = SetlistSession::open(
+        &shelf.library,
+        &entry.file,
+        Box::new(output.clone()),
+        options(),
+    )
+    .unwrap();
+    session.poll();
+    wait_disks(&session);
+    let monitors = session.disk_monitors();
+    assert_eq!(monitors.len(), 2, "A and Hi, prepared ahead");
+    let hi = monitors[1].clone();
+    assert!(hi.is_running());
+
+    // The stream is lost and the output keeps the deck: no player is left.
+    output.lost.store(true, std::sync::atomic::Ordering::SeqCst);
+    let lost = session.poll();
+    assert_eq!(lost.song.last_error, Some(app::RuntimeError::PlayerLost));
+
+    let error = session.send(SetlistCommand::Next).unwrap_err();
+    assert_eq!(
+        error,
+        SetlistCommandError::Runtime(app::RuntimeError::PlayerLost)
+    );
+    let snapshot = session.poll();
+    assert_eq!(snapshot.setlist.current, 0, "the session still describes A");
+    assert_eq!(session.song().sample_rate, RATE);
+    assert!(
+        !hi.is_running(),
+        "Hi was dropped here, not sent to a deck nobody plays"
+    );
+}
+
+#[test]
+fn a_first_item_that_cannot_be_built_is_reported_and_the_setlist_opens_at_the_next() {
+    let shelf = Shelf::new();
+    // 1 kHz is too low to stream, though the song itself is valid.
+    shelf
+        .song("Songs/Low.song", 1_000, 0)
+        .song("Songs/A.song", RATE, 10);
+    let fake = FakeOutput::new();
+    let mut session = shelf.open(
+        vec![
+            song("Songs/Low.song", Transition::CueNext),
+            song("Songs/A.song", Transition::CueNext),
+        ],
+        &fake,
+    );
+    let info = session.info().clone();
+    assert_eq!(info.unavailable(), [0], "Low is reported");
+    assert!(
+        info.items[0].problems.iter().any(|p| p.contains("too low")),
+        "{:?}",
+        info.items[0].problems
+    );
+    assert_eq!(info.sample_rate, RATE, "the device opens at A's rate");
+    assert_eq!(fake.opened()[0].sample_rate, RATE);
+    assert_eq!(session.poll().setlist.current, 1);
+    assert_eq!(
+        session.send(SetlistCommand::Previous),
+        Err(SetlistCommandError::NoPrevious),
+        "Low is skipped"
+    );
+}
+
+#[test]
+fn a_setlist_whose_items_all_fail_to_build_has_nothing_playable_with_every_reason() {
+    let shelf = Shelf::new();
+    shelf.song("Songs/Low.song", 1_000, 0);
+    let mut setlist = Setlist::new("Low");
+    setlist.items = vec![
+        song("Songs/Missing.song", Transition::CueNext),
+        song("Songs/Low.song", Transition::CueNext),
+    ];
+    let entry = shelf.library.save_setlist(&setlist).unwrap();
+    let fake = FakeOutput::new();
+    let result = SetlistSession::open(
+        &shelf.library,
+        &entry.file,
+        Box::new(fake.clone()),
+        options(),
+    );
+    let Err(app::SetlistOpenError::NothingPlayable { name, problems }) = result else {
+        panic!("nothing can play: {:?}", result.err());
+    };
+    assert_eq!(name, "Low");
+    assert!(problems[0].iter().any(|p| p.contains("Songs/Missing.song")));
+    assert!(
+        problems[1].iter().any(|p| p.contains("too low")),
+        "{problems:?}"
+    );
+    assert!(fake.opened().is_empty());
+}
+
+/// Tests wait on these monitors before each buffer: the item a crossfade
+/// fades out is still heard, so its disk is watched until the blend ends.
+#[test]
+fn the_item_a_crossfade_fades_out_stays_watched_until_the_blend_ends() {
+    let shelf = Shelf::new();
+    shelf
+        .steady("Songs/A.song", 7, PEAK, 0.0)
+        .steady("Songs/B.song", 7, PEAK, 0.0);
+    let fake = FakeOutput::new();
+    let mut session = shelf.open(
+        vec![
+            song("Songs/A.song", Transition::Crossfade),
+            song("Songs/B.song", Transition::CueNext),
+        ],
+        &fake,
+    );
+    wait_next(&mut session);
+    assert_eq!(session.disk_monitors().len(), 2, "A, and B cued");
+    let mut during = None;
+    let mut after = None;
+    let mut audio = start(&mut session, &fake);
+    while audio.len() < 2 * 14 * RATE as usize {
+        let (out, snapshot) = step(&mut session, &fake);
+        audio.extend(out);
+        let watched = session.disk_monitors().len();
+        if snapshot.setlist.blend.is_some() {
+            during.get_or_insert(watched);
+        } else if snapshot.setlist.current == 1 {
+            after.get_or_insert(watched);
+        }
+    }
+    assert_eq!(during, Some(2), "B, and A while it fades out");
+    assert_eq!(after, Some(1), "B alone once the blend is over");
+}

@@ -186,7 +186,10 @@ pub enum SetlistOpenError {
     /// opened.
     #[error(transparent)]
     Library(#[from] SetlistError),
-    /// No item can play; [`SetlistInfo`] would list why for each.
+    /// No item can play: each one either breaks a rule, names a song the
+    /// library cannot provide, or does not build (its song does not stream,
+    /// say). `problems` lists why for each item, as [`ItemInfo::problems`]
+    /// would.
     #[error("setlist \"{name}\" has no item that can play")]
     NothingPlayable {
         /// The setlist's name.
@@ -194,19 +197,11 @@ pub enum SetlistOpenError {
         /// Why each item cannot play, in item order.
         problems: Vec<Vec<String>>,
     },
-    /// The first playable item or the device could not be opened.
+    /// The buffer size is refused, or the device could not be opened. An
+    /// item that does not build is not this error: it is reported with the
+    /// items that cannot play, and the setlist opens at the next one.
     #[error(transparent)]
     Open(#[from] OpenError),
-    /// The first playable item could not be built although its folder
-    /// opened: its song changed after the setlist was checked and no longer
-    /// has the item's start and end positions.
-    #[error("item {} could not be prepared: {error}", .item + 1)]
-    FirstItem {
-        /// Index of the item.
-        item: usize,
-        /// Why.
-        error: String,
-    },
 }
 
 /// Why [`SetlistSession::send`] refused a command; nothing changed.
@@ -335,6 +330,7 @@ impl PreparedSetlist {
             halted: false,
             failed: None,
             blend_from: None,
+            fading: None,
             finished_seen: 0,
             next_tag: 1,
             problem: None,
@@ -421,6 +417,8 @@ pub struct SetlistSession {
     failed: Option<usize>,
     /// The item a crossfade under way fades out.
     blend_from: Option<usize>,
+    /// Its disk, still read while it fades out.
+    fading: Option<DiskMonitor>,
     finished_seen: u64,
     next_tag: u64,
     problem: Option<SetlistProblem>,
@@ -453,39 +451,35 @@ impl SetlistSession {
         let setlist = library.load_setlist(file)?;
         let songs = library.setlist_songs(&setlist)?;
         let errors = setlist.validate(&songs).err().unwrap_or_default();
-        let (items, plans): (Vec<ItemInfo>, Vec<Option<Plan>>) = setlist
+        let (mut items, mut plans): (Vec<ItemInfo>, Vec<Option<Plan>>) = setlist
             .items
             .iter()
             .enumerate()
             .map(|(index, item)| plan_item(library, &songs, &errors, index, item))
             .unzip();
-        let sample_rate = plans
-            .iter()
-            .find_map(|plan| match plan {
-                Some(Plan::Song { sample_rate, .. }) => Some(*sample_rate),
-                _ => None,
-            })
-            .unwrap_or(CLICK_ONLY_SAMPLE_RATE);
-        let Some(first) = plans.iter().position(Option::is_some) else {
-            return Err(SetlistOpenError::NothingPlayable {
-                name: setlist.name,
-                problems: items.into_iter().map(|item| item.problems).collect(),
-            });
+        // The first item that builds starts the setlist; one that passed the
+        // check but does not build (its song does not stream, say) is
+        // reported like any item that cannot play, and the next one is tried.
+        let (first, item, sample_rate) = loop {
+            let sample_rate = device_rate(&plans);
+            let Some(first) = plans.iter().position(Option::is_some) else {
+                return Err(SetlistOpenError::NothingPlayable {
+                    name: setlist.name,
+                    problems: items.into_iter().map(|item| item.problems).collect(),
+                });
+            };
+            match build(plans[first].as_ref(), sample_rate, &options) {
+                Ok(item) => break (first, item, sample_rate),
+                Err(error) => {
+                    items[first].problems.push(error.to_string());
+                    plans[first] = None;
+                }
+            }
         };
         let info = SetlistInfo {
             name: setlist.name,
             sample_rate,
             items,
-        };
-        let item = match build(plans[first].as_ref(), sample_rate, &options) {
-            Ok(item) => item,
-            Err(BuildError::Item(ItemError::Open(error))) => return Err(error.into()),
-            Err(error) => {
-                return Err(SetlistOpenError::FirstItem {
-                    item: first,
-                    error: error.to_string(),
-                });
-            }
         };
         Ok(PreparedSetlist {
             prepared: PreparedSong::new(item, 0, &options),
@@ -512,10 +506,12 @@ impl SetlistSession {
         self.session.devices()
     }
 
-    /// Watches the disk threads of the current item and the items prepared
-    /// ahead; for tests and diagnostics.
+    /// Watches the disk threads of the current item, the item a crossfade
+    /// fades out while it does, and the items prepared ahead; for tests and
+    /// diagnostics.
     pub fn disk_monitors(&self) -> Vec<DiskMonitor> {
         let mut monitors = vec![self.session.disk_monitor()];
+        monitors.extend(self.fading.clone());
         monitors.extend(self.cued.iter().map(|staged| staged.monitor.clone()));
         monitors.extend(
             self.pending
@@ -620,11 +616,13 @@ impl SetlistSession {
             && let Some(staged) = self.cued.take()
         {
             self.blend_from = deck.blend.map(|_| self.current);
+            self.fading = deck.blend.map(|_| self.session.disk_monitor());
             self.session.bind(staged.info, staged.monitor, staged.tag);
             self.current = staged.index;
         }
         if deck.blend.is_none() {
             self.blend_from = None;
+            self.fading = None;
         }
         if deck.finished > self.finished_seen {
             self.finished_seen = deck.finished;
@@ -873,6 +871,18 @@ impl fmt::Debug for SetlistSession {
             .field("current", &self.current)
             .finish_non_exhaustive()
     }
+}
+
+/// The rate the device opens at: the first playable song's, or
+/// [`CLICK_ONLY_SAMPLE_RATE`] when only click-only tiles can play.
+fn device_rate(plans: &[Option<Plan>]) -> u32 {
+    plans
+        .iter()
+        .find_map(|plan| match plan {
+            Some(Plan::Song { sample_rate, .. }) => Some(*sample_rate),
+            _ => None,
+        })
+        .unwrap_or(CLICK_ONLY_SAMPLE_RATE)
 }
 
 /// What `item` (at `index`) is, whether it can play, and how to build it.

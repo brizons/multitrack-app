@@ -988,10 +988,13 @@ impl Session {
     /// ([`RuntimeError::DeviceReopenFailed`]); choosing an item at a rate
     /// the device takes brings it back.
     ///
-    /// The item goes to the deck first: when the deck refuses it (its queue
-    /// is full), nothing else changes, so the session keeps describing and
-    /// playing the item it had at the rate it had, and the refusal is
-    /// returned and kept as [`Snapshot::last_error`].
+    /// The item goes to the deck before the stream closes: when the deck
+    /// refuses it (its queue is full), nothing else changes, so the session
+    /// keeps describing and playing the item it had at the rate it had, and
+    /// the refusal is returned and kept as [`Snapshot::last_error`]. With no
+    /// player left ([`RuntimeError::PlayerLost`]) nothing is sent at all.
+    /// Should the output keep the player once the stream closes, the session
+    /// is lost after all, still describing the item it had.
     pub(crate) fn reopen_with(&mut self, item: Item, tag: u64) -> Result<(), RuntimeError> {
         let Item {
             info,
@@ -1000,6 +1003,12 @@ impl Session {
             ..
         } = item;
         let rate = info.sample_rate;
+        // With no player left nothing is sent: the item is dropped here,
+        // on the control thread, with its disk thread.
+        if let Link::Lost = self.link {
+            self.last_error = Some(RuntimeError::PlayerLost);
+            return Err(RuntimeError::PlayerLost);
+        }
         // Should the audio thread take it before the stream closes, the
         // item waits there stopped: silent, whatever the rate.
         let sent = self.deck.select(player, tag);
