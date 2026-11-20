@@ -14,7 +14,7 @@
 //! does the same for a song or a setlist, and [`ending`] decides when
 //! quitting or closing the window asks first. For the Library screen,
 //! [`library_page`] carries out its controls and says what it shows,
-//! [`shelf`] lists, creates and duplicates setlists, [`editor`] edits and
+//! [`shelf`] lists, creates, duplicates and moves setlists, [`editor`] edits and
 //! saves one, and [`line_edit`] is its one-line text field. The GPUI views
 //! in the binary only draw these views and dispatch these actions.
 

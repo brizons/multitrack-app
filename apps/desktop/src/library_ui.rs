@@ -171,7 +171,17 @@ fn setlists(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
                 .flex()
                 .flex_col()
                 .gap(px(8.))
-                .children(view.setlists.iter().map(|row| setlist_row(row, cx)))
+                .children(
+                    view.setlists
+                        .iter()
+                        .map(|row| setlist_row(row, view.setlists.len(), cx)),
+                )
+                .children(view.order_problem.iter().map(|line| {
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::queued())
+                        .child(line.clone())
+                }))
                 .children(view.unreadable_setlists.iter().map(|line| {
                     div()
                         .text_size(px(12.))
@@ -194,13 +204,28 @@ fn setlists(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
         )
 }
 
-fn setlist_row(row: &SetlistRow, cx: &mut Context<Perform>) -> AnyElement {
+/// A setlist of the list: the arrows move it, the rest selects it.
+fn setlist_row(row: &SetlistRow, rows: usize, cx: &mut Context<Perform>) -> AnyElement {
+    let index = row.index;
+    let step = |name: &'static str, enabled: bool, action, cx: &mut Context<Perform>| {
+        let color = if enabled {
+            theme::text_muted()
+        } else {
+            theme::border()
+        };
+        button(id(format!("setlist-{name}-{index}")), cx, act(action))
+            .size(px(24.))
+            .justify_center()
+            .rounded(px(6.))
+            .child(icon(name, color, 16.))
+    };
     let tile = button(
         ("setlist-row", row.index),
         cx,
         act(LibraryAction::SelectSetlist(row.index)),
     )
-    .flex_none()
+    .flex_1()
+    .min_w_0()
     .flex_col()
     .items_start()
     .gap(px(3.))
@@ -219,21 +244,45 @@ fn setlist_row(row: &SetlistRow, cx: &mut Context<Perform>) -> AnyElement {
     } else {
         row.meta.clone()
     };
-    tile.child(
-        div()
-            .w_full()
-            .truncate()
-            .text_size(px(16.))
-            .font_weight(FontWeight::SEMIBOLD)
-            .child(row.name.clone()),
-    )
-    .child(
-        div()
-            .text_size(px(13.))
-            .text_color(theme::text_muted())
-            .child(meta),
-    )
-    .into_any_element()
+    let tile = tile
+        .child(
+            div()
+                .w_full()
+                .truncate()
+                .text_size(px(16.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(row.name.clone()),
+        )
+        .child(
+            div()
+                .text_size(px(13.))
+                .text_color(theme::text_muted())
+                .child(meta),
+        );
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(step(
+                    "up",
+                    index > 0,
+                    LibraryAction::MoveSetlistUp(index),
+                    cx,
+                ))
+                .child(step(
+                    "down",
+                    index + 1 < rows,
+                    LibraryAction::MoveSetlistDown(index),
+                    cx,
+                )),
+        )
+        .child(tile)
+        .into_any_element()
 }
 
 /// The setlist in the editor: its name, items and their controls.

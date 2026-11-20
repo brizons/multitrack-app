@@ -641,3 +641,60 @@ fn while_a_field_has_the_focus_keys_type_into_it_except_shortcuts() {
     );
     assert_eq!(typed(&with_secondary("a"), Some("a")), Typed::Ignored);
 }
+
+#[test]
+fn setlists_move_up_and_down_and_the_order_lasts() {
+    let dir = library();
+    for name in ["A", "B", "C"] {
+        save(dir.path(), name, Vec::new());
+    }
+    let mut page = LibraryPage::open(dir.path(), None).unwrap();
+    assert_eq!(page.selected_file(), Some("A.setlist.json"));
+
+    page.act(LibraryAction::MoveSetlistDown(0));
+    assert_eq!(setlist_names(&page), ["B", "A", "C"]);
+    page.act(LibraryAction::MoveSetlistUp(2));
+    assert_eq!(setlist_names(&page), ["B", "C", "A"]);
+    // The ends of the list stay put.
+    page.act(LibraryAction::MoveSetlistUp(0));
+    page.act(LibraryAction::MoveSetlistDown(2));
+    assert_eq!(setlist_names(&page), ["B", "C", "A"]);
+    assert_eq!(page.notice(), None);
+    // The setlist in the editor stays there, marked where it moved.
+    assert_eq!(page.selected_file(), Some("A.setlist.json"));
+    assert!(page.view(None).setlists[2].selected);
+
+    let reopened = LibraryPage::open(dir.path(), None).unwrap();
+    assert_eq!(setlist_names(&reopened), ["B", "C", "A"]);
+
+    // With an order stored, a new setlist goes at the end and a copy
+    // right after its original.
+    page.act(LibraryAction::NewSetlist);
+    page.stop_typing();
+    page.act(LibraryAction::SelectSetlist(0));
+    page.act(LibraryAction::DuplicateSetlist);
+    page.stop_typing();
+    assert_eq!(
+        setlist_names(&page),
+        ["B", "B copy", "C", "A", "New setlist"]
+    );
+}
+
+#[test]
+fn an_order_that_cannot_be_used_is_reported_and_setlists_are_listed_by_name() {
+    let dir = library();
+    for name in ["C", "A", "B"] {
+        save(dir.path(), name, Vec::new());
+    }
+    fs::write(dir.path().join("Setlists/order.json"), "{ broken").unwrap();
+
+    let page = LibraryPage::open(dir.path(), None).unwrap();
+
+    let view = page.view(None);
+    assert_eq!(setlist_names(&page), ["A", "B", "C"]);
+    let problem = view.order_problem.expect("the problem shows");
+    assert!(
+        problem.contains("is not a valid setlist order") && problem.contains("listed by name"),
+        "{problem}"
+    );
+}

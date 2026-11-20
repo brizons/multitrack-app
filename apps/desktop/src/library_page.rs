@@ -40,6 +40,10 @@ pub enum LibraryAction {
     RenameSetlist,
     /// Copies the setlist in the editor and starts naming the copy.
     DuplicateSetlist,
+    /// Moves this setlist of the list one place up.
+    MoveSetlistUp(usize),
+    /// Moves this setlist of the list one place down.
+    MoveSetlistDown(usize),
     /// Shows this item's details in the editor (again: hides them).
     SelectRow(usize),
     /// Adds the song of this row of the song list at the end.
@@ -189,6 +193,15 @@ impl LibraryPage {
                 self.start_rename();
             }
             A::RenameSetlist => self.start_rename(),
+            A::MoveSetlistUp(index) if index > 0 => self
+                .shelf
+                .move_setlist(index, index - 1)
+                .map_err(|e| e.to_string())?,
+            A::MoveSetlistDown(index) if index + 1 < self.shelf.setlists.len() => self
+                .shelf
+                .move_setlist(index, index + 1)
+                .map_err(|e| e.to_string())?,
+            A::MoveSetlistUp(_) | A::MoveSetlistDown(_) => {}
             A::DuplicateSetlist => {
                 if let Some(file) = self.selected_file().map(str::to_owned) {
                     let entry = self.shelf.duplicate(&file).map_err(|e| e.to_string())?;
@@ -482,6 +495,7 @@ impl LibraryPage {
             folder: self.root.display().to_string(),
             setlists,
             unreadable_setlists: self.shelf.unreadable.clone(),
+            order_problem: self.shelf.order_problem.clone(),
             editor: self
                 .editor
                 .as_ref()
@@ -863,6 +877,9 @@ pub struct LibraryView {
     pub setlists: Vec<SetlistRow>,
     /// Setlist files that cannot be read, with the reason.
     pub unreadable_setlists: Vec<String>,
+    /// Why the stored order of the setlists cannot be used, so they are
+    /// listed by name.
+    pub order_problem: Option<String>,
     /// The editor, when a setlist is selected.
     pub editor: Option<EditorView>,
     /// The songs that match the search, by title.

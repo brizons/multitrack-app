@@ -1,6 +1,7 @@
-//! The setlists of a library folder (F5.1): listed with their item counts,
-//! created and duplicated through the `library` crate, which writes each
-//! file atomically and never overwrites another setlist. Renaming goes
+//! The setlists of a library folder (F5.1): listed in their stored order
+//! with their item counts, created, duplicated and moved through the
+//! `library` crate, which writes each file atomically, never overwrites
+//! another setlist and keeps the order of the list. Renaming goes
 //! through the editor ([`crate::editor::SetlistEditor::rename`]), which
 //! holds the setlist.
 
@@ -22,7 +23,7 @@ pub struct ShelfEntry {
 }
 
 /// The setlists of a library folder, as [`Library::list_setlists`] lists
-/// them (by name, ignoring case).
+/// them: in the stored order, the rest by name.
 #[derive(Debug)]
 pub struct Shelf {
     library: Library,
@@ -30,6 +31,9 @@ pub struct Shelf {
     pub setlists: Vec<ShelfEntry>,
     /// Setlist files that cannot be read, one line each with the reason.
     pub unreadable: Vec<String>,
+    /// Why the stored order cannot be used, so the setlists are listed by
+    /// name.
+    pub order_problem: Option<String>,
 }
 
 impl Shelf {
@@ -39,6 +43,7 @@ impl Shelf {
             library: Library::new(root),
             setlists: Vec::new(),
             unreadable: Vec::new(),
+            order_problem: None,
         };
         shelf.refresh()?;
         Ok(shelf)
@@ -68,7 +73,20 @@ impl Shelf {
             .iter()
             .map(|unreadable| format!("{}: {}", unreadable.file, unreadable.error))
             .collect();
+        self.order_problem = listing
+            .order_error
+            .map(|error| format!("{error}; the setlists are listed by name"));
         Ok(())
+    }
+
+    /// Moves the setlist at `index` of the list to place `to`, stores the
+    /// order, and lists the setlists again.
+    pub fn move_setlist(&mut self, index: usize, to: usize) -> Result<(), SetlistError> {
+        let Some(file) = self.setlists.get(index).map(|s| s.entry.file.clone()) else {
+            return Ok(());
+        };
+        self.library.move_setlist(&file, to)?;
+        self.refresh()
     }
 
     /// The index of the setlist in `file`.
