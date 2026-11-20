@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Component, Path, PathBuf};
@@ -269,33 +270,18 @@ fn open_stem(folder: &Path, stem: &Stem) -> Result<Option<OpenedStem>, SongProbl
         file: stem.file.clone(),
         reason,
     };
-    let resolved =
-        fs::canonicalize(folder.join(&stem.file)).map_err(|error| unreadable(error.to_string()))?;
-    if !resolved.starts_with(folder) {
-        return Err(SongProblem::StemOutsideFolder {
-            id: stem.id.clone(),
-            file: stem.file.clone(),
-        });
-    }
-    let checked = fs::metadata(&resolved).map_err(|error| unreadable(error.to_string()))?;
-    if !checked.is_file() {
-        return Err(unreadable("it is not a regular file".to_owned()));
-    }
-    // Remaining window: a folder entry on `resolved` could be swapped for a
-    // symlink between the checks above and this open. The standard library
-    // cannot open a path relative to a folder handle without following
-    // symlinks (that needs `openat2` with `RESOLVE_BENEATH` or similar), so a
-    // swap to a FIFO can still block here. A swap to another file is caught
-    // below by comparing the opened file with the checked one.
-    let file = File::open(&resolved).map_err(|error| unreadable(error.to_string()))?;
-    let opened = file
-        .metadata()
-        .map_err(|error| unreadable(error.to_string()))?;
-    if !opened.is_file() || !same_file(&checked, &opened) {
-        return Err(unreadable(
-            "it changed while it was being opened".to_owned(),
-        ));
-    }
+    let resolved = match resolve_inside(folder, &stem.file) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => {
+            return Err(SongProblem::StemOutsideFolder {
+                id: stem.id.clone(),
+                file: stem.file.clone(),
+            });
+        }
+        Err(error) => return Err(unreadable(error.to_string())),
+    };
+    let (file, opened) =
+        open_regular_file(&resolved).map_err(|error| unreadable(error.to_string()))?;
     let reader =
         WavReader::new(BufReader::new(file)).map_err(|error| unreadable(error.to_string()))?;
     let spec = reader.spec();
@@ -315,6 +301,57 @@ fn open_stem(folder: &Path, stem: &Stem) -> Result<Option<OpenedStem>, SongProbl
         reader,
         max_samples: opened.len() / bytes_per_sample,
     }))
+}
+
+/// Resolves `relative` inside `folder`, which must already be canonical,
+/// following symlinks. Returns `None` when the result lands outside `folder`;
+/// the caller has already checked that `relative` is a plain relative path.
+fn resolve_inside(folder: &Path, relative: impl AsRef<Path>) -> io::Result<Option<PathBuf>> {
+    let resolved = fs::canonicalize(folder.join(relative))?;
+    Ok(resolved.starts_with(folder).then_some(resolved))
+}
+
+/// Why [`open_regular_file`] did not open a file.
+#[derive(Debug)]
+enum OpenFileError {
+    /// The file could not be inspected or opened.
+    Io(io::Error),
+    /// The path is a folder, FIFO, device or anything but a regular file.
+    NotRegular,
+    /// The opened file is not the one that was checked.
+    Changed,
+}
+
+impl fmt::Display for OpenFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => error.fmt(f),
+            Self::NotRegular => f.write_str("it is not a regular file"),
+            Self::Changed => f.write_str("it changed while it was being opened"),
+        }
+    }
+}
+
+/// Opens `path` (already resolved) for reading, only when it is a regular
+/// file, so opening it cannot block (a FIFO would). Returns the file and its
+/// metadata.
+fn open_regular_file(path: &Path) -> Result<(File, fs::Metadata), OpenFileError> {
+    let checked = fs::metadata(path).map_err(OpenFileError::Io)?;
+    if !checked.is_file() {
+        return Err(OpenFileError::NotRegular);
+    }
+    // Remaining window: a folder entry on `path` could be swapped for a
+    // symlink between the checks above and this open. The standard library
+    // cannot open a path relative to a folder handle without following
+    // symlinks (that needs `openat2` with `RESOLVE_BENEATH` or similar), so a
+    // swap to a FIFO can still block here. A swap to another file is caught
+    // below by comparing the opened file with the checked one.
+    let file = File::open(path).map_err(OpenFileError::Io)?;
+    let opened = file.metadata().map_err(OpenFileError::Io)?;
+    if !opened.is_file() || !same_file(&checked, &opened) {
+        return Err(OpenFileError::Changed);
+    }
+    Ok((file, opened))
 }
 
 /// Whether `file` is a non-empty relative path whose components are all plain
