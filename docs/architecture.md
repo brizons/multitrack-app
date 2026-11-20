@@ -68,7 +68,8 @@ Each shell sends commands and reads state snapshots (~30 Hz) through the same `a
 - macOS is GPUI's most mature backend, and the development machine is a Mac, so the shipped desktop app is the one used every day.
 
 **Known GPUI risks and how they are handled:**
-- Pre-1.0 API that still changes, with sparse documentation: pin exact versions of `gpui` and `gpui-component` and upgrade on purpose.
+- Pre-1.0 API that still changes, with sparse documentation: pin the exact `gpui` version and upgrade on purpose. `gpui-component` 0.10.0 builds on the `gpui-pre` fork, not on `gpui` 0.2.2, so the desktop widgets are our own.
+- The macOS build uses gpui's `runtime_shaders` feature, because Xcode 26 ships the Metal toolchain separately; shaders then compile when the app starts.
 - Screen-reader support upstream is not confirmed (forks add it with AccessKit): spike S5 checks it before release.
 - Mac App Store distribution of a GPUI app is unproven: ship the Mac build signed and notarized outside the store first.
 - No platform look: the app uses its own design (the design canvas) on every desktop.
@@ -143,7 +144,6 @@ Render transposed and time-stretched stems **offline**, into a cache keyed by ke
 | `signalsmith-stretch` | 0.1.3 | MIT | Yes (v0.2) |
 | `uniffi` (Swift and Kotlin bindings) | 0.32.2 | MPL-2.0 | Yes |
 | `gpui` (desktop shell) | 0.2.2 | Apache-2.0 | Yes |
-| `gpui-component` (desktop widgets) | 0.10.0 | Apache-2.0 | Yes |
 | `rtrb` (ring buffer) | 0.4.1 | MIT or Apache-2.0 | Yes |
 | `triple_buffer` | 9.0.1 | MPL-2.0 | Yes |
 | `crossterm` (`play-cli` key input only) | 0.29.0 | MIT | Yes |
