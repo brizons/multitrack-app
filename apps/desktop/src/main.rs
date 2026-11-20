@@ -44,7 +44,7 @@ fn main() -> ExitCode {
             "arguments"
         };
         eprintln!(
-            "unexpected {noun} {} (one song folder at most)\n\n{USAGE}",
+            "unexpected {noun} {} (one song folder or setlist file at most)\n\n{USAGE}",
             extra.join(" ")
         );
         return ExitCode::from(2);

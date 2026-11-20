@@ -85,8 +85,9 @@ fn an_extra_argument_is_named_and_exits_2() {
     let out = run(&["first-song", "second-song"]);
     assert_eq!(out.code, Some(2));
     assert!(
-        out.stderr
-            .starts_with("unexpected argument \"second-song\" (one song folder at most)\n"),
+        out.stderr.starts_with(
+            "unexpected argument \"second-song\" (one song folder or setlist file at most)\n"
+        ),
         "{}",
         out.stderr
     );
@@ -96,8 +97,9 @@ fn an_extra_argument_is_named_and_exits_2() {
     let out = run(&["a", "b", "c d"]);
     assert_eq!(out.code, Some(2));
     assert!(
-        out.stderr
-            .starts_with("unexpected arguments \"b\" \"c d\" (one song folder at most)\n"),
+        out.stderr.starts_with(
+            "unexpected arguments \"b\" \"c d\" (one song folder or setlist file at most)\n"
+        ),
         "{}",
         out.stderr
     );

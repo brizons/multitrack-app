@@ -256,10 +256,12 @@ fn help_shows_the_setlist_mode_and_its_keys() {
 
 #[test]
 fn setlist_usage_errors_exit_with_code_2() {
-    for (args, says) in [
+    // clap shows the usage with a conflict, not with a missing value.
+    for (args, says, usage) in [
         (
             &["some/song", "--setlist", "Setlists/Sunday.setlist.json"][..],
             "cannot be used with",
+            true,
         ),
         (
             &[
@@ -268,16 +270,41 @@ fn setlist_usage_errors_exit_with_code_2() {
                 "--list-devices",
             ],
             "cannot be used with",
+            true,
         ),
-        (&["--setlist"], "a value is required for '--setlist <FILE>'"),
+        (
+            &["--setlist"],
+            "a value is required for '--setlist <FILE>'",
+            false,
+        ),
     ] {
         let output = play_cli(args);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         let errors = stderr(&output);
         assert!(errors.starts_with("error: "), "{args:?}");
         assert!(errors.contains(says), "{args:?}: {errors}");
+        // Both forms of the command line, the song folder's first.
+        assert_eq!(
+            errors.contains(
+                "Usage: play-cli <SONG_DIR> [--device <NAME>] [--buffer <FRAMES>] [--list-devices]\n       play-cli --setlist <FILE> [--device <NAME>] [--buffer <FRAMES>]\n"
+            ),
+            usage,
+            "{args:?}: {errors}"
+        );
         assert!(stdout(&output).is_empty());
     }
+}
+
+#[test]
+fn single_song_usage_errors_show_the_one_line_usage() {
+    let errors = stderr(&play_cli(&["song", "--loop"]));
+    assert!(
+        errors.contains(
+            "\nUsage: play-cli <SONG_DIR> [--device <NAME>] [--buffer <FRAMES>] [--list-devices]\n\n"
+        ),
+        "{errors}"
+    );
+    assert!(!errors.contains("--setlist <FILE>"), "{errors}");
 }
 
 #[test]

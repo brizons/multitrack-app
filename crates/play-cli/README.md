@@ -88,4 +88,4 @@ To check it by hand: start a song on a USB interface or headphones, unplug them 
 |------|------|--------|
 | 0 | Quit with `q` or Ctrl-C, or `--list-devices` listed the devices. | The device list on stdout for `--list-devices`. |
 | 1 | The song folder cannot be loaded or validated; the setlist file is not in a `Setlists` folder, cannot be read, or is not a valid setlist, or no item of it can play (each item's reasons follow); the device cannot be opened (not found, a name two devices share, not at the song's sample rate, buffer size refused); standard input is not a terminal; or the terminal fails. | Every error on its own stderr line, prefixed `error:`; package warnings and the setlist's problems prefixed `warning:`. |
-| 2 | Usage error, such as a missing `<SONG_DIR>`, `<SONG_DIR>` together with `--setlist`, or `--buffer` outside 64–1024. | clap's message on stderr. |
+| 2 | Usage error, such as a missing `<SONG_DIR>`, `<SONG_DIR>` together with `--setlist`, or `--buffer` outside 64–1024. | clap's message on stderr; when the command line names `--setlist`, its usage shows both forms, the song folder's and the setlist's. |

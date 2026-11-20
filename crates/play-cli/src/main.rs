@@ -30,8 +30,16 @@ use play_cli::{
     setlist_status_line, status_line,
 };
 
+/// The command line of a single song, as usage lines show it.
+const SONG_USAGE: &str =
+    "play-cli <SONG_DIR> [--device <NAME>] [--buffer <FRAMES>] [--list-devices]";
+
+/// The command line of a setlist, shown under [`SONG_USAGE`].
+const SETLIST_USAGE: &str = "play-cli --setlist <FILE> [--device <NAME>] [--buffer <FRAMES>]";
+
 /// clap's default help layout with the setlist form under the usage line;
-/// usage errors keep the one-line usage.
+/// usage errors keep the one-line usage, except those about `--setlist`
+/// ([`usage_error`]).
 const HELP_TEMPLATE: &str = "\
 {before-help}{about-with-newline}
 {usage-heading} {usage}
@@ -53,7 +61,7 @@ const STOP_WAIT: Duration = Duration::from_millis(500);
 #[command(
     name = "play-cli",
     version,
-    override_usage = "play-cli <SONG_DIR> [--device <NAME>] [--buffer <FRAMES>] [--list-devices]",
+    override_usage = SONG_USAGE,
     help_template = HELP_TEMPLATE,
     after_help = CONTROLS
 )]
@@ -93,7 +101,7 @@ struct Args {
 
 fn main() -> ExitCode {
     // Usage errors print clap's message and exit with code 2.
-    let args = Args::parse();
+    let args = Args::try_parse().unwrap_or_else(|error| usage_error(error));
     let result = if args.list_devices {
         list_devices()
     } else if let Some(setlist) = &args.setlist {
@@ -111,6 +119,25 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Prints `error` as clap does and exits. A usage error on a command line
+/// that names `--setlist` shows both forms of the command line, since the
+/// one-line usage only shows the song folder's; every other error, help
+/// and the version are clap's own.
+fn usage_error(error: clap::Error) -> ! {
+    let setlist = std::env::args_os().skip(1).any(|arg| {
+        arg.to_str()
+            .is_some_and(|arg| arg == "--setlist" || arg.starts_with("--setlist="))
+    });
+    if !setlist || !error.use_stderr() {
+        error.exit();
+    }
+    let rendered = error.render().to_string();
+    let usage = format!("Usage: {SONG_USAGE}\n");
+    let both = format!("Usage: {SONG_USAGE}\n       {SETLIST_USAGE}\n");
+    eprint!("{}", rendered.replacen(&usage, &both, 1));
+    std::process::exit(2);
 }
 
 fn list_devices() -> Result<(), Vec<String>> {
