@@ -195,8 +195,11 @@ pub struct Player {
     ends: u64,
     /// Frames before the end over which the track stems fade out.
     end_fade: Option<u64>,
-    /// Whether the end fade began since the last return to the start.
-    end_fade_started: bool,
+    /// The end fade's own gain on the track stems, on top of the operator's
+    /// fade; 1.0 at rest.
+    end_gain: Ramp,
+    /// Whether the end fade is running: the item can end within its window.
+    end_fading: bool,
     /// Whether the infinite loop is on after every return to the start.
     infinite_at_start: bool,
 }
@@ -315,7 +318,8 @@ impl Player {
             applied: 0,
             ends: 0,
             end_fade: None,
-            end_fade_started: false,
+            end_gain: Ramp::at(1.0),
+            end_fading: false,
             infinite_at_start: false,
         };
         player.update_hints();
@@ -382,12 +386,26 @@ impl Player {
     }
 
     /// Fades the `track` stems out over the last `frames` frames before the
-    /// arrangement ends, so they are silent on its last frame: the fade of
-    /// [`Command::ToggleFade`], started on its own (F5.3). Click and guide
-    /// stems and the generated click keep playing to the end. The fade
-    /// starts while playing, at most once per run from the start; pressing
-    /// [`Command::ToggleFade`] during it fades the stems back in. `None`, the
-    /// default, plays the end as it is. Call it before the player plays.
+    /// arrangement ends, so they are silent on its last frame (F5.3). Click
+    /// and guide stems and the generated click keep playing to the end.
+    ///
+    /// The window is the last `frames` frames as the player predicts them,
+    /// the earliest the arrangement can end: honouring a queued jump or
+    /// loop, but also where it ends should that jump wait for its audio.
+    /// The fade starts while playing, exactly `frames` before that end. When
+    /// the end moves out of the window (a jump back or a loop executes, or
+    /// the infinite loop comes on), the fade is cancelled: the stems return
+    /// over [`super::DECLICK_FRAMES`] (for a full swing) to the level of the
+    /// operator's fade, and the fade starts again before the new end. When
+    /// the end moves closer, the fade speeds up to stay silent on the last
+    /// frame.
+    ///
+    /// It is a gain of its own on the stems, on top of the operator's
+    /// [`Command::ToggleFade`]: the stems play at the operator's level times
+    /// the end fade, so a fade the operator engaged stays engaged whatever
+    /// the end fade does, and [`Status::fade`] reports the operator's fade
+    /// only. `None`, the default, plays the end as it is. Call it before the
+    /// player plays.
     pub fn set_end_fade(&mut self, frames: Option<u64>) {
         self.end_fade = frames;
     }
@@ -566,7 +584,7 @@ impl Player {
         let mut done = 0;
         loop {
             self.handle_boundaries();
-            self.start_end_fade();
+            self.update_end_fade();
             self.update_hints();
             if done == frames || !self.transport.is_running() {
                 return;
@@ -657,27 +675,45 @@ impl Player {
         frames
     }
 
-    /// Frames until the end fade must start, while it is set, not started
-    /// yet, and the transport plays; 0 when it is due now.
+    /// Frames until the end fade must start, while it is set and not
+    /// running, the transport plays, and the arrangement can end; 0 when
+    /// it is due now.
     fn end_fade_due(&self) -> Option<u64> {
-        let fade = self.end_fade?;
-        if self.end_fade_started || self.transport != Transport::Playing {
+        let window = self.end_fade?;
+        if self.end_fading || self.transport != Transport::Playing {
             return None;
         }
-        Some(self.frames_to_end()?.saturating_sub(fade))
+        Some(self.earliest_end()?.saturating_sub(window))
     }
 
-    /// Starts the end fade when it is due: the track stems ramp from where
-    /// the fade stands to silence over exactly the frames left, so the last
-    /// frame of the arrangement is silent for them.
-    fn start_end_fade(&mut self) {
-        if self.end_fade_due() != Some(0) {
+    /// Keeps the end fade on the arrangement's predicted end (see
+    /// [`Self::set_end_fade`]): starts it when it is due, ramping the end
+    /// gain from where it stands to silence over exactly the frames left;
+    /// speeds it up when the end came closer; and cancels it, ramping the
+    /// stems back, when the end left the window or can no longer come.
+    fn update_end_fade(&mut self) {
+        let Some(window) = self.end_fade else {
+            return;
+        };
+        if self.end_fading {
+            match self.earliest_end() {
+                Some(left) if left <= window => {
+                    if left < self.end_gain.remaining() {
+                        self.end_gain.retarget_over(0.0, left);
+                    }
+                }
+                _ => {
+                    self.end_fading = false;
+                    self.end_gain.retarget(1.0, DECLICK_FRAMES);
+                }
+            }
             return;
         }
-        let left = self.frames_to_end().unwrap_or(0);
-        self.end_fade_started = true;
-        self.fade_out = true;
-        self.fade.retarget_over(0.0, left);
+        if self.end_fade_due() == Some(0) {
+            let left = self.earliest_end().unwrap_or(0);
+            self.end_fading = true;
+            self.end_gain.retarget_over(0.0, left);
+        }
     }
 
     /// Output frame of the first boundary, at or after `queued.not_before`,
@@ -836,14 +872,15 @@ impl Player {
         self.infinite = self.infinite_at_start;
         self.fade = Ramp::at(1.0);
         self.fade_out = false;
-        self.end_fade_started = false;
+        self.end_gain = Ramp::at(1.0);
+        self.end_fading = false;
     }
 
     /// Renders `out.len() / 2` frames with no boundary inside them.
     fn render_block(&mut self, out: &mut [f32]) {
         let n = out.len() / 2;
         for i in 0..n {
-            self.track_gain[i] = self.fade.next();
+            self.track_gain[i] = self.fade.next() * self.end_gain.next();
             self.click_gain[i] = self.click.next();
             self.master[i] = self.master_gain * self.transport_gain.next();
         }
