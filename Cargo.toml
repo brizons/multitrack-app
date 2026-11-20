@@ -10,6 +10,8 @@ members = [
     "crates/play-cli",
     "crates/render-cli",
 ]
+# Vendored crates patched in place; not part of the workspace (see PATCHED.md).
+exclude = ["third_party/xattr-0.2.3"]
 
 [workspace.package]
 version = "0.1.0"
@@ -35,3 +37,7 @@ serde_json = "1.0"
 tempfile = "3.27.0"
 thiserror = "2.0"
 triple_buffer = "9.0.1"
+
+[patch.crates-io]
+# libc 0.2.190+ dropped ENOATTR on Linux; see third_party/xattr-0.2.3/PATCHED.md.
+xattr = { path = "third_party/xattr-0.2.3" }

@@ -1030,11 +1030,9 @@ fn opening_a_missing_folder_or_arrangement_fails_before_any_device_opens() {
         error,
         OpenError::Load(LoadError::ReadManifest { .. })
     ));
-    assert!(
-        error
-            .to_string()
-            .starts_with("cannot read /nonexistent/song/song.json:")
-    );
+    // The platform joins the path (a backslash on Windows).
+    let expected = format!("cannot read {}:", missing.join("song.json").display());
+    assert!(error.to_string().starts_with(&expected), "{error}");
 
     let dir = song();
     let error = Session::open(
