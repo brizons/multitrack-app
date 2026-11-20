@@ -383,3 +383,55 @@ fn a_move_in_a_read_only_folder_fails_and_leaves_the_order_as_it_was() {
     assert_eq!(fs::read(order_path(&dir)).unwrap(), order);
     assert_eq!(entries(&dir), before);
 }
+
+/// Fills every name the library's temporary file for the order file can
+/// take (`.order.json.<pid>-<n>.tmp`, n from 0 to 99) with a folder, so
+/// writing the order fails while setlists are still written.
+fn block_order_writes(dir: &TempDir) {
+    for attempt in 0..100 {
+        let name = format!(".{SETLIST_ORDER_FILE}.{}-{attempt}.tmp", std::process::id());
+        fs::create_dir(folder(dir).join(name)).unwrap();
+    }
+}
+
+fn saved_file(error: &SetlistError) -> &str {
+    match error {
+        SetlistError::OrderNotUpdated { saved, .. } => &saved.file,
+        other => panic!("OrderNotUpdated expected: {other}"),
+    }
+}
+
+#[test]
+fn a_setlist_saved_whose_place_cannot_be_stored_says_it_was_saved() {
+    let (dir, library) = library_with(&["A", "B"]);
+    library.move_setlist("B.setlist.json", 0).unwrap();
+    let order = fs::read(order_path(&dir)).unwrap();
+    block_order_writes(&dir);
+
+    let error = library.save_setlist(&Setlist::new("C")).unwrap_err();
+    assert_eq!(saved_file(&error), "C.setlist.json");
+    assert!(
+        error
+            .to_string()
+            .starts_with("setlist \"C\" was saved as C.setlist.json, but its place in the list could not be stored: "),
+        "{error}"
+    );
+    assert_eq!(library.load_setlist("C.setlist.json").unwrap().name, "C");
+
+    let error = library.rename_setlist("A.setlist.json", "Zed").unwrap_err();
+    assert_eq!(saved_file(&error), "Zed.setlist.json");
+    assert_eq!(
+        library.load_setlist("Zed.setlist.json").unwrap().name,
+        "Zed"
+    );
+
+    let error = library
+        .duplicate_setlist("B.setlist.json", "B copy")
+        .unwrap_err();
+    assert_eq!(saved_file(&error), "B copy.setlist.json");
+
+    // Every setlist is listed: the ones the order names first, the rest
+    // by name; the order file is as it was.
+    assert_eq!(listed(&library), ["B", "B copy", "C", "Zed"]);
+    assert_eq!(fs::read(order_path(&dir)).unwrap(), order);
+}

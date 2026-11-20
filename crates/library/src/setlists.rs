@@ -240,6 +240,20 @@ pub enum SetlistError {
         /// The version in the file.
         found: u32,
     },
+    /// The setlist was written, but its place in the stored order could
+    /// not be: until it is moved, it is listed after the setlists the order
+    /// names. Only its place is missing; the save itself succeeded.
+    #[error(
+        "setlist \"{}\" was saved as {}, but its place in the list could not be stored: {reason}",
+        saved.name,
+        saved.file
+    )]
+    OrderNotUpdated {
+        /// The setlist as saved.
+        saved: SetlistEntry,
+        /// Why its place could not be stored.
+        reason: String,
+    },
     /// A setlist was asked to move past the end of the list.
     #[error("cannot move a setlist to place {}: the library lists {len} setlists", .to + 1)]
     MoveOutOfRange {
@@ -366,6 +380,9 @@ impl Library {
     /// The file is replaced only when it holds a setlist with the same name;
     /// one holding another setlist is left as it was and
     /// [`SetlistError::FileTaken`] is returned. A blank name is refused.
+    /// A new setlist goes at the end of a stored order; when that place
+    /// cannot be written, the setlist is saved all the same and
+    /// [`SetlistError::OrderNotUpdated`] says so.
     pub fn save_setlist(&self, setlist: &Setlist) -> Result<SetlistEntry, SetlistError> {
         if setlist.name.trim().is_empty() {
             return Err(SetlistEditError::EmptyName.into());
@@ -385,22 +402,26 @@ impl Library {
             }
         }
         write_atomically(&path, &json)?;
-        if created {
-            update_order(&folder, |order| {
-                order.retain(|listed| *listed != file);
-                order.push(file.clone());
-            })?;
-        }
-        Ok(SetlistEntry {
+        let saved = SetlistEntry {
             name: setlist.name.clone(),
             file,
-        })
+        };
+        if created {
+            let placed = update_order(&folder, |order| {
+                order.retain(|listed| *listed != saved.file);
+                order.push(saved.file.clone());
+            });
+            return placed_or_saved(placed, saved);
+        }
+        Ok(saved)
     }
 
     /// Renames the setlist in `file` to `name` (F5.1), moving it to the file
     /// the new name maps to. A file already holding another setlist is never
     /// overwritten. Changing only the case of the name also works on a file
-    /// system that ignores case.
+    /// system that ignores case. It keeps its place in a stored order; when
+    /// that cannot be written, [`SetlistError::OrderNotUpdated`] says the
+    /// rename was made all the same.
     pub fn rename_setlist(&self, file: &str, name: &str) -> Result<SetlistEntry, SetlistError> {
         check_file_name(file)?;
         let folder = self.existing_setlists_folder(file)?;
@@ -432,8 +453,7 @@ impl Library {
                 path: target_path,
                 source,
             })?;
-            keep_place(&folder, file, &target)?;
-            return Ok(renamed);
+            return placed_or_saved(keep_place(&folder, file, &target), renamed);
         }
         // Move first, then rewrite: an interruption in between leaves the
         // setlist under its new file name with its old name, never two
@@ -446,13 +466,14 @@ impl Library {
             let _ = fs::rename(&target_path, &source_path);
             return Err(error);
         }
-        keep_place(&folder, file, &target)?;
-        Ok(renamed)
+        placed_or_saved(keep_place(&folder, file, &target), renamed)
     }
 
     /// Copies the setlist in `file` to a new setlist named `name` (F5.1), in
     /// the file that name maps to; an existing file there is never
-    /// overwritten.
+    /// overwritten. The copy goes right after the original in a stored
+    /// order; when that cannot be written, [`SetlistError::OrderNotUpdated`]
+    /// says the copy was made all the same.
     pub fn duplicate_setlist(&self, file: &str, name: &str) -> Result<SetlistEntry, SetlistError> {
         check_file_name(file)?;
         let folder = self.existing_setlists_folder(file)?;
@@ -467,16 +488,19 @@ impl Library {
             return Err(file_taken(name, target));
         }
         write_atomically(&target_path, &json)?;
-        update_order(&folder, |order| {
+        let placed = update_order(&folder, |order| {
             order.retain(|listed| *listed != target);
             if let Some(original) = order.iter().position(|listed| listed == file) {
                 order.insert(original + 1, target.clone());
             }
-        })?;
-        Ok(SetlistEntry {
-            name: copy.name,
-            file: target,
-        })
+        });
+        placed_or_saved(
+            placed,
+            SetlistEntry {
+                name: copy.name,
+                file: target,
+            },
+        )
     }
 
     /// The canonical library folder.
@@ -614,6 +638,21 @@ pub(crate) fn read_folder_file(folder: &Path, file: &str) -> Result<String, Setl
             source,
         })?
         .ok_or_else(too_large)
+}
+
+/// `saved`, or [`SetlistError::OrderNotUpdated`] when `placed` says its
+/// place in the stored order could not be written.
+fn placed_or_saved(
+    placed: Result<(), SetlistError>,
+    saved: SetlistEntry,
+) -> Result<SetlistEntry, SetlistError> {
+    match placed {
+        Ok(()) => Ok(saved),
+        Err(error) => Err(SetlistError::OrderNotUpdated {
+            saved,
+            reason: error.to_string(),
+        }),
+    }
 }
 
 /// After the setlist in `file` was renamed to `target`, puts `target` in
