@@ -1,11 +1,17 @@
-//! Opening and closing a song while the show runs (S8): a new song opens
-//! before the current one closes, so a pick that cannot open leaves the
-//! current song loaded and playing; closing always ramps down, sending a
-//! refused Stop again, and says what went wrong.
+//! Opening and closing a song while the show runs (S8): a pick is checked
+//! before the current song stops, so a pick that cannot open leaves the
+//! current song loaded and playing; a pick that can open stops the current
+//! song with its ramp and frees its device before the new song opens it;
+//! and closing always ramps down, sending a refused Stop again, and says
+//! what went wrong.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use app::{Command, RuntimeError, Session, TransportState};
+use app::{
+    AudioOutput, Command, OpenError, PreparedSong, RuntimeError, Session, SessionOptions, Snapshot,
+    TransportState,
+};
 
 /// How long closing waits for the player to take Stop and end its ramp
 /// before the device closes.
@@ -15,17 +21,165 @@ pub const STOP_WAIT: Duration = Duration::from_millis(500);
 /// the ramp.
 pub const STOP_POLL: Duration = Duration::from_millis(5);
 
-/// Opens a song in place of `current`. `open` runs first; only when it
-/// succeeds does its song replace `current`, and the song it replaced
-/// comes back for the caller to stop ([`stop_and_wait`]). When `open`
-/// fails, `current` is untouched, still loaded and playing, and the error
-/// comes back.
-pub fn open_in_place<T, E>(
-    current: &mut Option<T>,
-    open: impl FnOnce() -> Result<T, E>,
-) -> Result<Option<T>, E> {
-    let opened = open()?;
-    Ok(current.replace(opened))
+/// A song loaded on a device: the folder it was opened from, so it can be
+/// opened again, its session, and the last snapshot [`Self::poll`] took.
+pub struct Song {
+    /// The song folder.
+    pub dir: PathBuf,
+    /// The session playing it.
+    pub session: Session,
+    /// The session's state at the last poll.
+    pub snapshot: Snapshot,
+}
+
+impl Song {
+    /// Opens the song folder `dir` on `output`, stopped at the start.
+    pub fn open(
+        dir: &Path,
+        options: &SessionOptions,
+        output: Box<dyn AudioOutput>,
+    ) -> Result<Self, OpenError> {
+        Self::start(dir, Session::prepare(dir, options.clone())?, output)
+    }
+
+    fn start(
+        dir: &Path,
+        prepared: PreparedSong,
+        output: Box<dyn AudioOutput>,
+    ) -> Result<Self, OpenError> {
+        let mut session = prepared.start(output)?;
+        let snapshot = session.poll();
+        Ok(Self {
+            dir: dir.to_owned(),
+            session,
+            snapshot,
+        })
+    }
+
+    /// Moves the session on and keeps its snapshot.
+    pub fn poll(&mut self) {
+        self.snapshot = self.session.poll();
+    }
+}
+
+/// A song that closed, and how.
+#[derive(Debug)]
+pub struct Closed {
+    /// Its title.
+    pub title: String,
+    /// Its folder, to open it again.
+    pub dir: PathBuf,
+    /// How its stop went.
+    pub closing: Closing,
+}
+
+impl Closed {
+    /// What went wrong, in one line that names the song; `None` when it
+    /// stopped with its ramp at the first Stop.
+    pub fn problem(&self) -> Option<String> {
+        let problem = self.closing.problem()?;
+        Some(format!("Closing \"{}\": {problem}", self.title))
+    }
+}
+
+/// Stops `song` with its ramp ([`stop_and_wait`]), then closes its session,
+/// which closes its device.
+pub fn close(mut song: Song, sleep: impl FnMut(Duration)) -> Closed {
+    let closing = stop_and_wait(&mut song.session, sleep);
+    let closed = Closed {
+        title: song.session.song().title.clone(),
+        dir: song.dir.clone(),
+        closing,
+    };
+    drop(song);
+    closed
+}
+
+/// What [`replace`] did once the picked song had prepared.
+#[derive(Debug)]
+pub struct Replaced {
+    /// The folder picked.
+    pub dir: PathBuf,
+    /// The song that was loaded before, and how it closed.
+    pub previous: Option<Closed>,
+    /// Why the picked song's device did not open, if it did not. The
+    /// current song is then the previous one, opened again and stopped at
+    /// the start, or none.
+    pub start_error: Option<OpenError>,
+    /// Why the previous song could not be opened again after that.
+    pub reopen_error: Option<OpenError>,
+}
+
+impl Replaced {
+    /// What to show and report, one line each; empty when the previous song
+    /// stopped with its ramp and the picked one opened.
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems: Vec<String> = self.previous.iter().filter_map(Closed::problem).collect();
+        if let Some(error) = &self.start_error {
+            problems.push(format!(
+                "Could not start {} on the audio device: {error}",
+                self.dir.display()
+            ));
+            if let Some(previous) = &self.previous {
+                problems.push(match &self.reopen_error {
+                    None => format!(
+                        "\"{}\" is loaded again, stopped at the start.",
+                        previous.title
+                    ),
+                    Some(error) => {
+                        format!("\"{}\" could not be loaded again: {error}", previous.title)
+                    }
+                });
+            }
+        }
+        problems
+    }
+}
+
+/// Opens the song folder `dir` in place of `current`, never holding the
+/// device twice:
+///
+/// 1. The picked song is prepared with no device ([`Session::prepare`]).
+///    When it cannot open, the error comes back and `current` plays on,
+///    untouched.
+/// 2. The current song stops with its ramp ([`stop_and_wait`], `sleep`
+///    between tries) and closes, which closes its device.
+/// 3. The picked song starts on a fresh output from `output`. When the
+///    device refuses it, the previous song opens again from its folder,
+///    stopped at the start, if it can; [`Replaced`] says what happened.
+///
+/// The device opens only once the old song has closed because on macOS
+/// opening a stream sets the device's sample rate, which would re-clock a
+/// song still playing on it (it would drop out with no ramp), and some
+/// devices take one stream at a time.
+pub fn replace(
+    current: &mut Option<Song>,
+    dir: &Path,
+    options: &SessionOptions,
+    mut output: impl FnMut() -> Box<dyn AudioOutput>,
+    sleep: impl FnMut(Duration),
+) -> Result<Replaced, OpenError> {
+    let prepared = Session::prepare(dir, options.clone())?;
+    let previous = current.take().map(|song| close(song, sleep));
+    let mut replaced = Replaced {
+        dir: dir.to_owned(),
+        previous,
+        start_error: None,
+        reopen_error: None,
+    };
+    match Song::start(dir, prepared, output()) {
+        Ok(song) => *current = Some(song),
+        Err(error) => {
+            replaced.start_error = Some(error);
+            if let Some(previous) = &replaced.previous {
+                match Song::open(&previous.dir, options, output()) {
+                    Ok(song) => *current = Some(song),
+                    Err(error) => replaced.reopen_error = Some(error),
+                }
+            }
+        }
+    }
+    Ok(replaced)
 }
 
 /// How closing a song went.

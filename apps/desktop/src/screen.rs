@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use app::{Session, SessionOptions, Snapshot, SongInfo};
+use app::SessionOptions;
 use gpui::{
     App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, PathPromptOptions,
     PromptButton, PromptLevel, Render, Subscription, Task, Window, prelude::*,
@@ -16,7 +16,7 @@ use multitrack_desktop::action::{UiAction, command_for};
 use multitrack_desktop::ending::{EndRequest, Ending, end_request, ends};
 use multitrack_desktop::hold::PanicHold;
 use multitrack_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, is_panic_key};
-use multitrack_desktop::song::{open_in_place, stop_and_wait};
+use multitrack_desktop::song::{Song, close, replace};
 use multitrack_desktop::view::{PerformView, open_error_lines};
 
 use crate::ui;
@@ -41,47 +41,10 @@ pub enum Intent {
     DismissProblems,
 }
 
-/// A song playing on the default output.
-struct Loaded {
-    session: Session,
-    song: SongInfo,
-    snapshot: Snapshot,
-}
-
-impl Loaded {
-    fn new(mut session: Session) -> Self {
-        let snapshot = session.poll();
-        let song = session.song().clone();
-        Self {
-            session,
-            song,
-            snapshot,
-        }
-    }
-}
-
-/// Stops `loaded` with its ramp ([`stop_and_wait`]: a Stop the player
-/// refuses is sent again until it takes it, within
-/// [`multitrack_desktop::song::STOP_WAIT`]), then closes the session and
-/// its device. What went wrong goes to stderr and comes back as a line for
-/// the screen.
-fn close(mut loaded: Loaded) -> Option<String> {
-    let closing = stop_and_wait(&mut loaded.session, thread::sleep);
-    let title = loaded.song.title.clone();
-    drop(loaded);
-    let problem = closing
-        .problem()
-        .map(|problem| format!("Closing \"{title}\": {problem}"));
-    if let Some(problem) = &problem {
-        eprintln!("warning: {problem}");
-    }
-    problem
-}
-
 /// The Perform screen.
 pub struct Perform {
     focus: FocusHandle,
-    loaded: Option<Loaded>,
+    loaded: Option<Song>,
     /// Problems to show, one line each: why the last pick did not open (the
     /// song that was playing goes on), or how the song it replaced closed.
     problems: Vec<String>,
@@ -138,11 +101,14 @@ impl Perform {
         screen
     }
 
-    /// Stops the song with its ramp, even when the player refuses Stop at
-    /// first, then closes the session and its device (see [`close`]).
+    /// Stops the song with its ramp, sending a Stop the player refuses
+    /// again within [`multitrack_desktop::song::STOP_WAIT`], then closes
+    /// the session and its device; what went wrong goes to stderr.
     pub fn close_song(&mut self) {
-        if let Some(loaded) = self.loaded.take() {
-            close(loaded);
+        if let Some(song) = self.loaded.take()
+            && let Some(problem) = close(song, thread::sleep).problem()
+        {
+            eprintln!("warning: {problem}");
         }
     }
 
@@ -151,9 +117,9 @@ impl Perform {
     /// the person confirms ([`end_request`]). Returns whether it ended at
     /// once, which lets the window close.
     fn end_show(&mut self, ending: Ending, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let transport = self.loaded.as_mut().map(|loaded| {
-            loaded.snapshot = loaded.session.poll();
-            loaded.snapshot.transport
+        let transport = self.loaded.as_mut().map(|song| {
+            song.poll();
+            song.snapshot.transport
         });
         match end_request(transport, self.asking) {
             EndRequest::EndNow => {
@@ -199,19 +165,26 @@ impl Perform {
         .detach();
     }
 
-    /// Opens the song folder `dir` while the current song keeps playing;
-    /// only once it opened does the current song stop and close. A folder
-    /// that does not open leaves the current song loaded and playing, and
-    /// the reasons show on screen.
+    /// Opens the song folder `dir` in place of the current song
+    /// ([`replace`]): a folder that does not open leaves the current song
+    /// loaded and playing, and the reasons show on screen; otherwise the
+    /// current song stops with its ramp and closes its device before the
+    /// new song opens the device.
     fn open_song(&mut self, dir: &Path) {
-        let opened = open_in_place(&mut self.loaded, || {
-            Session::open(dir, Box::new(CpalOutput::new()), SessionOptions::default())
-                .map(Loaded::new)
-        });
-        match opened {
+        let replaced = replace(
+            &mut self.loaded,
+            dir,
+            &SessionOptions::default(),
+            || Box::new(CpalOutput::new()),
+            thread::sleep,
+        );
+        match replaced {
             Ok(replaced) => {
                 self.hold = PanicHold::new();
-                self.problems = replaced.and_then(close).into_iter().collect();
+                self.problems = replaced.problems();
+                for problem in &self.problems {
+                    eprintln!("warning: {problem}");
+                }
             }
             Err(error) => {
                 self.problems = open_error_lines(&error);
@@ -235,7 +208,7 @@ impl Perform {
     fn tick(&mut self, cx: &mut Context<Self>) {
         let counting = self.hold.is_counting();
         let fires = self.hold.tick(Instant::now());
-        let Some(loaded) = &mut self.loaded else {
+        let Some(song) = &mut self.loaded else {
             // Nothing moves without a song, except a hold's fill.
             if counting {
                 cx.notify();
@@ -243,9 +216,9 @@ impl Perform {
             return;
         };
         if fires {
-            send(loaded, UiAction::Panic);
+            send(song, UiAction::Panic);
         }
-        loaded.snapshot = loaded.session.poll();
+        song.poll();
         cx.notify();
     }
 
@@ -254,17 +227,17 @@ impl Perform {
         let now = Instant::now();
         match intent {
             Intent::Ui(action) => {
-                if let Some(loaded) = &mut self.loaded {
-                    send(loaded, action);
-                    loaded.snapshot = loaded.session.poll();
+                if let Some(song) = &mut self.loaded {
+                    send(song, action);
+                    song.poll();
                 }
             }
             Intent::PanicDown => self.hold.press(now),
             Intent::PanicUp => {
                 if self.hold.release(now)
-                    && let Some(loaded) = &mut self.loaded
+                    && let Some(song) = &mut self.loaded
                 {
-                    send(loaded, UiAction::Panic);
+                    send(song, UiAction::Panic);
                 }
             }
             Intent::OpenSong => self.prompt_for_song(window, cx),
@@ -341,17 +314,17 @@ impl Perform {
 
 /// Sends the command `action` stands for; a refused command shows as the
 /// snapshot's last error.
-fn send(loaded: &mut Loaded, action: UiAction) {
-    if let Some(command) = command_for(action, &loaded.snapshot, &loaded.song) {
-        let _ = loaded.session.send(command);
+fn send(song: &mut Song, action: UiAction) {
+    if let Some(command) = command_for(action, &song.snapshot, song.session.song()) {
+        let _ = song.session.send(command);
     }
 }
 
 impl Render for Perform {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.loaded {
-            Some(loaded) => {
-                let view = PerformView::new(&loaded.snapshot, &loaded.song);
+            Some(song) => {
+                let view = PerformView::new(&song.snapshot, song.session.song());
                 ui::perform(&view, self.hold.fill(Instant::now()), &self.problems, cx)
                     .into_any_element()
             }

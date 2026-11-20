@@ -30,7 +30,7 @@ $ cargo run -p multitrack-desktop -- /tmp/demo-song
 
 The session is polled about 30 times a second on a timer that keeps running while the window is hidden, since a waiting play starts only through polling.
 
-**Open song…** opens the new folder while the current song keeps playing; only once it opened does the current song stop and close. A folder that does not open, or a folder picker that fails, leaves the current song playing and shows why under the header until dismissed.
+**Open song…** first checks the new folder and loads it without the audio device while the current song keeps playing: a folder that does not open, or a folder picker that fails, leaves the current song playing and shows why under the header until dismissed. Otherwise the current song stops with its ramp and closes the device, and only then does the new song open it: on macOS, opening a stream sets the device's sample rate, which would cut off a song still playing on it, and some interfaces take one stream at a time. If the device then refuses the new song (a sample rate it does not run at, for example), the previous song is loaded again, stopped at the start, and both reasons show.
 
 Quitting or closing the window while a song plays or waits to start (`Loading…`) asks first: **Stop and quit** or **Keep playing**. On the Mac, Return picks Stop and quit and Escape keeps playing; on Windows, Escape keeps playing; on Linux, gpui draws the question in the window and it is answered with a click. Stop, the transport control, stays immediate. With nothing playing, both quit at once. The app sets no menus of its own. Quitting from the Dock, or when the system logs out, cannot be asked about (gpui 0.2.2 cannot cancel it), so the song just stops with its ramp.
 

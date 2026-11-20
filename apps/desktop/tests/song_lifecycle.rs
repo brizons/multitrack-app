@@ -1,39 +1,46 @@
-//! S8: opening another song never ends the current one unless the new one
-//! opened, and closing a song always ramps down, even when the player
-//! refuses Stop at first. A real `Session` on the app's `FakeOutput`.
+//! S8: a pick that cannot open never ends the current song; a pick that can
+//! open stops the current song with its ramp and frees its device before
+//! the new song opens the device; and closing a song always ramps down,
+//! even when the player refuses Stop at first. A real `Session` on the
+//! app's `FakeOutput`.
 
+use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
 use app::testing::FakeOutput;
-use app::{Command, JumpTiming, OpenError, RuntimeError, Session, SessionOptions, TransportState};
+use app::{
+    AudioOutput, Command, JumpTiming, OpenError, OutputError, RuntimeError, SessionOptions,
+    TransportState,
+};
 use domain::{
     Arrangement, SectionMarker, SectionType, SongPackage, Stem, StemRole, TempoPoint,
     TimeSignaturePoint,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
-use multitrack_desktop::song::{Closing, STOP_POLL, STOP_WAIT, open_in_place, stop_and_wait};
+use multitrack_desktop::song::{
+    Closing, STOP_POLL, STOP_WAIT, Song, close, replace, stop_and_wait,
+};
 
 const RATE: u32 = 8_000;
-/// 120 bpm in 4/4: a bar is two seconds.
-const BAR: u64 = 2 * RATE as u64;
 const FRAMES: usize = 256;
 
-/// `title`: intro and verse, one bar each, one mono track stem that is
-/// never silent.
-fn write_song(dir: &Path, title: &str) {
-    let section = |id: &str, section_type, bar: u64| SectionMarker {
+/// `title` at `rate`, 120 bpm in 4/4: intro and verse, one bar each, one
+/// mono track stem that is never silent.
+fn write_song_at(dir: &Path, title: &str, rate: u32) {
+    let bar = 2 * u64::from(rate);
+    let section = |id: &str, section_type, at: u64| SectionMarker {
         id: id.to_owned(),
         section_type,
         number: None,
-        start: bar * BAR,
+        start: at * bar,
     };
     let package = SongPackage {
         format_version: 1,
         title: title.to_owned(),
         artist: None,
-        sample_rate: RATE,
+        sample_rate: rate,
         key: None,
         tempo_map: vec![TempoPoint { at: 0, bpm: 120.0 }],
         time_signature_map: vec![TimeSignaturePoint {
@@ -62,12 +69,12 @@ fn write_song(dir: &Path, title: &str) {
     fs::write(dir.join("song.json"), package.to_json().unwrap()).unwrap();
     let spec = WavSpec {
         channels: 1,
-        sample_rate: RATE,
+        sample_rate: rate,
         bits_per_sample: 16,
         sample_format: SampleFormat::Int,
     };
     let mut writer = WavWriter::create(dir.join("stems/keys.wav"), spec).unwrap();
-    for frame in 0..2 * BAR {
+    for frame in 0..2 * bar {
         writer
             .write_sample(2_000 + (frame % 200) as i16 * 50)
             .unwrap();
@@ -75,54 +82,59 @@ fn write_song(dir: &Path, title: &str) {
     writer.finalize().unwrap();
 }
 
-/// A song playing on its own fake output.
-struct Playing {
-    session: Session,
-    fake: FakeOutput,
+fn write_song(dir: &Path, title: &str) {
+    write_song_at(dir, title, RATE);
 }
 
-impl Playing {
-    fn open(dir: &Path) -> Result<Self, OpenError> {
-        let fake = FakeOutput::new();
-        let session = Session::open(dir, Box::new(fake.clone()), SessionOptions::default())?;
-        Ok(Self { session, fake })
-    }
+/// A song on `fake`, the screen's way.
+fn open_on(dir: &Path, fake: &FakeOutput) -> Result<Song, OpenError> {
+    Song::open(dir, &SessionOptions::default(), Box::new(fake.clone()))
+}
 
-    fn step(&mut self) -> Vec<f32> {
-        assert!(
-            self.session
-                .disk_monitor()
-                .wait_idle(Duration::from_secs(10))
-        );
-        self.fake.render(FRAMES).expect("a stream plays")
-    }
+/// One audio callback once the disk has caught up.
+fn step(song: &mut Song, fake: &FakeOutput) -> Vec<f32> {
+    assert!(
+        song.session
+            .disk_monitor()
+            .wait_idle(Duration::from_secs(10))
+    );
+    let audio = fake.render(FRAMES).expect("a stream plays");
+    song.poll();
+    audio
+}
 
-    fn play(&mut self) {
-        self.session.send(Command::Play).unwrap();
-        for _ in 0..200 {
-            self.step();
-            if self.session.poll().transport == TransportState::Playing {
-                return;
-            }
+fn play(song: &mut Song, fake: &FakeOutput) {
+    song.session.send(Command::Play).unwrap();
+    for _ in 0..200 {
+        step(song, fake);
+        if song.snapshot.transport == TransportState::Playing {
+            return;
         }
-        panic!("the song never started");
     }
+    panic!("the song never started");
+}
 
-    fn playhead(&mut self) -> u64 {
-        self.session.poll().output_frame
-    }
-
-    /// Sends commands nobody takes until the player's queue refuses one.
-    fn fill_the_queue(&mut self) -> RuntimeError {
-        for _ in 0..10_000 {
-            if let Err(error) = self
-                .session
-                .send(Command::SetJumpTiming(JumpTiming::NextBar))
-            {
-                return error;
-            }
+/// Sends commands nobody takes until the player's queue refuses one.
+fn fill_the_queue(song: &mut Song) -> RuntimeError {
+    for _ in 0..10_000 {
+        if let Err(error) = song
+            .session
+            .send(Command::SetJumpTiming(JumpTiming::NextBar))
+        {
+            return error;
         }
-        panic!("the command queue never filled");
+    }
+    panic!("the command queue never filled");
+}
+
+/// An output factory that always hands out `fake` and counts its calls.
+fn outputs<'a>(
+    fake: &'a FakeOutput,
+    calls: &'a Cell<usize>,
+) -> impl FnMut() -> Box<dyn AudioOutput> + 'a {
+    move || {
+        calls.set(calls.get() + 1);
+        Box::new(fake.clone())
     }
 }
 
@@ -146,65 +158,207 @@ fn ramped_down(heard: &[Vec<f32>], after: &[f32]) -> bool {
 fn a_pick_that_cannot_open_leaves_the_current_song_playing() {
     let dir = tempfile::tempdir().unwrap();
     write_song(dir.path(), "First");
-    let mut current = Some(Playing::open(dir.path()).unwrap());
-    current.as_mut().unwrap().play();
+    let fake = FakeOutput::new();
+    let mut current = Some(open_on(dir.path(), &fake).unwrap());
+    play(current.as_mut().unwrap(), &fake);
 
+    let calls = Cell::new(0);
     let missing = dir.path().join("no-such-song");
-    let refused = open_in_place(&mut current, || Playing::open(&missing));
-    assert!(refused.is_err(), "a missing folder does not open");
+    let refused = replace(
+        &mut current,
+        &missing,
+        &SessionOptions::default(),
+        outputs(&fake, &calls),
+        |_| panic!("nothing stops"),
+    );
+    assert!(matches!(refused, Err(OpenError::Load(_))), "{refused:?}");
+    assert_eq!(calls.get(), 0, "no device is touched");
 
     // The first song is still there, and still plays.
-    let playing = current.as_mut().expect("the current song stays loaded");
-    assert_eq!(playing.session.song().title, "First");
-    let before = playing.playhead();
-    let audio = playing.step();
-    assert_eq!(playing.session.poll().transport, TransportState::Playing);
-    assert!(playing.playhead() > before, "the playhead moves on");
+    let song = current.as_mut().expect("the current song stays loaded");
+    assert_eq!(song.session.song().title, "First");
+    let before = song.snapshot.output_frame;
+    let audio = step(song, &fake);
+    assert_eq!(song.snapshot.transport, TransportState::Playing);
+    assert!(song.snapshot.output_frame > before, "the playhead moves on");
     assert!(peak(&audio) > 0.01, "the song is still heard");
 }
 
 #[test]
-fn a_pick_that_opens_replaces_the_current_song_and_hands_it_back() {
+fn a_pick_stops_the_current_song_with_its_ramp_before_it_opens_the_device() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
     write_song(first.path(), "First");
     write_song(second.path(), "Second");
-    let mut current = Some(Playing::open(first.path()).unwrap());
-    current.as_mut().unwrap().play();
+    // One device that plays one stream at a time, as some interfaces do.
+    let device = FakeOutput::new();
+    let mut current = Some(open_on(first.path(), &device).unwrap());
+    play(current.as_mut().unwrap(), &device);
 
-    let replaced = open_in_place(&mut current, || Playing::open(second.path()))
-        .unwrap_or_else(|error| panic!("the second song opens: {error}"))
-        .expect("the first song comes back to be stopped");
-    assert_eq!(current.as_ref().unwrap().session.song().title, "Second");
-    assert_eq!(replaced.session.song().title, "First");
+    let mut heard = Vec::new();
+    let replaced = replace(
+        &mut current,
+        second.path(),
+        &SessionOptions::default(),
+        || {
+            assert!(!device.is_streaming(), "the first song closed first");
+            Box::new(device.clone())
+        },
+        |_| heard.push(device.render(FRAMES).expect("the first song plays")),
+    )
+    .unwrap_or_else(|error| panic!("the second song opens: {error}"));
 
-    // With nothing loaded, the pick simply loads.
-    let mut empty: Option<Playing> = None;
-    let none = open_in_place(&mut empty, || Playing::open(first.path())).unwrap();
-    assert!(none.is_none() && empty.is_some());
+    let previous = replaced.previous.as_ref().expect("a song was loaded");
+    assert_eq!(previous.title, "First");
+    assert_eq!(previous.closing, Closing::Stopped { refused: None });
+    assert!(replaced.start_error.is_none() && replaced.reopen_error.is_none());
+    assert!(replaced.problems().is_empty(), "{:?}", replaced.problems());
+    let song = current.as_mut().expect("the second song is loaded");
+    assert_eq!(song.session.song().title, "Second");
+    assert_eq!(song.dir, second.path());
+    assert_eq!(song.snapshot.transport, TransportState::Stopped);
+    assert!(
+        ramped_down(&heard, &step(song, &device)),
+        "a ramp, not a cut"
+    );
+    assert_eq!(device.opened().len(), 2);
 }
 
 #[test]
-fn opening_runs_the_opener_before_touching_the_current_song() {
-    let mut current = Some("first");
-    let failed: Result<Option<&str>, &str> = open_in_place(&mut current, || Err("invalid"));
-    assert_eq!(failed, Err("invalid"));
-    assert_eq!(current, Some("first"));
-    assert_eq!(
-        open_in_place(&mut current, || Ok::<_, &str>("second")),
-        Ok(Some("first"))
+fn with_nothing_loaded_a_pick_simply_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    write_song(dir.path(), "First");
+    let fake = FakeOutput::new();
+    let calls = Cell::new(0);
+    let mut current = None;
+    let replaced = replace(
+        &mut current,
+        dir.path(),
+        &SessionOptions::default(),
+        outputs(&fake, &calls),
+        |_| panic!("nothing stops"),
+    )
+    .unwrap();
+    assert!(replaced.previous.is_none() && replaced.problems().is_empty());
+    assert_eq!(calls.get(), 1);
+    assert_eq!(current.unwrap().session.song().title, "First");
+}
+
+#[test]
+fn a_device_that_refuses_the_new_song_gets_the_previous_one_back_stopped() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    write_song(first.path(), "First");
+    write_song_at(second.path(), "Second", 16_000);
+    let device = FakeOutput::without_devices().with_device("Only 8k", 2, Some(&[RATE]));
+    let mut current = Some(open_on(first.path(), &device).unwrap());
+    play(current.as_mut().unwrap(), &device);
+    for _ in 0..10 {
+        step(current.as_mut().unwrap(), &device);
+    }
+
+    let calls = Cell::new(0);
+    let replaced = replace(
+        &mut current,
+        second.path(),
+        &SessionOptions::default(),
+        outputs(&device, &calls),
+        |_| {
+            device.render(FRAMES);
+        },
+    )
+    .expect("the second song itself is fine");
+
+    assert_eq!(calls.get(), 2, "the new song, then the previous one again");
+    assert!(matches!(
+        replaced.start_error,
+        Some(OpenError::Output(OutputError::UnsupportedSampleRate {
+            requested: 16_000,
+            ..
+        }))
+    ));
+    assert!(replaced.reopen_error.is_none());
+    let song = current.as_mut().expect("the first song is back");
+    assert_eq!(song.session.song().title, "First");
+    assert_eq!(song.snapshot.transport, TransportState::Stopped);
+    assert_eq!(song.snapshot.output_frame, 0, "back at the start");
+    let problems = replaced.problems();
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert!(
+        problems[0].starts_with(&format!(
+            "Could not start {} on the audio device: ",
+            second.path().display()
+        )) && problems[0].contains("16000 Hz"),
+        "{problems:?}"
     );
-    assert_eq!(current, Some("second"));
+    assert_eq!(
+        problems[1],
+        "\"First\" is loaded again, stopped at the start."
+    );
+}
+
+#[test]
+fn when_the_previous_song_cannot_come_back_nothing_is_loaded_and_both_reasons_show() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    write_song(first.path(), "First");
+    write_song_at(second.path(), "Second", 16_000);
+    let fake = FakeOutput::new();
+    let mut current = Some(open_on(first.path(), &fake).unwrap());
+    play(current.as_mut().unwrap(), &fake);
+
+    // From now on the only device runs at 48 kHz: neither song opens.
+    let device = FakeOutput::without_devices().with_device("Only 48k", 2, Some(&[48_000]));
+    let calls = Cell::new(0);
+    let replaced = replace(
+        &mut current,
+        second.path(),
+        &SessionOptions::default(),
+        outputs(&device, &calls),
+        |_| {
+            fake.render(FRAMES);
+        },
+    )
+    .unwrap();
+    assert!(current.is_none());
+    assert!(replaced.start_error.is_some() && replaced.reopen_error.is_some());
+    let problems = replaced.problems();
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert!(
+        problems[1].starts_with("\"First\" could not be loaded again: ")
+            && problems[1].contains("8000 Hz"),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn closing_a_song_frees_its_device_and_names_it_in_its_problem() {
+    let dir = tempfile::tempdir().unwrap();
+    write_song(dir.path(), "First");
+    let fake = FakeOutput::new();
+    let mut song = open_on(dir.path(), &fake).unwrap();
+    play(&mut song, &fake);
+    fill_the_queue(&mut song);
+
+    let closed = close(song, |_| {});
+    assert!(!fake.is_streaming(), "the device is free");
+    assert_eq!(closed.title, "First");
+    assert!(matches!(closed.closing, Closing::Refused(_)));
+    let problem = closed.problem().expect("a refusal is reported");
+    assert!(
+        problem.starts_with("Closing \"First\": the player refused Stop"),
+        "{problem}"
+    );
 }
 
 #[test]
 fn closing_stops_with_the_ramp() {
     let dir = tempfile::tempdir().unwrap();
     write_song(dir.path(), "First");
-    let mut playing = Playing::open(dir.path()).unwrap();
-    playing.play();
+    let fake = FakeOutput::new();
+    let mut playing = open_on(dir.path(), &fake).unwrap();
+    play(&mut playing, &fake);
 
-    let fake = playing.fake.clone();
     let mut heard = Vec::new();
     let closing = stop_and_wait(&mut playing.session, |wait| {
         assert_eq!(wait, STOP_POLL);
@@ -213,20 +367,23 @@ fn closing_stops_with_the_ramp() {
     assert_eq!(closing, Closing::Stopped { refused: None });
     assert_eq!(closing.problem(), None);
     assert_eq!(playing.session.poll().transport, TransportState::Stopped);
-    assert!(ramped_down(&heard, &playing.step()), "a ramp, not a cut");
+    assert!(
+        ramped_down(&heard, &step(&mut playing, &fake)),
+        "a ramp, not a cut"
+    );
 }
 
 #[test]
 fn closing_sends_a_refused_stop_again_and_still_ramps_down() {
     let dir = tempfile::tempdir().unwrap();
     write_song(dir.path(), "First");
-    let mut playing = Playing::open(dir.path()).unwrap();
-    playing.play();
-    let full = playing.fill_the_queue();
+    let fake = FakeOutput::new();
+    let mut playing = open_on(dir.path(), &fake).unwrap();
+    play(&mut playing, &fake);
+    let full = fill_the_queue(&mut playing);
     assert!(matches!(full, RuntimeError::QueueFull { .. }), "{full:?}");
 
     // The audio thread takes the queue on its next callback, then Stop.
-    let fake = playing.fake.clone();
     let mut heard = Vec::new();
     let closing = stop_and_wait(&mut playing.session, |_| {
         heard.push(fake.render(FRAMES).expect("a stream plays"));
@@ -240,7 +397,10 @@ fn closing_sends_a_refused_stop_again_and_still_ramps_down() {
     assert!(command.contains("Stop"), "{command}");
     assert_eq!(playing.session.poll().transport, TransportState::Stopped);
     assert!(heard.len() >= 2, "Stop waited for the queue to drain");
-    assert!(ramped_down(&heard, &playing.step()), "a ramp, not a cut");
+    assert!(
+        ramped_down(&heard, &step(&mut playing, &fake)),
+        "a ramp, not a cut"
+    );
     let problem = closing.problem().expect("a refusal is reported");
     assert!(problem.contains("refused Stop"), "{problem}");
     assert!(problem.contains("stopped with its ramp"), "{problem}");
@@ -250,9 +410,10 @@ fn closing_sends_a_refused_stop_again_and_still_ramps_down() {
 fn closing_reports_a_stop_the_player_never_takes() {
     let dir = tempfile::tempdir().unwrap();
     write_song(dir.path(), "First");
-    let mut playing = Playing::open(dir.path()).unwrap();
-    playing.play();
-    playing.fill_the_queue();
+    let fake = FakeOutput::new();
+    let mut playing = open_on(dir.path(), &fake).unwrap();
+    play(&mut playing, &fake);
+    fill_the_queue(&mut playing);
 
     // No callback runs, so the queue stays full for the whole wait.
     let mut waits = Duration::ZERO;
@@ -271,8 +432,9 @@ fn closing_reports_a_stop_the_player_never_takes() {
 fn closing_reports_a_ramp_that_does_not_end_in_time() {
     let dir = tempfile::tempdir().unwrap();
     write_song(dir.path(), "First");
-    let mut playing = Playing::open(dir.path()).unwrap();
-    playing.play();
+    let fake = FakeOutput::new();
+    let mut playing = open_on(dir.path(), &fake).unwrap();
+    play(&mut playing, &fake);
 
     // Stop is taken, but no callback runs to play the ramp.
     let closing = stop_and_wait(&mut playing.session, |_| {});
