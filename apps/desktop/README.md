@@ -38,7 +38,7 @@ Closing a song (opening another one, closing the window, quitting) stops it with
 
 ## Keys
 
-The same single keys as `play-cli`; letters work in either case, and a key held with Ctrl, Alt or Cmd does nothing (except Open and Quit). A key held down acts once: its repeats are ignored until it is released, on every platform (on X11, gpui reports each repeat as a new press, so the screen tracks the keys that are down itself). Pressing Cmd counts every key as up, since macOS never reports a key released while Cmd is held.
+The same single keys as `play-cli`; letters work in either case, and a key held with Ctrl, Alt or Cmd does nothing (except Open and Quit). A key held down acts once: its repeats are ignored until it is released, on every platform (on X11, gpui reports each repeat as a new press, so the screen tracks the keys that are down itself). On the Mac, pressing Cmd counts every key as up, since macOS never reports a key released while Cmd is held; elsewhere the Super or Windows key changes nothing.
 
 | Key | Does |
 |-----|------|

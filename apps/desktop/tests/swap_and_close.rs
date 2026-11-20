@@ -19,7 +19,7 @@ use domain::{
 use hound::{SampleFormat, WavSpec, WavWriter};
 use multitrack_desktop::ending::{Dialog, EndRequest, Ending, end_request};
 use multitrack_desktop::hold::{PANIC_HOLD, PanicHold};
-use multitrack_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods};
+use multitrack_desktop::keys::{HeldKeys, KeyAction, KeyPlatform, KeyPress, Mods};
 use multitrack_desktop::song::{Closing, Replaced, Song, replace, stop_and_wait};
 
 const FRAMES: usize = 256;
@@ -505,7 +505,7 @@ fn x11_repeats_of_digits_and_space_mixed_with_shortcuts_act_once() {
 /// swallowed press).
 #[test]
 fn a_plain_key_released_while_cmd_is_held_acts_on_its_next_press() {
-    let mut keys = HeldKeys::new();
+    let mut keys = HeldKeys::on(KeyPlatform::Mac);
     assert!(keys.press(&plain("space"), false).is_some(), "play");
     keys.modifiers_changed(with_cmd("space").mods);
     // Space's key-up while Cmd is held never arrives; Cmd goes up.

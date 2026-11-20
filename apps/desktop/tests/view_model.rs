@@ -13,7 +13,8 @@ use app::{
 use multitrack_desktop::action::{UiAction, command_for};
 use multitrack_desktop::hold::{PANIC_HOLD, PanicHold};
 use multitrack_desktop::keys::{
-    HeldKeys, KeyAction, KeyPress, Mods, PANIC_KEY, SECONDARY_IS_PLATFORM, is_panic_key, key_down,
+    HeldKeys, KeyAction, KeyPlatform, KeyPress, Mods, PANIC_KEY, SECONDARY_IS_PLATFORM,
+    is_panic_key, key_down,
 };
 use multitrack_desktop::view::{Level, PerformView, SectionKind, open_error_lines, short_label};
 
@@ -740,7 +741,7 @@ fn a_plain_key_released_while_command_is_held_still_acts_next_time() {
         ..Mods::default()
     };
     let play = Some(KeyAction::Ui(UiAction::TogglePlay));
-    let mut keys = HeldKeys::new();
+    let mut keys = HeldKeys::on(KeyPlatform::Mac);
     assert_eq!(keys.press(&plain("space"), false), play);
     // Command goes down while Space is held; Space's key-up while Command
     // is held never arrives (macOS drops it); then Command goes up.
@@ -765,6 +766,47 @@ fn a_plain_key_released_while_command_is_held_still_acts_next_time() {
     });
     keys.modifiers_changed(Mods::default());
     assert_eq!(keys.press(&plain("f"), false), None, "F is still down");
+}
+
+#[test]
+fn elsewhere_the_super_key_keeps_the_keys_that_are_down() {
+    let plain = |key| KeyPress {
+        key,
+        mods: Mods::default(),
+    };
+    let super_key = Mods {
+        platform: true,
+        ..Mods::default()
+    };
+    // Windows and X11 report every release, so a key held through a Super
+    // or Windows key press stays down: its repeats are still ignored.
+    let mut keys = HeldKeys::on(KeyPlatform::Other);
+    assert_eq!(
+        keys.press(&plain("space"), false),
+        Some(KeyAction::Ui(UiAction::TogglePlay))
+    );
+    keys.modifiers_changed(super_key);
+    keys.modifiers_changed(Mods::default());
+    assert_eq!(
+        keys.press(&plain("space"), false),
+        None,
+        "Space is still down"
+    );
+    keys.release("space");
+    assert_eq!(
+        keys.press(&plain("space"), false),
+        Some(KeyAction::Ui(UiAction::TogglePlay))
+    );
+}
+
+#[test]
+fn the_key_platform_here_is_this_one() {
+    let expected = if cfg!(target_os = "macos") {
+        KeyPlatform::Mac
+    } else {
+        KeyPlatform::Other
+    };
+    assert_eq!(KeyPlatform::HERE, expected);
 }
 
 #[test]

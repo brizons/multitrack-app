@@ -99,20 +99,55 @@ pub fn is_panic_key(key: &str) -> bool {
     key.eq_ignore_ascii_case(PANIC_KEY)
 }
 
+/// How the platform reports key releases, which decides when
+/// [`HeldKeys`] forgets the keys that are down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyPlatform {
+    /// macOS: a key let go while Command is held never reports its
+    /// release.
+    Mac,
+    /// Windows and Linux: every release arrives, whatever is held.
+    Other,
+}
+
+impl KeyPlatform {
+    /// This platform.
+    pub const HERE: Self = if cfg!(target_os = "macos") {
+        Self::Mac
+    } else {
+        Self::Other
+    };
+}
+
 /// The keys that are down, so a held key acts once: its repeats are
 /// ignored until it is released. gpui 0.2.2 marks a repeat as held on
 /// macOS and Windows but reports every repeat on X11 as a fresh press, so
 /// the screen keeps track itself, on every platform.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HeldKeys {
     /// Lowercase names of the plain keys that acted and are still down.
     down: Vec<String>,
+    platform: KeyPlatform,
+}
+
+impl Default for HeldKeys {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HeldKeys {
-    /// No key down.
+    /// No key down, on this platform ([`KeyPlatform::HERE`]).
     pub fn new() -> Self {
-        Self::default()
+        Self::on(KeyPlatform::HERE)
+    }
+
+    /// No key down, on `platform`.
+    pub fn on(platform: KeyPlatform) -> Self {
+        Self {
+            down: Vec::new(),
+            platform,
+        }
     }
 
     /// What `press` asks for when it goes down, as [`key_down`] maps it, or
@@ -145,14 +180,13 @@ impl HeldKeys {
         self.down.retain(|down| !down.eq_ignore_ascii_case(key));
     }
 
-    /// The modifiers held changed to `mods`. When Command (the platform
-    /// key) is down, every key counts as up: macOS never delivers the
-    /// release of a key let go while Command is held, so a key that went
-    /// down before Command would otherwise swallow its next press. Other
-    /// platforms have no such loss; there it only means that a repeat of
-    /// a key held through a Super or Windows key press acts once more.
+    /// The modifiers held changed to `mods`. On the Mac, while Command is
+    /// down, every key counts as up: macOS never delivers the release of a
+    /// key let go while Command is held, so a key that went down before
+    /// Command would otherwise swallow its next press. Elsewhere every
+    /// release arrives, so the Super or Windows key changes nothing.
     pub fn modifiers_changed(&mut self, mods: Mods) {
-        if mods.platform {
+        if self.platform == KeyPlatform::Mac && mods.platform {
             self.forget_all();
         }
     }
