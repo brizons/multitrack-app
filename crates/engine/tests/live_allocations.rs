@@ -12,7 +12,7 @@ use std::cell::Cell;
 use common::{four_sections, mono, noise, stereo};
 use domain::StemRole;
 use engine::MixSettings;
-use engine::live::{Command, JumpTiming, Player, memory_sources};
+use engine::live::{Command, JumpTiming, Player, PlayerConfig, memory_sources};
 
 struct Counting;
 
@@ -68,8 +68,7 @@ fn process_allocates_nothing_through_every_live_command() {
         &song,
         "f23",
         &settings,
-        48_000,
-        buffer,
+        &PlayerConfig::new(48_000, buffer),
         memory_sources(stems).unwrap(),
     )
     .unwrap();

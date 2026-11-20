@@ -11,6 +11,15 @@
 //! single-consumer queue; the player applies every pending command at the
 //! start of the next [`Player::process`] call. A queued jump executes on the
 //! exact boundary frame, splitting the buffer there when it falls inside one.
+//! It executes only when every [`StemSource`] reports the target ready;
+//! otherwise it stays queued and moves to the next boundary of the same kind,
+//! so a jump never plays silence. A section end always executes: when the
+//! arrangement enters the queued target there on its own, the queued jump is
+//! dropped instead of playing the target twice. The player tells every source
+//! where it is playing and where it may go next ([`StemSource::prefetch`]),
+//! including both places a section end can go (its own start for a loop, and
+//! the next position), so a streaming source can have the audio in memory in
+//! time.
 //!
 //! Real-time rules: `process` allocates nothing, takes no locks, and does no
 //! I/O. Every buffer is sized at construction from the maximum buffer size,
@@ -25,13 +34,23 @@ mod status;
 use std::error::Error;
 use std::fmt;
 
+use domain::DEFAULT_SEAM_CROSSFADE;
+
 pub use player::Player;
 pub use source::{MemorySource, StemSource, memory_sources};
-pub use status::{FadeState, FadeStatus, JumpKind, QueuedJump, Status, Transport};
+pub use status::{ClickSource, FadeState, FadeStatus, JumpKind, QueuedJump, Status, Transport};
 
 /// Frames over which pause, stop, resume, and click on/off ramp, so the
-/// transport never cuts a waveform mid-cycle.
+/// transport never cuts a waveform mid-cycle. It is also the shortest fade.
 pub const DECLICK_FRAMES: u64 = 256;
+
+/// How long a panic takes to fade everything to silence (F6.6).
+pub const PANIC_MILLISECONDS: u64 = 500;
+
+/// Most prefetch targets the player passes to [`StemSource::prefetch`]: the
+/// queued jump target, the start of the current position (where a loop
+/// goes), the start of the next position, and the start of the arrangement.
+pub const MAX_PREFETCH_TARGETS: usize = 4;
 
 /// Default fade duration, in seconds of output ([`Command::SetFadeDuration`]
 /// changes it).
@@ -39,6 +58,32 @@ pub const DEFAULT_FADE_SECONDS: u32 = 3;
 
 /// Commands the queue holds before [`Controller::send`] reports it full.
 pub const COMMAND_CAPACITY: usize = 256;
+
+/// How a [`Player`] runs, besides the song, its mix, and its sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerConfig {
+    /// Output sample rate; it must be the song's rate.
+    pub sample_rate: u32,
+    /// Largest buffer [`Player::process`] is given; larger buffers are
+    /// processed in pieces of this size.
+    pub max_frames: usize,
+    /// Crossfade at seams where the source jumps, as
+    /// [`domain::CompileOptions::seam_crossfade`]; the same value gives the
+    /// same samples as the compiled plan.
+    pub seam_crossfade: u64,
+}
+
+impl PlayerConfig {
+    /// `sample_rate` and `max_frames` with the default seam crossfade,
+    /// [`DEFAULT_SEAM_CROSSFADE`].
+    pub fn new(sample_rate: u32, max_frames: usize) -> Self {
+        Self {
+            sample_rate,
+            max_frames,
+            seam_crossfade: DEFAULT_SEAM_CROSSFADE,
+        }
+    }
+}
 
 /// When a queued jump executes (F6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,7 +113,11 @@ pub enum Command {
     /// silently.
     BackToStart,
     /// Queues a jump to arrangement position `position`, replacing any queued
-    /// jump. It executes at the boundary [`JumpTiming`] selects.
+    /// jump. It executes at the boundary [`JumpTiming`] selects, once every
+    /// source has the target ready; until then it moves to the next boundary
+    /// of the same kind ([`QueuedJump::deferrals`] counts the moves). When
+    /// the arrangement enters `position` on its own at a section end (the
+    /// next position, or the infinite loop), the jump is done and dropped.
     QueueJump {
         /// Index into the arrangement's section list.
         position: usize,
@@ -79,27 +128,35 @@ pub enum Command {
     /// new timing.
     SetJumpTiming(JumpTiming),
     /// Repeats the current position once more: a queued jump to it at the
-    /// end of the current position, whatever the [`JumpTiming`].
+    /// end of the current position, whatever the [`JumpTiming`]. If a source
+    /// does not have the position's start ready at that end, the arrangement
+    /// plays on and the loop stays queued for the same position: it jumps
+    /// back there at the end of the position then playing, or is dropped
+    /// when the arrangement enters that position on its own (the infinite
+    /// loop).
     LiveLoop,
     /// Repeats the current position at each of its ends until switched off.
-    /// A queued jump takes priority and switches it off when it executes.
+    /// A queued jump takes priority; a jump to another position switches it
+    /// off when it executes, a live loop or a jump to the current position
+    /// does not.
     SetInfinite(bool),
     /// Fades the `track` stems out, or back in when they are faded or
     /// fading out. Click and guide stems and the generated click keep
     /// playing.
     ToggleFade,
     /// Sets how long a full fade takes, in frames; a fade from a partial
-    /// level takes proportionally less.
+    /// level takes proportionally less. Durations shorter than
+    /// [`DECLICK_FRAMES`] are raised to it, so a fade is never a step.
     SetFadeDuration {
         /// Frames for a full fade.
         frames: u64,
     },
-    /// Fades everything, click included, to silence within 0.5 seconds, then
-    /// stops like [`Command::Stop`].
+    /// Fades everything, click included, to silence within
+    /// [`PANIC_MILLISECONDS`], then stops like [`Command::Stop`].
     Panic,
     /// Turns the generated click on or off, ramping over [`DECLICK_FRAMES`].
     /// Like [`crate::ClickSettings::enabled`], it does not affect a `click`
-    /// stem.
+    /// stem; [`Status::click_source`] says which click the song has.
     SetClick(bool),
 }
 

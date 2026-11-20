@@ -18,9 +18,9 @@ mod timeline;
 
 pub use compile::{
     ClickEvent, ClickLevel, CompileError, CompileOptions, CueEvent, CueTiming,
-    DEFAULT_SEAM_CROSSFADE, RenderPlan, Segment, compile,
+    DEFAULT_SEAM_CROSSFADE, RenderPlan, Segment, compile, seam_fade,
 };
-pub use grid::{BarBeat, BeatGrid};
+pub use grid::{BarBeat, BeatGrid, SourceClick};
 pub use package::{
     Arrangement, DEFAULT_ARRANGEMENT_ID, FORMAT_VERSION, IdKind, MAX_BPM, MAX_SONG_HOURS, MIN_BPM,
     ManifestError, MapKind, SectionMarker, SectionType, SongPackage, Stem, StemInfo,

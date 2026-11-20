@@ -5,17 +5,18 @@
 //! (oldest first) and then the current section; then the generated click
 //! bursts in the order they started; then the master gain. The envelopes and
 //! bursts are the offline renderer's own, and every live gain is exactly 1.0
-//! at rest, so with no live command the samples are bit-identical.
+//! at rest, so with no live command the samples are bit-identical. Seams use
+//! [`domain::seam_fade`], the rule `compile` uses.
 
-use domain::{BeatGrid, DEFAULT_SEAM_CROSSFADE, Song, StemRole};
+use domain::{BeatGrid, Song, StemRole, seam_fade};
 use rtrb::{Consumer, RingBuffer};
 
 use super::ramp::Ramp;
 use super::source::StemSource;
-use super::status::{FadeState, FadeStatus, JumpKind, QueuedJump, Status, Transport};
+use super::status::{ClickSource, FadeState, FadeStatus, JumpKind, QueuedJump, Status, Transport};
 use super::{
     COMMAND_CAPACITY, Command, Controller, DECLICK_FRAMES, DEFAULT_FADE_SECONDS, JumpTiming,
-    LiveError,
+    LiveError, MAX_PREFETCH_TARGETS, PANIC_MILLISECONDS, PlayerConfig,
 };
 use crate::click::ClickBursts;
 use crate::mix::Envelope;
@@ -37,8 +38,11 @@ struct Voice {
     position: usize,
     /// Frames played since entering this position.
     offset: u64,
-    /// Seam crossfade at the start of this position (see `domain::Segment`).
+    /// Length of the fade-in this voice plays (see `domain::Segment`).
     fade_in: u64,
+    /// Fade-in frames already played when this position was entered: a
+    /// contiguous seam carries the fade-in on instead of restarting it.
+    env_start: u64,
 }
 
 impl Voice {
@@ -46,7 +50,13 @@ impl Voice {
         position: 0,
         offset: 0,
         fade_in: 0,
+        env_start: 0,
     };
+
+    /// Frame of the fade-in envelope the next frame plays.
+    fn envelope_position(&self) -> u64 {
+        self.env_start + self.offset
+    }
 }
 
 /// The outgoing side of a seam: it keeps reading its source past the cut,
@@ -107,6 +117,29 @@ struct ActiveBurst {
 struct Queued {
     target: usize,
     kind: JumpKind,
+    /// First output frame the jump may execute on; after a deferral it is
+    /// one past the boundary it missed.
+    not_before: u64,
+    deferrals: u32,
+}
+
+impl Queued {
+    fn new(target: usize, kind: JumpKind) -> Self {
+        Self {
+            target,
+            kind,
+            not_before: 0,
+            deferrals: 0,
+        }
+    }
+}
+
+/// The last prefetch hint sent to the sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Hint {
+    voice_epoch: u64,
+    targets: [u64; MAX_PREFETCH_TARGETS],
+    count: usize,
 }
 
 /// Plays one arrangement in real time; see the [module docs](super).
@@ -115,12 +148,17 @@ pub struct Player {
     song_length: u64,
     grid: BeatGrid,
     max_frames: usize,
+    seam_crossfade: u64,
     panic_frames: u64,
     stems: Vec<Stem>,
     master_gain: f32,
     click_levels: [f32; 4],
     /// `None` when a `click` stem replaces the generated click.
     bursts: Option<ClickBursts>,
+    /// Most click bursts that sound at once: at most one tick starts per
+    /// output frame and a burst lasts its table length, plus one for the
+    /// frame where the oldest ends.
+    max_bursts: usize,
     commands: Consumer<Command>,
 
     // Scratch, sized at construction.
@@ -145,25 +183,31 @@ pub struct Player {
     click: Ramp,
     click_on: bool,
     underruns: u64,
+    /// Counts every re-entry of a position, so hints follow playhead jumps.
+    voice_epoch: u64,
+    last_hint: Option<Hint>,
 }
 
 impl Player {
     /// Builds a stopped player for the arrangement `arrangement_id` of
     /// `song`, and the [`Controller`] that drives it.
     ///
-    /// `sample_rate` must be the song's rate. `max_frames` is the largest
-    /// buffer [`Self::process`] will be given; larger buffers are processed
-    /// in pieces of that size. Stems are mixed in `sources` order with
-    /// `settings`, as [`crate::render_offline`] mixes them. Everything the
-    /// audio thread needs is allocated here.
+    /// Stems are mixed in `sources` order with `settings`, as
+    /// [`crate::render_offline`] mixes them. Everything the audio thread
+    /// needs is allocated here, and every source gets its first
+    /// [`StemSource::prefetch`] hint: the start of the arrangement.
     pub fn new(
         song: &Song,
         arrangement_id: &str,
         settings: &MixSettings,
-        sample_rate: u32,
-        max_frames: usize,
+        config: &PlayerConfig,
         sources: Vec<Box<dyn StemSource>>,
     ) -> Result<(Self, Controller), LiveError> {
+        let PlayerConfig {
+            sample_rate,
+            max_frames,
+            seam_crossfade,
+        } = *config;
         let arrangement =
             song.arrangement(arrangement_id)
                 .ok_or_else(|| LiveError::UnknownArrangement {
@@ -203,7 +247,7 @@ impl Player {
             .iter()
             .any(|source| source.role() == StemRole::Click);
         let bursts = (!has_click_stem).then(|| ClickBursts::new(sample_rate));
-        let burst_capacity = bursts.as_ref().map_or(0, |bursts| bursts.len() + 1);
+        let max_bursts = bursts.as_ref().map_or(0, |bursts| bursts.len() + 1);
         let stems = sources
             .into_iter()
             .map(|source| Stem {
@@ -216,22 +260,24 @@ impl Player {
         let click_level = if settings.click.enabled { 1.0 } else { 0.0 };
         let positions = entries.len();
 
-        let player = Self {
+        let mut player = Self {
             entries,
             song_length: song.length(),
             grid: BeatGrid::new(song),
             max_frames,
-            panic_frames: u64::from(sample_rate) / 2,
+            seam_crossfade,
+            panic_frames: u64::from(sample_rate) * PANIC_MILLISECONDS / 1_000,
             stems,
             master_gain: settings.master_gain,
             click_levels: settings.click.levels,
             bursts,
+            max_bursts,
             commands,
             read: vec![0.0; 2 * max_frames],
             track_gain: vec![0.0; max_frames],
             click_gain: vec![0.0; max_frames],
             master: vec![0.0; max_frames],
-            active: Vec::with_capacity(burst_capacity),
+            active: Vec::with_capacity(max_bursts),
             tails: Vec::with_capacity(MAX_TAILS),
             transport: Transport::Stopped,
             transport_gain: Ramp::at(1.0),
@@ -246,7 +292,10 @@ impl Player {
             click: Ramp::at(click_level),
             click_on: settings.click.enabled,
             underruns: 0,
+            voice_epoch: 0,
+            last_hint: None,
         };
+        player.update_hints();
         Ok((
             player,
             Controller {
@@ -263,6 +312,7 @@ impl Player {
         while let Ok(command) = self.commands.pop() {
             self.apply(command);
         }
+        self.update_hints();
         out.fill(0.0);
         let usable = out.len() - out.len() % 2;
         let piece = 2 * self.max_frames;
@@ -283,7 +333,8 @@ impl Player {
             queued: self.queued.map(|queued| QueuedJump {
                 target: queued.target,
                 kind: queued.kind,
-                executes_at: self.jump_frame(queued.kind),
+                executes_at: self.jump_frame(queued),
+                deferrals: queued.deferrals,
             }),
             jump_timing: self.jump_timing,
             infinite: self.infinite,
@@ -297,6 +348,11 @@ impl Player {
                 level: self.fade.level(),
             },
             click: self.click_on,
+            click_source: if self.bursts.is_some() {
+                ClickSource::Generated
+            } else {
+                ClickSource::Recorded
+            },
             underruns: self.underruns,
         }
     }
@@ -330,6 +386,7 @@ impl Player {
                 Playing | Pausing => self.seam_to(0),
                 Paused => {
                     self.voice = Voice::START;
+                    self.voice_epoch += 1;
                     self.tails.clear();
                     self.active.clear();
                 }
@@ -337,19 +394,13 @@ impl Player {
             },
             Command::QueueJump { position } => {
                 if position < self.entries.len() {
-                    self.queued = Some(Queued {
-                        target: position,
-                        kind: JumpKind::Jump,
-                    });
+                    self.queued = Some(Queued::new(position, JumpKind::Jump));
                 }
             }
             Command::CancelJump => self.queued = None,
             Command::SetJumpTiming(timing) => self.jump_timing = timing,
             Command::LiveLoop => {
-                self.queued = Some(Queued {
-                    target: self.voice.position,
-                    kind: JumpKind::Loop,
-                });
+                self.queued = Some(Queued::new(self.voice.position, JumpKind::Loop));
             }
             Command::SetInfinite(on) => self.infinite = on,
             Command::ToggleFade => {
@@ -357,7 +408,7 @@ impl Player {
                 let target = if self.fade_out { 0.0 } else { 1.0 };
                 self.fade.retarget(target, self.fade_frames);
             }
-            Command::SetFadeDuration { frames } => self.fade_frames = frames,
+            Command::SetFadeDuration { frames } => self.fade_frames = frames.max(DECLICK_FRAMES),
             Command::Panic => match self.transport {
                 Playing | Pausing | Stopping => {
                     self.transport = Panicking;
@@ -380,6 +431,7 @@ impl Player {
         let mut done = 0;
         loop {
             self.handle_boundaries();
+            self.update_hints();
             if done == frames || !self.transport.is_running() {
                 return;
             }
@@ -406,23 +458,35 @@ impl Player {
                 _ => {}
             }
             if let Some(queued) = self.queued
-                && self.jump_frame(queued.kind) == self.output_frame
+                && self.jump_frame(queued) == self.output_frame
             {
-                self.queued = None;
-                self.infinite = false;
-                self.seam_to(queued.target);
+                if self.target_ready(queued.target) {
+                    self.queued = None;
+                    if queued.kind == JumpKind::Jump && queued.target != self.voice.position {
+                        self.infinite = false;
+                    }
+                    self.seam_to(queued.target);
+                } else {
+                    self.queued = Some(Queued {
+                        not_before: self.output_frame + 1,
+                        deferrals: queued.deferrals + 1,
+                        ..queued
+                    });
+                }
                 continue;
             }
             if self.voice.offset == self.entries[self.voice.position].len {
-                let position = self.voice.position;
-                if self.infinite {
-                    self.seam_to(position);
-                } else if position + 1 < self.entries.len() {
-                    self.seam_to(position + 1);
-                } else {
+                let Some(next) = self.natural_next() else {
                     self.reset();
                     return;
+                };
+                // A jump deferred at this boundary whose target the
+                // arrangement enters on its own has done its job; executing
+                // it later would play the target again.
+                if self.queued.is_some_and(|queued| queued.target == next) {
+                    self.queued = None;
                 }
+                self.seam_to(next);
                 continue;
             }
             return;
@@ -436,7 +500,7 @@ impl Player {
         let entry = self.entries[self.voice.position];
         let mut frames = entry.len - self.voice.offset;
         if let Some(queued) = self.queued {
-            frames = frames.min(self.jump_frame(queued.kind) - self.output_frame);
+            frames = frames.min(self.jump_frame(queued) - self.output_frame);
         }
         if matches!(
             self.transport,
@@ -447,17 +511,98 @@ impl Player {
         frames
     }
 
-    /// Output frame where a queued jump of `kind` executes.
-    fn jump_frame(&self, kind: JumpKind) -> u64 {
+    /// Output frame of the first boundary, at or after `queued.not_before`,
+    /// where `queued` may execute: the end of the current position, or with
+    /// [`JumpTiming::NextBar`] the next bar line inside it.
+    fn jump_frame(&self, queued: Queued) -> u64 {
         let entry = self.entries[self.voice.position];
         let at_end = self.output_frame + (entry.len - self.voice.offset);
-        if kind == JumpKind::Loop || self.jump_timing == JumpTiming::SectionEnd {
-            return at_end;
+        let earliest = queued.not_before.max(self.output_frame);
+        if queued.kind == JumpKind::Loop || self.jump_timing == JumpTiming::SectionEnd {
+            // Past `earliest` only for the instant between a deferral at a
+            // section end and the seam that follows it.
+            return at_end.max(earliest);
         }
         let source = entry.src_start + self.voice.offset;
-        match self.grid.next_bar_line(source) {
+        let from = source + (earliest - self.output_frame);
+        let boundary = match self.grid.next_bar_line(from) {
             Some(bar) if bar < entry.src_start + entry.len => self.output_frame + (bar - source),
             _ => at_end,
+        };
+        boundary.max(earliest)
+    }
+
+    /// Whether every source has the start of position `target` ready.
+    fn target_ready(&mut self, target: usize) -> bool {
+        let entry = self.entries[target];
+        self.stems
+            .iter_mut()
+            .all(|stem| stem.source.is_ready(entry.src_start, entry.len))
+    }
+
+    /// Position the arrangement enters at the end of the current one when no
+    /// queued jump executes: the current one again with the infinite loop
+    /// on, else the next one; `None` at the end of the arrangement.
+    fn natural_next(&self) -> Option<usize> {
+        let position = self.voice.position;
+        if self.infinite {
+            Some(position)
+        } else {
+            (position + 1 < self.entries.len()).then_some(position + 1)
+        }
+    }
+
+    /// Source start of `position` when entering it at the end of the current
+    /// position jumps in the source; `None` when it follows on contiguously,
+    /// where the window ahead of the playhead already covers it.
+    fn seam_target(&self, position: usize) -> Option<u64> {
+        let current = self.entries[self.voice.position];
+        let start = self.entries[position].src_start;
+        (start != current.src_start + current.len).then_some(start)
+    }
+
+    /// Sends the sources a new prefetch hint when the playhead jumped or the
+    /// targets changed: the queued target; both places the end of the
+    /// current position can go, the next position and its own start (a
+    /// loop), the one the infinite loop selects first; and the start of the
+    /// arrangement (for back to start and stop). Hinting both keeps a loop
+    /// switched on or off just before the end from meeting audio the source
+    /// has not buffered.
+    fn update_hints(&mut self) {
+        let mut targets = [0; MAX_PREFETCH_TARGETS];
+        let mut count = 0;
+        let position = self.voice.position;
+        let next = (position + 1 < self.entries.len()).then_some(position + 1);
+        let (likely, other) = if self.infinite {
+            (Some(position), next)
+        } else {
+            (next, Some(position))
+        };
+        let candidates = [
+            self.queued
+                .map(|queued| self.entries[queued.target].src_start),
+            likely.and_then(|position| self.seam_target(position)),
+            other.and_then(|position| self.seam_target(position)),
+            Some(self.entries[0].src_start),
+        ];
+        for target in candidates.into_iter().flatten() {
+            if !targets[..count].contains(&target) {
+                targets[count] = target;
+                count += 1;
+            }
+        }
+        let hint = Hint {
+            voice_epoch: self.voice_epoch,
+            targets,
+            count,
+        };
+        if self.last_hint == Some(hint) {
+            return;
+        }
+        self.last_hint = Some(hint);
+        let playhead = self.source_frame();
+        for stem in &mut self.stems {
+            stem.source.prefetch(playhead, &targets[..count]);
         }
     }
 
@@ -467,17 +612,28 @@ impl Player {
 
     /// Leaves the current position for the start of `target`. When the
     /// source jumps, the outgoing side keeps playing as a tail and the
-    /// incoming side fades in, with the length and caps `compile` uses.
+    /// incoming side fades in, as [`seam_fade`] says. When it does not, the
+    /// same audio plays on, a fade-in still running included.
     fn seam_to(&mut self, target: usize) {
         let outgoing_end = self.source_frame();
         let incoming = self.entries[target];
-        let fade = if outgoing_end == incoming.src_start {
-            0
-        } else {
-            DEFAULT_SEAM_CROSSFADE
-                .min(incoming.len)
-                .min(self.song_length.saturating_sub(outgoing_end))
-        };
+        self.voice_epoch += 1;
+        if outgoing_end == incoming.src_start {
+            self.voice = Voice {
+                position: target,
+                offset: 0,
+                env_start: self.voice.envelope_position(),
+                ..self.voice
+            };
+            return;
+        }
+        let fade = seam_fade(
+            self.seam_crossfade,
+            outgoing_end,
+            incoming.src_start,
+            incoming.len,
+            self.song_length,
+        );
         if fade > 0 {
             if self.tails.len() == MAX_TAILS {
                 self.tails.remove(0);
@@ -487,13 +643,14 @@ impl Player {
                 len: fade,
                 played: 0,
                 fade_in: self.voice.fade_in,
-                cut_offset: self.voice.offset,
+                cut_offset: self.voice.envelope_position(),
             });
         }
         self.voice = Voice {
             position: target,
             offset: 0,
             fade_in: fade,
+            env_start: 0,
         };
     }
 
@@ -503,6 +660,7 @@ impl Player {
         self.transport_gain = Ramp::at(1.0);
         self.output_frame = 0;
         self.voice = Voice::START;
+        self.voice_epoch += 1;
         self.tails.clear();
         self.active.clear();
         self.queued = None;
@@ -543,7 +701,7 @@ impl Player {
             }
             for i in 0..n {
                 let gain = stem.gain_at(&self.track_gain, i)
-                    * main_envelope.at(self.voice.offset + i as u64);
+                    * main_envelope.at(self.voice.envelope_position() + i as u64);
                 out[2 * i] += read[2 * i] * gain;
                 out[2 * i + 1] += read[2 * i + 1] * gain;
             }
@@ -585,7 +743,7 @@ impl Player {
                 gain,
                 &click_gain[start..start + k],
             );
-            if k < table.len() && self.active.len() < self.active.capacity() {
+            if k < table.len() && self.active.len() < self.max_bursts {
                 self.active.push(ActiveBurst {
                     level: click.level,
                     gain,

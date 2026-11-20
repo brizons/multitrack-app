@@ -8,7 +8,7 @@ mod common;
 use common::{RATE, SongSpec, four_section_spec, info, marker};
 use domain::{
     ClickEvent, ClickLevel, CompileError, CompileOptions, CueEvent, CueTiming,
-    DEFAULT_SEAM_CROSSFADE, RenderPlan, SectionType, Segment, Song, compile, validate,
+    DEFAULT_SEAM_CROSSFADE, RenderPlan, SectionType, Segment, Song, compile, seam_fade, validate,
 };
 
 fn seg(id: &str, out_start: u64, src_start: u64, len: u64, fades: (u64, u64)) -> Segment {
@@ -836,4 +836,42 @@ fn tempo_and_meter_points_far_beyond_the_song_end_do_not_panic() {
     let plan = plan(&song, "default");
     assert_eq!(plan.clicks.len(), 5 * 16, "five bars of 4/4 at 120 bpm");
     assert_eq!(positions(&plan, &[ClickLevel::Downbeat]).len(), 5);
+}
+
+#[test]
+fn seam_fade_is_zero_when_contiguous_and_otherwise_capped_by_the_incoming_length_and_source_left() {
+    let song_length = 1_000_000;
+    // Contiguous: the incoming section starts where the outgoing one ended.
+    assert_eq!(seam_fade(256, 500_000, 500_000, 10_000, song_length), 0);
+    // A jump gets the full crossfade...
+    assert_eq!(seam_fade(256, 500_000, 0, 10_000, song_length), 256);
+    // ...capped by the incoming length...
+    assert_eq!(seam_fade(256, 500_000, 0, 100, song_length), 100);
+    // ...and by the source audio left after the outgoing end.
+    assert_eq!(seam_fade(256, song_length - 10, 0, 10_000, song_length), 10);
+    assert_eq!(seam_fade(256, song_length, 0, 10_000, song_length), 0);
+    assert_eq!(seam_fade(0, 500_000, 0, 10_000, song_length), 0);
+}
+
+#[test]
+fn compile_uses_the_seam_fade_rule_for_every_seam() {
+    let song = four_section_spec()
+        .arrangement(
+            "x",
+            &["outro", "chorus", "chorus", "verse", "intro", "outro"],
+        )
+        .build();
+    for crossfade in [0, 1, 256, 5_000, 1_000_000] {
+        let plan = plan_with(&song, "x", self::crossfade(crossfade));
+        for pair in plan.segments.windows(2) {
+            let expected = seam_fade(
+                crossfade,
+                pair[0].src_start + pair[0].len,
+                pair[1].src_start,
+                pair[1].len,
+                song.length(),
+            );
+            assert_eq!((pair[0].fade_out, pair[1].fade_in), (expected, expected));
+        }
+    }
 }

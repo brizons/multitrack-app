@@ -9,7 +9,7 @@
 
 use std::ops::Range;
 
-use crate::compile::{ClickEvent, ClickLevel};
+use crate::compile::ClickLevel;
 use crate::song::Song;
 use crate::timeline::Timeline;
 
@@ -23,12 +23,21 @@ pub struct BarBeat {
     pub beat: u32,
 }
 
+/// One click tick at a source sample. A plan places it at an output sample as
+/// a [`crate::ClickEvent`]; the two types keep source and output time apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceClick {
+    /// Source sample of the tick.
+    pub at: u64,
+    /// Which of the four click levels plays it.
+    pub level: ClickLevel,
+}
+
 /// The song's tick, beat and bar grid, in source samples.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeatGrid {
-    /// Every tick in `[0, song length)`, sorted by position; `at` is a source
-    /// sample.
-    ticks: Vec<ClickEvent>,
+    /// Every tick in `[0, song length)`, sorted by position.
+    ticks: Vec<SourceClick>,
     /// Positions of the `Downbeat` and `Beat` ticks.
     beats: Vec<u64>,
     /// Positions of the `Downbeat` ticks: the bar lines.
@@ -38,10 +47,10 @@ pub struct BeatGrid {
 impl BeatGrid {
     /// Computes the grid of `song`.
     pub fn new(song: &Song) -> Self {
-        let ticks: Vec<ClickEvent> = Timeline::new(song)
+        let ticks: Vec<SourceClick> = Timeline::new(song)
             .ticks()
             .into_iter()
-            .map(|tick| ClickEvent {
+            .map(|tick| SourceClick {
                 at: tick.at,
                 level: tick.level,
             })
@@ -59,10 +68,9 @@ impl BeatGrid {
     }
 
     /// The click ticks whose source position lies in `range`, sorted by
-    /// position. Here [`ClickEvent::at`] is a source sample: a plan segment
-    /// playing `range` from output sample `out_start` places each tick at
-    /// `out_start + (at - range.start)`.
-    pub fn clicks_in(&self, range: Range<u64>) -> &[ClickEvent] {
+    /// position. A plan segment playing `range` from output sample
+    /// `out_start` places each tick at `out_start + (at - range.start)`.
+    pub fn clicks_in(&self, range: Range<u64>) -> &[SourceClick] {
         let first = self.ticks.partition_point(|tick| tick.at < range.start);
         let end = self.ticks.partition_point(|tick| tick.at < range.end);
         &self.ticks[first..end.max(first)]

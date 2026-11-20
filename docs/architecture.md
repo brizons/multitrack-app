@@ -1,14 +1,14 @@
 # Architecture Proposal — Open-Source Live Multitrack Player
 
-**Decision:** a Rust audio engine built as a hexagonal core, shared by a native UI per platform: SwiftUI for iPhone, iPad and Mac, Jetpack Compose for Android, and Tauri with React for Windows and Linux. The default build uses only permissive or weak-copyleft dependencies, so the app can ship on every store, including the Apple App Store. This document supports the [MVP spec](mvp-spec.md).
+**Decision:** a Rust audio engine built as a hexagonal core, shared by one UI per platform family: SwiftUI for iPhone and iPad, Jetpack Compose for Android, and GPUI (Rust) for Mac, Windows and Linux. The default build uses only permissive or weak-copyleft dependencies, so the app can ship on every store, including the Apple App Store. This document supports the [MVP spec](mvp-spec.md).
 
-> **Status:** Decision 1 (stack) decided on 2026-10-30. Decision 5 (project license) still needs sign-off. The Rust core (`domain`, `engine`, `library`, `render-cli`) is built and reviewed on `feat/core-render-pipeline`.
+> **Status:** Decision 1 (stack) decided on 2026-10-30; on 2026-11-19 the desktop shell moved from Tauri with React to GPUI, and the Mac moved from the SwiftUI app to the GPUI app. Decision 5 (project license) still needs sign-off. The Rust core (`domain`, `engine`, `library`, `render-cli`) is built and reviewed on `feat/core-render-pipeline`.
 
 ## Decisions at a glance
 
 | # | Decision | Proposal | Status |
 |---|----------|----------|--------|
-| 1 | Engine and UI stack | Rust core + native UI per platform (SwiftUI, Compose, Tauri) | Decided |
+| 1 | Engine and UI stack | Rust core + one UI per platform family (SwiftUI, Compose, GPUI) | Decided |
 | 2 | Engine model | One sample clock driving a compiled timeline | Proposed |
 | 3 | Threads | Real-time audio thread fed by lock-free queues | Proposed |
 | 4 | Key and tempo change (v0.2) | Offline render with Signalsmith Stretch | Proposed |
@@ -18,10 +18,10 @@
 ## System overview
 
 ```text
-┌─ SwiftUI ───────┐ ┌─ Compose ─────────┐ ┌─ Tauri + React ─┐
-│ iPhone·iPad·Mac │ │      Android      │ │ Windows · Linux │
+┌─ SwiftUI ───────┐ ┌─ Compose ─────────┐ ┌─ GPUI (Rust) ───┐
+│  iPhone · iPad  │ │      Android      │ │ Mac·Win·Linux   │
 └────────┬────────┘ └─────────┬─────────┘ └────────┬────────┘
-   UniFFI (Swift)      UniFFI (Kotlin)      Tauri commands
+   UniFFI (Swift)      UniFFI (Kotlin)     direct Rust calls
          │                    │                    │
 ┌────────▼────────────────────▼────────────────────▼─────────┐
 │  app        use cases, library, MIDI mapping, settings    │
@@ -41,32 +41,44 @@ Each shell sends commands and reads state snapshots (~30 Hz) through the same `a
 
 ## Decision 1 — Engine and UI stack
 
-**Decided (2026-10-30): one Rust core, one native shell per platform family.**
+**Decided (2026-10-30, desktop shell updated 2026-11-19): one Rust core, one shell per platform family.**
 
 | Shell | Platforms | Language | Talks to the core through |
 |-------|-----------|----------|---------------------------|
-| `apps/apple` | iPhone, iPad, Mac (one SwiftUI multiplatform app) | Swift | UniFFI-generated Swift bindings (`uniffi` 0.32, MPL-2.0) |
+| `apps/apple` | iPhone, iPad (one SwiftUI app) | Swift | UniFFI-generated Swift bindings (`uniffi` 0.32, MPL-2.0) |
 | `apps/android` | Android tablets and phones | Kotlin | UniFFI-generated Kotlin bindings |
-| `apps/desktop` | Windows, Linux | TypeScript (React) + Rust | Tauri 2 commands calling the core directly (Apache-2.0 OR MIT) |
+| `apps/desktop` | Mac, Windows, Linux | Rust | Direct calls to the `app` crate, no FFI; UI drawn with GPUI (`gpui` 0.2, Apache-2.0) |
 
-| Criterion | JUCE (C++) for everything | Rust core + one shared UI (Flutter) | **Rust core + native shells** |
-|-----------|---------------------------|-------------------------------------|-------------------------------|
+| Criterion | JUCE (C++) for everything | Rust core + one shared UI (Flutter) | **Rust core + per-family shells** |
+|-----------|---------------------------|-------------------------------------|-----------------------------------|
 | Audio I/O maturity | Best, built in | `cpal` behind the `AudioOutput` port | Same as Flutter; native adapters are natural per shell |
 | License impact | AGPLv3 unless commercial | Permissive | Permissive |
-| Apple App Store | Blocked under AGPL | Allowed | Allowed |
-| Native feel and OS integration (audio session, USB permissions, Files) | Custom-drawn | Good | Best |
+| Apple App Store | Blocked under AGPL | Allowed | Allowed for iPhone and iPad; Mac App Store with GPUI unproven |
+| Native feel and OS integration (audio session, USB permissions, Files) | Custom-drawn | Good | Best on mobile; custom-drawn on desktop |
 | UI work | One codebase | One codebase | Three shells |
 | Feature parity | Automatic | Automatic | Must be kept on purpose |
-| Languages | C++ | Rust, Dart | Rust, Swift, Kotlin, TypeScript |
+| Languages | C++ | Rust, Dart | Rust, Swift, Kotlin |
 
-**Why native shells:** the best feel on each platform, natural access to platform audio and device APIs (AVAudioSession on iPhone and iPad, USB permissions on Android), and every store stays open.
+**Why native shells on mobile:** natural access to platform audio and device APIs (AVAudioSession on iPhone and iPad, USB permissions on Android), the best touch feel, and every store stays open.
+
+**Why GPUI on desktop (Mac, Windows, Linux):**
+- The shell is Rust, so it calls the `app` crate directly: no bindings, no IPC, one language from the audio callback to the screen.
+- GPUI draws everything on the GPU (Metal on macOS, DirectX on Windows, Vulkan on Linux), which suits waveforms, meters and a playhead redrawn every frame.
+- One desktop UI for three operating systems. The desktop use is the same everywhere (laptop, keyboard, mouse, MIDI); the iPad is touch-first and gets its own layout anyway.
+- macOS is GPUI's most mature backend, and the development machine is a Mac, so the shipped desktop app is the one used every day.
+
+**Known GPUI risks and how they are handled:**
+- Pre-1.0 API that still changes, with sparse documentation: pin exact versions of `gpui` and `gpui-component` and upgrade on purpose.
+- Screen-reader support upstream is not confirmed (forks add it with AccessKit): spike S5 checks it before release.
+- Mac App Store distribution of a GPUI app is unproven: ship the Mac build signed and notarized outside the store first.
+- No platform look: the app uses its own design (the design canvas) on every desktop.
 
 **How the cost stays bounded:**
 - All behavior lives in the core: validation, timeline compilation, transport, queued jumps, mixing. The `app` crate exposes one API of commands and state snapshots; shells only render snapshots and send commands.
 - Shells share one design (the screens in the design canvas) and one set of acceptance tests written against the `app` API.
 - Shells are built one at a time: a shell starts only when the previous one plays a setlist end to end.
 
-**What would change this:** if keeping three shells in parity becomes the bottleneck, a shared UI layer (Compose Multiplatform for Android and desktop) can replace two shells without touching the core.
+**What would change this:** if GPUI's churn or missing accessibility blocks the desktop shell, Tauri with React (the 2026-10-30 choice) can replace it without touching the core, because both call the `app` crate from Rust. If keeping three shells in parity becomes the bottleneck, a shared UI layer can replace two of them, again without touching the core.
 
 ## Decision 2 — Engine model: one clock, compiled timeline
 
@@ -82,7 +94,7 @@ Song + Arrangement + Settings ──compile()──▶ RenderPlan
 |------|-------------|
 | One sample counter drives every stem reader. | Zero drift between stems by construction. |
 | `compile()` is a pure function. | It can be unit- and property-tested without audio. |
-| A live change (jump, loop, fade) recompiles the plan from a boundary and swaps it at that boundary sample. | Live edits are sample-exact and never touch audio mid-buffer. |
+| A live change (jump, loop, fade) takes effect at a boundary sample: the live player walks the arrangement and applies the same seam rule as `compile` (`domain::seam_fade`), so with no live change it reproduces the compiled plan bit for bit. | Live edits are sample-exact and never touch audio mid-buffer. |
 | A queued jump starts prefetching the target audio right away; if it is not ready at the boundary, the jump moves to the next boundary. | The engine never plays silence or glitches to honor a jump. |
 
 ## Decision 3 — Threads and real-time rules
@@ -92,7 +104,7 @@ Song + Arrangement + Settings ──compile()──▶ RenderPlan
 | Audio (OS callback) | Renders the current plan: mix, click, guide, routing | Reads per-stem ring buffers (`rtrb`); publishes state through `triple_buffer` |
 | Disk | Decodes stems ahead of the playhead and prefetches jump targets | Writes the ring buffers |
 | Control | Runs use cases, compiles plans, handles MIDI input | Sends commands to the audio thread over a lock-free queue |
-| UI | Native shell (SwiftUI, Compose or Tauri); draws state snapshots | Calls the `app` API; polls snapshots at about 30 Hz |
+| UI | Platform shell (SwiftUI, Compose or GPUI); draws state snapshots | Calls the `app` API; polls snapshots at about 30 Hz |
 
 Real-time checklist for every line that runs in the audio callback:
 
@@ -130,7 +142,8 @@ Render transposed and time-stretched stems **offline**, into a cache keyed by ke
 | `symphonia` (decoding) | 0.6.1 | MPL-2.0 | Yes |
 | `signalsmith-stretch` | 0.1.3 | MIT | Yes (v0.2) |
 | `uniffi` (Swift and Kotlin bindings) | 0.32.2 | MPL-2.0 | Yes |
-| `tauri` (desktop shell) | 2.12.5 | Apache-2.0 OR MIT | Yes |
+| `gpui` (desktop shell) | 0.2.2 | Apache-2.0 | Yes |
+| `gpui-component` (desktop widgets) | 0.10.0 | Apache-2.0 | Yes |
 | `rtrb` (ring buffer) | 0.4.1 | MIT or Apache-2.0 | Yes |
 | `triple_buffer` | 9.0.0 | MPL-2.0 | Yes |
 | ASIO SDK (Windows) | — | GPLv3 or proprietary | Opt-in feature only |
@@ -155,9 +168,9 @@ crates/
   ffi/          UniFFI bindings of `app` for Swift and Kotlin
   render-cli/   headless renderer for tests and CI
 apps/
-  apple/        SwiftUI app for iPhone, iPad and Mac
+  apple/        SwiftUI app for iPhone and iPad
   android/      Jetpack Compose app
-  desktop/      Tauri + React app for Windows and Linux
+  desktop/      GPUI app for Mac, Windows and Linux
 docs/
 ```
 
@@ -182,7 +195,8 @@ Run these before building the UI. Each one is a few days and decides whether Dec
 | S1 | Can `cpal` open 8 outputs on an Android tablet with a class-compliant USB interface? | Distinct audio on all 8 outputs on two tablets from different makers |
 | S2 | Same on iPadOS | Distinct audio on all 8 outputs |
 | S3 | Can a low-end Android tablet decode 32 FLAC stems in real time? | Under 50% of one core at 48 kHz |
-| S4 | Shell → Rust → audio round trip for transport commands (UniFFI and Tauri commands) | Under 50 ms from tap to sound |
+| S4 | Shell → Rust → audio round trip for transport commands (UniFFI on mobile, direct calls in the GPUI app) | Under 50 ms from tap to sound |
+| S5 | Does the GPUI app expose the Perform screen to screen readers (VoiceOver, Narrator, Orca)? | Transport, section pads and panic are reachable and labelled on all three desktops |
 
 Android USB multichannel varies by device maker, and the official Android docs still describe 1–2 channels for USB host mode. S1 is the highest risk in the project.
 
@@ -204,4 +218,4 @@ Static analysis of the shipped macOS binary, used only to understand the archite
 
 1. Settle Decision 5 (project license).
 2. Build live playback — the `app` API, the real-time engine with `cpal`, and the first shell — as planned in [odd/tasks/live-playback.md](../odd/tasks/live-playback.md).
-3. Run spikes S1–S4 when the hardware is available (an Android tablet, an iPad and a multichannel USB interface).
+3. Run spikes S1–S5 when the hardware is available (an Android tablet, an iPad and a multichannel USB interface).

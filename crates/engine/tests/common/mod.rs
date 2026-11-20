@@ -8,6 +8,13 @@ use domain::{
 };
 use engine::StemAudio;
 
+/// A validated song and what it was validated from.
+pub struct BuiltSong {
+    pub song: Song,
+    pub package: SongPackage,
+    pub infos: Vec<StemInfo>,
+}
+
 /// A song description; [`SongSpec::build`] validates it.
 pub struct SongSpec {
     pub rate: u32,
@@ -63,9 +70,9 @@ impl SongSpec {
         self
     }
 
-    /// Validates the package; every stem is `length` frames long.
-    pub fn build(&self) -> Song {
-        let package = SongPackage {
+    /// The package this spec describes.
+    pub fn package(&self) -> SongPackage {
+        SongPackage {
             format_version: 1,
             title: "Engine Test".to_owned(),
             artist: None,
@@ -128,17 +135,36 @@ impl SongSpec {
                     infinite_loop: Vec::new(),
                 })
                 .collect(),
-        };
-        let infos: Vec<StemInfo> = self
-            .stems
+        }
+    }
+
+    /// Stem information for every stem: each one is `length` frames long.
+    pub fn infos(&self) -> Vec<StemInfo> {
+        self.stems
             .iter()
             .map(|&(id, _)| StemInfo {
                 id: id.to_owned(),
                 sample_rate: self.rate,
                 length_samples: self.length,
             })
-            .collect();
-        validate(&package, &infos).expect("test song is valid").song
+            .collect()
+    }
+
+    /// Validates the package; every stem is `length` frames long.
+    pub fn build(&self) -> Song {
+        validate(&self.package(), &self.infos())
+            .expect("test song is valid")
+            .song
+    }
+
+    /// The validated song with the package and stem information it came
+    /// from, so a test can derive other songs from it.
+    pub fn built(&self) -> BuiltSong {
+        BuiltSong {
+            song: self.build(),
+            package: self.package(),
+            infos: self.infos(),
+        }
     }
 }
 

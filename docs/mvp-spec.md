@@ -249,7 +249,7 @@ Targets are validated on the reference hardware (**Decision needed:** choose it)
 
 **Decision needed:** confirm the tiers. iPadOS distribution needs an Apple developer account.
 
-Shells: the SwiftUI app covers macOS, iPadOS and iPhone; the Compose app covers Android; the Tauri app covers Windows and Linux.
+Shells: the SwiftUI app covers iPadOS and iPhone; the Compose app covers Android; the GPUI app covers macOS, Windows and Linux.
 
 ## Roadmap after the MVP
 
