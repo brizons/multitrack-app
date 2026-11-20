@@ -497,7 +497,9 @@ fn a_single_song_ignores_the_setlist_controls_and_keeps_its_own() {
 
 #[test]
 fn a_setlist_file_names_its_library_by_the_setlists_folder_it_is_in() {
-    let library = Path::new("/music/Library");
+    // Absolute on every platform: on Windows `/music` is relative to the
+    // current drive, and a setlist path is made absolute before use.
+    let library = &std::path::absolute("/music/Library").unwrap();
     assert_eq!(
         Source::setlist_file(&library.join("Setlists/Sunday.setlist.json")),
         Some(Source::Setlist {
@@ -521,7 +523,9 @@ fn a_setlist_file_names_its_library_by_the_setlists_folder_it_is_in() {
 
 #[test]
 fn a_path_to_open_is_a_setlist_file_or_a_song_folder() {
-    let library = Path::new("/music/Library");
+    // Absolute on every platform: on Windows `/music` is relative to the
+    // current drive, and a setlist path is made absolute before use.
+    let library = &std::path::absolute("/music/Library").unwrap();
     assert_eq!(
         Source::for_path(&library.join("Setlists/Sunday.setlist.json")),
         Ok(Source::Setlist {
@@ -544,7 +548,9 @@ fn a_path_to_open_is_a_setlist_file_or_a_song_folder() {
 
 #[test]
 fn a_picked_setlist_must_be_a_setlist_file_in_a_setlists_folder() {
-    let library = Path::new("/music/Library");
+    // Absolute on every platform: on Windows `/music` is relative to the
+    // current drive, and a setlist path is made absolute before use.
+    let library = &std::path::absolute("/music/Library").unwrap();
     assert_eq!(
         Source::picked_setlist(&library.join("setlists/Sunday.setlist.json")),
         Ok(Source::Setlist {
@@ -578,7 +584,9 @@ fn a_setlist_path_relative_to_the_current_folder_names_a_library_that_opens() {
 
 #[test]
 fn dots_in_a_setlist_path_are_resolved_by_name() {
-    let library = Path::new("/music/Library");
+    // Absolute on every platform: on Windows `/music` is relative to the
+    // current drive, and a setlist path is made absolute before use.
+    let library = &std::path::absolute("/music/Library").unwrap();
     for path in [
         "/music/Library/./Setlists/Sunday.setlist.json",
         "/music/Library/Other/../Setlists/Sunday.setlist.json",
