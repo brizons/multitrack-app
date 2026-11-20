@@ -1,18 +1,18 @@
-//! S8: a pick that cannot open never ends the current song; a pick that can
-//! open stops the current song with its ramp and frees its device before
-//! the new song opens the device; and closing a song always ramps down,
-//! even when the player refuses Stop at first. A real `Session` on the
-//! app's `FakeOutput`.
+//! S8: a pick that cannot open, or that the device cannot play, never ends
+//! the current song; a pick that can open stops the current song with its
+//! ramp and frees its device before the new song opens the device; and
+//! closing a song always ramps down, even when the player refuses Stop at
+//! first. A real `Session` on the app's `FakeOutput`.
 
 use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use app::testing::FakeOutput;
+use app::testing::{FAKE_DEVICE_ID, FakeOutput};
 use app::{
-    AudioOutput, Command, JumpTiming, OpenError, OutputError, RuntimeError, SessionOptions,
-    TransportState,
+    AudioOutput, AudioRenderer, Command, DeviceInfo, DeviceStatus, JumpTiming, OpenError,
+    OutputError, OutputRequest, OutputStream, RuntimeError, SessionOptions, TransportState,
 };
 use domain::{
     Arrangement, SectionMarker, SectionType, SongPackage, Stem, StemRole, TempoPoint,
@@ -200,10 +200,9 @@ fn a_pick_stops_the_current_song_with_its_ramp_before_it_opens_the_device() {
         &mut current,
         second.path(),
         &SessionOptions::default(),
-        || {
-            assert!(!device.is_streaming(), "the first song closed first");
-            Box::new(device.clone())
-        },
+        // The device takes one stream: the second song can only open it
+        // once the first song closed.
+        || Box::new(device.clone()),
         |_| heard.push(device.render(FRAMES).expect("the first song plays")),
     )
     .unwrap_or_else(|error| panic!("the second song opens: {error}"));
@@ -222,6 +221,8 @@ fn a_pick_stops_the_current_song_with_its_ramp_before_it_opens_the_device() {
         "a ramp, not a cut"
     );
     assert_eq!(device.opened().len(), 2);
+    assert_eq!(device.open_attempts(), 2, "one open per song, none refused");
+    assert_eq!(device.checks(), 1, "the pick was checked first");
 }
 
 #[test]
@@ -245,7 +246,7 @@ fn with_nothing_loaded_a_pick_simply_loads() {
 }
 
 #[test]
-fn a_device_that_refuses_the_new_song_gets_the_previous_one_back_stopped() {
+fn a_pick_the_device_cannot_play_leaves_the_current_song_playing() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
     write_song(first.path(), "First");
@@ -253,29 +254,163 @@ fn a_device_that_refuses_the_new_song_gets_the_previous_one_back_stopped() {
     let device = FakeOutput::without_devices().with_device("Only 8k", 2, Some(&[RATE]));
     let mut current = Some(open_on(first.path(), &device).unwrap());
     play(current.as_mut().unwrap(), &device);
-    for _ in 0..10 {
-        step(current.as_mut().unwrap(), &device);
+
+    let refused = replace(
+        &mut current,
+        second.path(),
+        &SessionOptions::default(),
+        || Box::new(device.clone()),
+        |_| panic!("nothing stops"),
+    );
+    let Err(OpenError::Output(OutputError::UnsupportedSampleRate {
+        requested: 16_000, ..
+    })) = &refused
+    else {
+        panic!("the device cannot play 16 kHz: {refused:?}");
+    };
+    assert_eq!(device.checks(), 1);
+    assert_eq!(device.open_attempts(), 1, "only the first song's open");
+
+    let song = current.as_mut().expect("the first song stays loaded");
+    assert_eq!(song.session.song().title, "First");
+    let audio = step(song, &device);
+    assert_eq!(song.snapshot.transport, TransportState::Playing);
+    assert!(peak(&audio) > 0.01, "the first song is still heard");
+    assert_eq!(song.snapshot.last_error, None);
+}
+
+#[test]
+fn with_the_only_output_unplugged_a_pick_leaves_the_current_song_to_come_back() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    write_song(first.path(), "First");
+    write_song(second.path(), "Second");
+    let fake = FakeOutput::new();
+    let options = SessionOptions {
+        reconnect_interval: Duration::ZERO,
+        ..SessionOptions::default()
+    };
+    let mut current = Some(Song::open(first.path(), &options, Box::new(fake.clone())).unwrap());
+    play(current.as_mut().unwrap(), &fake);
+    fake.unplug(FAKE_DEVICE_ID);
+    current.as_mut().unwrap().poll();
+
+    let refused = replace(
+        &mut current,
+        second.path(),
+        &options,
+        || Box::new(fake.clone()),
+        |_| panic!("nothing stops"),
+    );
+    assert!(
+        matches!(refused, Err(OpenError::Output(OutputError::NoDevice))),
+        "{refused:?}"
+    );
+    assert_eq!(fake.open_attempts(), 1, "only the first song's open");
+
+    // The first song is still loaded, and plays on its device once it is
+    // back.
+    let song = current.as_mut().expect("the first song stays loaded");
+    assert_eq!(song.session.song().title, "First");
+    assert!(matches!(
+        song.snapshot.device,
+        DeviceStatus::Disconnected { .. }
+    ));
+    fake.plug(FAKE_DEVICE_ID);
+    song.poll();
+    assert!(
+        matches!(song.snapshot.device, DeviceStatus::Connected(_)),
+        "{:?}",
+        song.snapshot.device
+    );
+}
+
+/// A port without a check, so it cannot tell ([`app::OutputCheck::Unknown`]).
+struct Unchecked(FakeOutput);
+
+impl AudioOutput for Unchecked {
+    fn devices(&self) -> Result<Vec<DeviceInfo>, OutputError> {
+        self.0.devices()
     }
 
+    fn open(
+        &mut self,
+        request: &OutputRequest,
+        renderer: AudioRenderer,
+    ) -> Result<Box<dyn OutputStream>, OutputError> {
+        self.0.open(request, renderer)
+    }
+}
+
+#[test]
+fn a_device_that_cannot_tell_still_takes_the_pick() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    write_song(first.path(), "First");
+    write_song(second.path(), "Second");
+    let device = FakeOutput::new();
+    let mut current = Some(open_on(first.path(), &device).unwrap());
+    play(current.as_mut().unwrap(), &device);
+
+    let replaced = replace(
+        &mut current,
+        second.path(),
+        &SessionOptions::default(),
+        || Box::new(Unchecked(device.clone())),
+        |_| {
+            device.render(FRAMES);
+        },
+    )
+    .expect("a check that cannot tell goes ahead");
+    assert!(replaced.start_error.is_none(), "{:?}", replaced.start_error);
+    assert_eq!(current.unwrap().session.song().title, "Second");
+    assert_eq!(device.checks(), 0, "the wrapper has no check");
+}
+
+/// A device that passes the check but is busy with another stream when the
+/// pick opens it: opening fails after the current song stopped.
+fn busy_device(dir: &Path) -> (FakeOutput, Song) {
+    let busy = FakeOutput::new();
+    write_song(dir, "Elsewhere");
+    let holder = open_on(dir, &busy).unwrap();
+    (busy, holder)
+}
+
+#[test]
+fn a_device_that_fails_to_open_after_the_check_gets_the_previous_song_back_stopped() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    write_song(first.path(), "First");
+    write_song(second.path(), "Second");
+    let device = FakeOutput::new();
+    let mut current = Some(open_on(first.path(), &device).unwrap());
+    play(current.as_mut().unwrap(), &device);
+    let (busy, _holder) = busy_device(other.path());
+
+    // The pick is checked and opened on the busy device; the previous song
+    // opens again on its own, which its close freed.
     let calls = Cell::new(0);
     let replaced = replace(
         &mut current,
         second.path(),
         &SessionOptions::default(),
-        outputs(&device, &calls),
+        || {
+            calls.set(calls.get() + 1);
+            let output = if calls.get() == 1 { &busy } else { &device };
+            Box::new(output.clone()) as Box<dyn AudioOutput>
+        },
         |_| {
             device.render(FRAMES);
         },
     )
-    .expect("the second song itself is fine");
+    .expect("the check lets the pick go ahead");
 
-    assert_eq!(calls.get(), 2, "the new song, then the previous one again");
+    assert_eq!(calls.get(), 2, "the pick, then the previous song again");
+    assert_eq!(busy.checks(), 1);
     assert!(matches!(
         replaced.start_error,
-        Some(OpenError::Output(OutputError::UnsupportedSampleRate {
-            requested: 16_000,
-            ..
-        }))
+        Some(OpenError::Output(OutputError::Device { .. }))
     ));
     assert!(replaced.reopen_error.is_none());
     let song = current.as_mut().expect("the first song is back");
@@ -288,7 +423,7 @@ fn a_device_that_refuses_the_new_song_gets_the_previous_one_back_stopped() {
         problems[0].starts_with(&format!(
             "Could not start {} on the audio device: ",
             second.path().display()
-        )) && problems[0].contains("16000 Hz"),
+        )),
         "{problems:?}"
     );
     assert_eq!(
@@ -301,20 +436,19 @@ fn a_device_that_refuses_the_new_song_gets_the_previous_one_back_stopped() {
 fn when_the_previous_song_cannot_come_back_nothing_is_loaded_and_both_reasons_show() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
     write_song(first.path(), "First");
-    write_song_at(second.path(), "Second", 16_000);
+    write_song(second.path(), "Second");
     let fake = FakeOutput::new();
     let mut current = Some(open_on(first.path(), &fake).unwrap());
     play(current.as_mut().unwrap(), &fake);
+    let (busy, _holder) = busy_device(other.path());
 
-    // From now on the only device runs at 48 kHz: neither song opens.
-    let device = FakeOutput::without_devices().with_device("Only 48k", 2, Some(&[48_000]));
-    let calls = Cell::new(0);
     let replaced = replace(
         &mut current,
         second.path(),
         &SessionOptions::default(),
-        outputs(&device, &calls),
+        || Box::new(busy.clone()),
         |_| {
             fake.render(FRAMES);
         },
@@ -325,8 +459,7 @@ fn when_the_previous_song_cannot_come_back_nothing_is_loaded_and_both_reasons_sh
     let problems = replaced.problems();
     assert_eq!(problems.len(), 2, "{problems:?}");
     assert!(
-        problems[1].starts_with("\"First\" could not be loaded again: ")
-            && problems[1].contains("8000 Hz"),
+        problems[1].starts_with("\"First\" could not be loaded again: "),
         "{problems:?}"
     );
 }

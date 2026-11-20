@@ -1,7 +1,8 @@
 //! S8 sequences from the independent verification of T6, on the pure units
 //! and a real `Session` with `FakeOutput`. The swap probes go through
-//! `song::replace`, which prepares the pick, closes the current song, and
-//! only then opens the device; three of them changed with it (see each).
+//! `song::replace`, which prepares the pick and checks the device, closes
+//! the current song, and only then opens the device; two of them changed
+//! with it (see each).
 
 use std::fs;
 use std::path::Path;
@@ -238,10 +239,7 @@ fn swap_while_the_old_song_is_starting_cancels_its_waiting_play() {
         replaced.previous.unwrap().closing,
         Closing::Stopped { refused: None }
     );
-    assert!(
-        tries <= 1,
-        "Stop ends a waiting play at once ({tries} tries)"
-    );
+    assert_eq!(tries, 0, "Stop ends a waiting play at once, with no wait");
     assert!(
         heard.iter().all(|audio| peak(audio) == 0.0),
         "the waiting play never starts"
@@ -250,13 +248,11 @@ fn swap_while_the_old_song_is_starting_cancels_its_waiting_play() {
     assert_eq!(current.unwrap().session.song().title, "Second");
 }
 
-/// Changed with the swap: the device is only tried once the current song
-/// has stopped, since opening it beside a playing song would re-clock that
-/// song on macOS. So a pick the device refuses no longer leaves the current
-/// song playing: it stops with its ramp, and comes back stopped at the
-/// start, with the device's reason on screen.
+/// The device is checked before the current song stops
+/// ([`app::AudioOutput::check`]), so a pick it cannot play leaves the
+/// current song playing and opens nothing.
 #[test]
-fn a_pick_at_a_rate_the_device_refuses_brings_the_current_song_back_stopped() {
+fn a_pick_at_a_rate_the_device_refuses_leaves_the_current_song_playing() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
     write_song(first.path(), "First", 48_000);
@@ -265,37 +261,22 @@ fn a_pick_at_a_rate_the_device_refuses_brings_the_current_song_back_stopped() {
     let mut current = Some(song_on(first.path(), &old_fake));
     play(current.as_mut().unwrap(), &old_fake);
 
-    // From now on, the device only runs at 48 kHz.
+    // The app gives every open its own output; this one only runs at 48 kHz.
     let refusing = FakeOutput::without_devices().with_device("Only 48k", 2, Some(&[48_000]));
-    let mut heard = Vec::new();
-    let replaced = replace_on(&mut current, second.path(), &refusing, |_| {
-        heard.push(old_fake.render(FRAMES).unwrap());
-    })
-    .expect("the 44.1 kHz song itself is fine");
-    assert!(
-        ramped_down(&heard),
-        "the current song stopped with its ramp"
-    );
-    let error = replaced
-        .start_error
-        .as_ref()
-        .expect("the device refuses it");
+    let refused = replace_on(&mut current, second.path(), &refusing, |_| {
+        panic!("the current song does not stop")
+    });
+    let Err(error) = refused else {
+        panic!("a 44.1 kHz song does not open on a 48 kHz-only device");
+    };
     assert!(format!("{error}").contains("44100"), "{error}");
-    assert!(replaced.reopen_error.is_none());
-    let back = current.as_mut().expect("the first song is back");
-    assert_eq!(back.session.song().title, "First");
-    let snapshot = back.session.poll();
-    assert_eq!(snapshot.transport, TransportState::Stopped);
-    assert_eq!(snapshot.output_frame, 0);
-    let problems = replaced.problems();
-    assert!(
-        problems.iter().any(|line| line.contains("44100")),
-        "{problems:?}"
-    );
-    assert!(
-        problems.contains(&"\"First\" is loaded again, stopped at the start.".to_owned()),
-        "{problems:?}"
-    );
+    assert_eq!(refusing.open_attempts(), 0, "no device was opened");
+    let old = current.as_mut().unwrap();
+    assert_eq!(old.session.song().title, "First");
+    let heard = old_fake.render(FRAMES).unwrap();
+    assert_eq!(old.session.poll().transport, TransportState::Playing);
+    assert!(peak(&heard) > 0.01, "the current song is still heard");
+    assert!(old.session.poll().last_error.is_none());
 }
 
 /// Changed with the swap (it used to record that no pick opened while a

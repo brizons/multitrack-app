@@ -1,5 +1,6 @@
-//! Opening and closing a song while the show runs (S8): a pick is checked
-//! before the current song stops, so a pick that cannot open leaves the
+//! Opening and closing a song while the show runs (S8): a pick and the
+//! device it would play on are checked before the current song stops, so a
+//! pick that cannot open, or that the device cannot play, leaves the
 //! current song loaded and playing; a pick that can open stops the current
 //! song with its ramp and frees its device before the new song opens it;
 //! and closing always ramps down, sending a refused Stop again, and says
@@ -9,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use app::{
-    AudioOutput, Command, OpenError, PreparedSong, RuntimeError, Session, SessionOptions, Snapshot,
-    TransportState,
+    AudioOutput, Command, OpenError, OutputCheck, PreparedSong, RuntimeError, Session,
+    SessionOptions, Snapshot, TransportState,
 };
 
 /// How long closing waits for the player to take Stop and end its ramp
@@ -102,9 +103,9 @@ pub struct Replaced {
     pub dir: PathBuf,
     /// The song that was loaded before, and how it closed.
     pub previous: Option<Closed>,
-    /// Why the picked song's device did not open, if it did not. The
-    /// current song is then the previous one, opened again and stopped at
-    /// the start, or none.
+    /// Why the picked song's device did not open although its check went
+    /// ahead, if it did not. The current song is then the previous one,
+    /// opened again and stopped at the start, or none.
     pub start_error: Option<OpenError>,
     /// Why the previous song could not be opened again after that.
     pub reopen_error: Option<OpenError>,
@@ -139,14 +140,18 @@ impl Replaced {
 /// Opens the song folder `dir` in place of `current`, never holding the
 /// device twice:
 ///
-/// 1. The picked song is prepared with no device ([`Session::prepare`]).
-///    When it cannot open, the error comes back and `current` plays on,
-///    untouched.
+/// 1. The picked song is prepared with no device ([`Session::prepare`]),
+///    and the output from `output` is asked whether it would play it
+///    ([`PreparedSong::check`]). When the song cannot open, or the device
+///    refuses it (no such device, or not at the song's rate, for example),
+///    the error comes back and `current` plays on, untouched. A device that
+///    cannot tell ([`OutputCheck::Unknown`]) goes ahead.
 /// 2. The current song stops with its ramp ([`stop_and_wait`], `sleep`
 ///    between tries) and closes, which closes its device.
-/// 3. The picked song starts on a fresh output from `output`. When the
-///    device refuses it, the previous song opens again from its folder,
-///    stopped at the start, if it can; [`Replaced`] says what happened.
+/// 3. The picked song starts on that output. When opening still fails (the
+///    stream cannot be built or started), the previous song opens again
+///    from its folder on a fresh output, stopped at the start, if it can;
+///    [`Replaced`] says what happened.
 ///
 /// The device opens only once the old song has closed because on macOS
 /// opening a stream sets the device's sample rate, which would re-clock a
@@ -160,6 +165,10 @@ pub fn replace(
     sleep: impl FnMut(Duration),
 ) -> Result<Replaced, OpenError> {
     let prepared = Session::prepare(dir, options.clone())?;
+    let device = output();
+    if let OutputCheck::Refused(error) = prepared.check(device.as_ref()) {
+        return Err(error.into());
+    }
     let previous = current.take().map(|song| close(song, sleep));
     let mut replaced = Replaced {
         dir: dir.to_owned(),
@@ -167,7 +176,7 @@ pub fn replace(
         start_error: None,
         reopen_error: None,
     };
-    match Song::start(dir, prepared, output()) {
+    match Song::start(dir, prepared, device) {
         Ok(song) => *current = Some(song),
         Err(error) => {
             replaced.start_error = Some(error);
