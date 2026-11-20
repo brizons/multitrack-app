@@ -1417,3 +1417,58 @@ fn the_item_a_crossfade_fades_out_stays_watched_until_the_blend_ends() {
     assert_eq!(during, Some(2), "B, and A while it fades out");
     assert_eq!(after, Some(1), "B alone once the blend is over");
 }
+
+#[test]
+fn a_link_into_another_rate_is_reported_as_the_cue_next_it_plays_as() {
+    use app::RateFallback;
+
+    let shelf = Shelf::new();
+    shelf
+        .song("Low.song", RATE, 0)
+        .song("High.song", 2 * RATE, 1)
+        .song("High2.song", 2 * RATE, 2)
+        .song("Low2.song", RATE, 3);
+    let fake = FakeOutput::new();
+    let mut session = shelf.open(
+        vec![
+            song("Low.song", Transition::AutoLink),
+            song("High.song", Transition::Crossfade),
+            // A click tile plays at the rate the device runs at.
+            click(Some(1), Transition::AutoLink),
+            song("High2.song", Transition::AutoLink),
+            song("Low2.song", Transition::AutoLink),
+        ],
+        &fake,
+    );
+
+    let info = session.info().clone();
+    let fallbacks: Vec<Option<RateFallback>> =
+        info.items.iter().map(|item| item.fallback).collect();
+    assert_eq!(
+        fallbacks,
+        [
+            Some(RateFallback {
+                next: 1,
+                next_rate: 2 * RATE,
+                device_rate: RATE,
+            }),
+            None,
+            None,
+            Some(RateFallback {
+                next: 4,
+                next_rate: RATE,
+                device_rate: 2 * RATE,
+            }),
+            None,
+        ]
+    );
+    assert_eq!(info.items[0].plays_as(), Transition::CueNext);
+    assert_eq!(info.items[1].plays_as(), Transition::Crossfade);
+    assert_eq!(info.items[4].plays_as(), Transition::AutoLink);
+
+    // The current item's, as the device runs now.
+    let state = session.poll().setlist;
+    assert_eq!(state.transition, Transition::AutoLink, "as written");
+    assert_eq!(state.fallback, info.items[0].fallback);
+    assert_eq!(state.plays_as(), Transition::CueNext);
+}

@@ -71,9 +71,35 @@ pub struct ItemInfo {
     pub sample_rate: Option<u32>,
     /// Why the item cannot play, every reason; empty when it can.
     pub problems: Vec<String>,
+    /// How its AutoLink or Crossfade plays as Cue next when the setlist
+    /// plays in order, because the item it leads into runs at another rate
+    /// than the device then; `None` when it plays as written.
+    pub fallback: Option<RateFallback>,
+}
+
+/// An AutoLink or Crossfade that plays as Cue next: the next playable item
+/// runs at another rate than the device while this one plays, and nothing
+/// resamples, so the device reopens between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateFallback {
+    /// Index of the item it leads into.
+    pub next: usize,
+    /// That item's rate.
+    pub next_rate: u32,
+    /// The device's rate while this item plays.
+    pub device_rate: u32,
 }
 
 impl ItemInfo {
+    /// The transition the item plays with: Cue next under a
+    /// [`Self::fallback`], else its own.
+    pub fn plays_as(&self) -> Transition {
+        match self.fallback {
+            Some(_) => Transition::CueNext,
+            None => self.item.transition(),
+        }
+    }
+
     /// Whether the item can play.
     pub fn is_playable(&self) -> bool {
         self.problems.is_empty()
@@ -119,11 +145,25 @@ pub struct SetlistState {
     /// Whether the next item is prepared and its start buffered, so its
     /// transition will not wait for the disk.
     pub next_ready: bool,
+    /// How the current item's AutoLink or Crossfade plays as Cue next, at
+    /// the rate the device runs now; `None` when it plays as written.
+    pub fallback: Option<RateFallback>,
     /// The crossfade under way, if any.
     pub blend: Option<BlendView>,
     /// The most recent setlist problem; an operator's next, previous or
     /// select clears it.
     pub problem: Option<SetlistProblem>,
+}
+
+impl SetlistState {
+    /// The transition the current item plays with: Cue next under a
+    /// [`Self::fallback`], else [`Self::transition`].
+    pub fn plays_as(&self) -> Transition {
+        match self.fallback {
+            Some(_) => Transition::CueNext,
+            None => self.transition,
+        }
+    }
 }
 
 /// A crossfade under way.
@@ -468,6 +508,7 @@ impl SetlistSession {
                 problems: items.into_iter().map(|item| item.problems).collect(),
             });
         };
+        predict_fallbacks(&plans, &mut items, sample_rate);
         let info = SetlistInfo {
             name: setlist.name,
             sample_rate,
@@ -585,6 +626,14 @@ impl SetlistSession {
                 current: self.current,
                 next,
                 transition: self.transition(self.current),
+                fallback: next.and_then(|next| {
+                    rate_fallback(
+                        self.transition(self.current),
+                        self.session.sample_rate(),
+                        next,
+                        self.rate_of(next),
+                    )
+                }),
                 next_ready,
                 blend: report.deck.blend.map(|blend| BlendView {
                     from: self.blend_from.unwrap_or(self.current),
@@ -646,11 +695,13 @@ impl SetlistSession {
         let Some(next) = self.next_playable(self.current) else {
             return;
         };
-        let late = match self.transition(self.current) {
+        let transition = self.transition(self.current);
+        let late = match transition {
             Transition::Stay => return,
             Transition::CueNext => false,
             Transition::AutoLink | Transition::Crossfade => {
-                !self.halted && self.rate_of(next) == self.session.sample_rate()
+                let rate = self.session.sample_rate();
+                !self.halted && rate_fallback(transition, rate, next, self.rate_of(next)).is_none()
             }
         };
         match self.select(next, late) {
@@ -920,6 +971,51 @@ fn is_session_wide(error: &OpenError) -> bool {
     )
 }
 
+/// How `transition`, from an item played while the device runs at
+/// `device_rate`, leads into item `next` at `next_rate`: an AutoLink or
+/// Crossfade into another rate plays as Cue next, since the device reopens
+/// between the two. The one rule the session plays by and reports.
+fn rate_fallback(
+    transition: Transition,
+    device_rate: u32,
+    next: usize,
+    next_rate: u32,
+) -> Option<RateFallback> {
+    let links = matches!(transition, Transition::AutoLink | Transition::Crossfade);
+    (links && next_rate != device_rate).then_some(RateFallback {
+        next,
+        next_rate,
+        device_rate,
+    })
+}
+
+/// Fills each playable item's [`ItemInfo::fallback`] for the setlist played
+/// in order from a device opened at `sample_rate`: a song runs the device
+/// at its own rate, a click-only tile at the rate the device runs at.
+fn predict_fallbacks(plans: &[Option<Plan>], items: &mut [ItemInfo], sample_rate: u32) {
+    let mut device = sample_rate;
+    let rates: Vec<Option<u32>> = plans
+        .iter()
+        .map(|plan| match plan {
+            Some(Plan::Song { sample_rate, .. }) => {
+                device = *sample_rate;
+                Some(device)
+            }
+            Some(Plan::Click(_)) => Some(device),
+            None => None,
+        })
+        .collect();
+    for (index, rate) in rates.iter().enumerate() {
+        let Some(rate) = *rate else {
+            continue;
+        };
+        let next = (index + 1..rates.len()).find_map(|next| rates[next].map(|r| (next, r)));
+        items[index].fallback = next.and_then(|(next, next_rate)| {
+            rate_fallback(items[index].item.transition(), rate, next, next_rate)
+        });
+    }
+}
+
 /// What `item` (at `index`) is, whether it can play, and how to build it.
 fn plan_item(
     library: &Library,
@@ -937,6 +1033,7 @@ fn plan_item(
                 item: item.clone(),
                 sample_rate: None,
                 problems,
+                fallback: None,
             };
             return (info, plan);
         }
@@ -965,6 +1062,7 @@ fn plan_item(
         item: item.clone(),
         sample_rate,
         problems,
+        fallback: None,
     };
     (info, plan)
 }
@@ -1069,6 +1167,7 @@ mod tests {
                 item: SetlistItem::Click(click),
                 sample_rate: None,
                 problems: Vec::new(),
+                fallback: None,
             })
             .collect();
         (plans, items)

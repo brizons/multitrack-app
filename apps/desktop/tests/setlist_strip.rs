@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use app::{
     BlendView, Command, DeviceStatus, FadeState, FadeView, ItemInfo, JumpTiming, LossReason,
-    OutputError, PositionInfo, RuntimeError, SetlistCommand, SetlistCommandError, SetlistInfo,
-    SetlistProblem, SetlistSnapshot, SetlistState, Snapshot, SongInfo, StreamInfo, TransportState,
+    OutputError, PositionInfo, RateFallback, RuntimeError, SetlistCommand, SetlistCommandError,
+    SetlistInfo, SetlistProblem, SetlistSnapshot, SetlistState, Snapshot, SongInfo, StreamInfo,
+    TransportState,
 };
 use domain::{ClickItem, SetlistItem, SongItem, TimeSignature, Transition};
 use library::{ArrangementEntry, PositionEntry, SongEntry};
@@ -79,6 +80,7 @@ fn playable(item: SetlistItem, sample_rate: Option<u32>) -> ItemInfo {
         item,
         sample_rate,
         problems: Vec::new(),
+        fallback: None,
     }
 }
 
@@ -109,6 +111,7 @@ fn info() -> SetlistInfo {
                 item: SetlistItem::Song(song_item("Missing.song", Transition::CueNext)),
                 sample_rate: None,
                 problems: vec![MISSING.to_owned()],
+                fallback: None,
             },
             playable(
                 SetlistItem::Click(ClickItem {
@@ -171,6 +174,7 @@ fn snapshot() -> SetlistSnapshot {
             current: 1,
             next: Some(3),
             transition: Transition::Crossfade,
+            fallback: None,
             next_ready: false,
             blend: None,
             problem: None,
@@ -626,11 +630,16 @@ fn clicking_the_current_tile_does_nothing() {
 fn a_link_into_a_song_at_another_rate_shows_as_the_cue_next_it_plays_as() {
     let mut info = info();
     // The click tile plays at the rate of the song before it (48 kHz);
-    // Rivers Rise runs at 44.1 kHz.
+    // Rivers Rise runs at 44.1 kHz, so the session reports the fallback.
     let SetlistItem::Click(click) = &mut info.items[3].item else {
         panic!("a click tile");
     };
     click.transition = Transition::AutoLink;
+    info.items[3].fallback = Some(RateFallback {
+        next: 4,
+        next_rate: 44_100,
+        device_rate: RATE,
+    });
 
     let view = SetlistView::new(&info, &snapshot(), &catalog(), None);
 
@@ -654,5 +663,24 @@ fn a_link_into_a_song_at_another_rate_shows_as_the_cue_next_it_plays_as() {
     assert_eq!(
         view.items[0].transition.as_ref().unwrap().transition,
         Transition::AutoLink
+    );
+}
+
+#[test]
+fn the_current_items_chip_follows_the_session_at_the_rate_the_device_runs_now() {
+    let mut snapshot = snapshot();
+    // Item 2's Crossfade into the click tile, at the device's rate now.
+    snapshot.setlist.fallback = Some(RateFallback {
+        next: 3,
+        next_rate: 44_100,
+        device_rate: RATE,
+    });
+
+    let view = SetlistView::new(&info(), &snapshot, &catalog(), None);
+
+    let chip = view.items[1].transition.clone().unwrap();
+    assert_eq!(
+        (chip.transition, chip.written),
+        (Transition::CueNext, Transition::Crossfade)
     );
 }

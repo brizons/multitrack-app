@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use app::{
     BlendView, Command, DeviceStatus, FadeState, FadeView, ItemInfo, JumpTiming, OutputError,
-    PositionInfo, RuntimeError, SetlistCommand, SetlistCommandError, SetlistInfo, SetlistProblem,
-    SetlistSnapshot, SetlistState, Snapshot, SongInfo, StreamInfo, TransportState,
+    PositionInfo, RateFallback, RuntimeError, SetlistCommand, SetlistCommandError, SetlistInfo,
+    SetlistProblem, SetlistSnapshot, SetlistState, Snapshot, SongInfo, StreamInfo, TransportState,
 };
 use domain::{ClickItem, SetlistItem, SongItem, TimeSignature, Transition};
 use play_cli::{
@@ -40,6 +40,7 @@ fn item(item: SetlistItem, sample_rate: Option<u32>, problems: &[&str]) -> ItemI
         item,
         sample_rate,
         problems: problems.iter().map(|p| (*p).to_owned()).collect(),
+        fallback: None,
     }
 }
 
@@ -130,6 +131,7 @@ fn setlist_snapshot() -> SetlistSnapshot {
             current: 1,
             next: Some(2),
             transition: Transition::AutoLink,
+            fallback: None,
             next_ready: true,
             blend: None,
             problem: None,
@@ -509,4 +511,24 @@ fn dot_dot_in_a_setlist_path_is_resolved_by_name() {
         setlist_location(&up).is_err(),
         "a folder is not a setlist file"
     );
+}
+
+#[test]
+fn a_link_into_another_rate_shows_as_the_cue_next_it_plays_as() {
+    let keys = SetlistKeys::default();
+    let mut snapshot = setlist_snapshot();
+    // Opening runs the device at 48 kHz; Hi runs at 96 kHz.
+    snapshot.setlist.fallback = Some(RateFallback {
+        next: 2,
+        next_rate: 96_000,
+        device_rate: 48_000,
+    });
+
+    let line = setlist_status_line(&snapshot, &info(), &song(), &keys, None);
+
+    let expected = format!(
+        "item 2/5 \"Opening\" | then: Cue next (AutoLink into 96000 Hz) -> 3 \"Hi\" | {}",
+        status_line(&snapshot.song, &song())
+    );
+    assert_eq!(line, expected);
 }

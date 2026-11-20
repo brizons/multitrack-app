@@ -362,12 +362,26 @@ pub fn setlist_status_line(
         let loading = if state.next_ready { "" } else { " (loading)" };
         format!("then: {name} -> {} \"{}\"{loading}", next + 1, label(next))
     };
-    fields.push(match (state.transition, state.next) {
-        (Transition::Stay, _) => "then: Stay".to_owned(),
-        (_, None) => "then: end of setlist".to_owned(),
-        (Transition::CueNext, Some(next)) => follow("Cue next", next),
-        (Transition::AutoLink, Some(next)) => follow("AutoLink", next),
-        (Transition::Crossfade, Some(next)) => follow("Crossfade", next),
+    let name = |transition| match transition {
+        Transition::CueNext => "Cue next",
+        Transition::Stay => "Stay",
+        Transition::AutoLink => "AutoLink",
+        Transition::Crossfade => "Crossfade",
+    };
+    // The transition as the session plays it: an AutoLink or Crossfade into
+    // another rate is a Cue next, and says which rate.
+    fields.push(match (state.plays_as(), state.next, state.fallback) {
+        (Transition::Stay, _, _) => "then: Stay".to_owned(),
+        (_, None, _) => "then: end of setlist".to_owned(),
+        (_, Some(next), Some(fallback)) => follow(
+            &format!(
+                "Cue next ({} into {} Hz)",
+                name(state.transition),
+                fallback.next_rate
+            ),
+            next,
+        ),
+        (transition, Some(next), None) => follow(name(transition), next),
     });
     fields.push(status_line(&snapshot.song, song));
     if let Some(problem) = &state.problem {

@@ -4,7 +4,7 @@
 
 use std::cmp::Ordering;
 
-use app::{DeviceStatus, SetlistCommandError, SetlistInfo, SetlistSnapshot};
+use app::{DeviceStatus, RateFallback, SetlistCommandError, SetlistInfo, SetlistSnapshot};
 use domain::{SetlistItem, Transition};
 
 use crate::catalog::{Catalog, transition_name, transition_short};
@@ -131,7 +131,7 @@ impl SetlistView {
                     loading: is_next && !state.next_ready,
                     warning,
                     playable: item.is_playable(),
-                    transition: (index < last).then(|| chip(info, index)),
+                    transition: (index < last).then(|| chip(info, state, index)),
                 }
             })
             .collect();
@@ -159,52 +159,21 @@ impl SetlistView {
     }
 }
 
-/// An AutoLink or Crossfade the session plays as Cue next, because the next
-/// playable item runs at another rate than the device while item `index`
-/// plays (nothing resamples, so the device reopens between them): the
-/// next item, its rate and the device's.
-struct Fallback {
-    next: usize,
-    next_rate: u32,
-    rate: u32,
-}
-
-/// The fallback of item `index`'s transition, if it has one.
-fn fallback(info: &SetlistInfo, index: usize) -> Option<Fallback> {
-    if !matches!(
-        info.items.get(index)?.item.transition(),
-        Transition::AutoLink | Transition::Crossfade
-    ) {
-        return None;
+/// How item `index`'s AutoLink or Crossfade plays as Cue next, as the
+/// session reports it: for the current item at the rate the device runs
+/// now, for the others as the setlist plays in order.
+fn fallback(info: &SetlistInfo, state: &app::SetlistState, index: usize) -> Option<RateFallback> {
+    if index == state.current {
+        state.fallback
+    } else {
+        info.items.get(index)?.fallback
     }
-    let next = (index + 1..info.items.len()).find(|&next| info.items[next].is_playable())?;
-    let (rate, next_rate) = (device_rate(info, index), device_rate(info, next));
-    (rate != next_rate).then_some(Fallback {
-        next,
-        next_rate,
-        rate,
-    })
-}
-
-/// The rate the device runs at while item `index` plays: a song's own; a
-/// click-only tile plays at the rate of the last playable song before it,
-/// or the setlist's when there is none.
-fn device_rate(info: &SetlistInfo, index: usize) -> u32 {
-    info.items[..=index.min(info.items.len().saturating_sub(1))]
-        .iter()
-        .rev()
-        .filter(|item| item.is_playable())
-        .find_map(|item| match item.item {
-            SetlistItem::Song(_) => item.sample_rate,
-            SetlistItem::Click(_) => None,
-        })
-        .unwrap_or(info.sample_rate)
 }
 
 /// The chip after item `index`: its transition as it plays.
-fn chip(info: &SetlistInfo, index: usize) -> TransitionChip {
+fn chip(info: &SetlistInfo, state: &app::SetlistState, index: usize) -> TransitionChip {
     let written = info.items[index].item.transition();
-    match fallback(info, index) {
+    match fallback(info, state, index) {
         Some(fallback) => TransitionChip {
             transition: Transition::CueNext,
             written,
@@ -214,7 +183,7 @@ fn chip(info: &SetlistInfo, index: usize) -> TransitionChip {
                 transition_name(written),
                 fallback.next + 1,
                 fallback.next_rate,
-                fallback.rate
+                fallback.device_rate
             ),
         },
         None => TransitionChip {
@@ -259,7 +228,7 @@ fn problems(
         ));
     }
     for index in 0..info.items.len() {
-        if let Some(fallback) = fallback(info, index) {
+        if let Some(fallback) = fallback(info, &snapshot.setlist, index) {
             lines.push(format!(
                 "Item {} leads into item {} with Cue next, not {}: item {} runs at {} Hz and the device at {} Hz",
                 name(index),
@@ -267,7 +236,7 @@ fn problems(
                 transition_name(info.items[index].item.transition()),
                 fallback.next + 1,
                 fallback.next_rate,
-                fallback.rate
+                fallback.device_rate
             ));
         }
     }
