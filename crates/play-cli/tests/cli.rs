@@ -348,8 +348,14 @@ fn problems_print_before_the_setlist_plays_and_the_rest_stays_playable() {
             song_item("Songs/Hi.song"),
         ],
     );
-    let output = play_cli(&["--setlist", file.to_str().unwrap()]);
-    // With no terminal (or no device) it stops before any stream opens.
+    // A device that does not exist shows the order: the terminal is
+    // checked first, so the outcome does not depend on the machine's audio.
+    let output = play_cli(&[
+        "--setlist",
+        file.to_str().unwrap(),
+        "--device",
+        "No Such Device",
+    ]);
     assert_eq!(output.status.code(), Some(1));
     let errors = stderr(&output);
     let lines: Vec<&str> = errors.lines().collect();
@@ -364,11 +370,9 @@ fn problems_print_before_the_setlist_plays_and_the_rest_stays_playable() {
         "warning: item 3 (\"Hi\") runs at 96000 Hz and the device at 48000 Hz: it plays once the device reopens at its rate, and no AutoLink or Crossfade leads into it",
         "{errors}"
     );
-    assert_eq!(lines.len(), 3, "{errors}");
-    assert!(
-        lines[2] == "error: play-cli reads single keys, so its standard input must be a terminal"
-            || lines[2].starts_with("error: no audio output device")
-            || lines[2].starts_with("error: audio system: "),
+    assert_eq!(
+        lines[2..],
+        ["error: play-cli reads single keys, so its standard input must be a terminal"],
         "{errors}"
     );
     assert!(stdout(&output).is_empty(), "nothing played");

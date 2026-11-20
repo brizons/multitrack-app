@@ -8,7 +8,7 @@
 #![warn(missing_docs)]
 
 use std::fmt::Write as _;
-use std::path::{self, Path, PathBuf};
+use std::path::{self, Component, Path, PathBuf};
 
 use app::{
     Command, DeviceInfo, DeviceStatus, FadeState, JumpKind, JumpTiming, SetlistCommand,
@@ -183,6 +183,10 @@ pub const KEY_ENTER: char = '\r';
 pub const KEY_ESCAPE: char = '\u{1b}';
 /// The key a terminal's Backspace gives.
 pub const KEY_BACKSPACE: char = '\u{8}';
+/// DEL, which many terminals send for Backspace; it deletes a digit too.
+const KEY_DELETE: char = '\u{7f}';
+/// Line feed, which some terminals send for Enter; it selects too.
+const KEY_LINE_FEED: char = '\n';
 
 /// Most digits an item number takes.
 const ITEM_DIGITS: usize = 4;
@@ -219,11 +223,11 @@ impl SetlistKeys {
                     }
                     return None;
                 }
-                KEY_BACKSPACE | '\u{7f}' => {
+                KEY_BACKSPACE | KEY_DELETE => {
                     entry.pop();
                     return None;
                 }
-                KEY_ENTER | '\n' => {
+                KEY_ENTER | KEY_LINE_FEED => {
                     let number = entry.parse::<usize>().ok().filter(|&number| number > 0);
                     self.entry = None;
                     return number
@@ -286,9 +290,9 @@ pub fn item_label(item: &SetlistItem) -> String {
 pub fn setlist_problems(info: &SetlistInfo) -> Vec<String> {
     let mut lines = Vec::new();
     for (index, item) in info.items.iter().enumerate() {
-        let name = format!("item {} (\"{}\")", index + 1, item_label(&item.item));
+        let name = item_name(index, Some(&item.item));
         for problem in &item.problems {
-            lines.push(format!("{name} cannot play: {problem}"));
+            lines.push(item_cannot_play(index, Some(&item.item), problem));
         }
         if let Some(rate) = item.sample_rate
             && item.is_playable()
@@ -301,6 +305,21 @@ pub fn setlist_problems(info: &SetlistInfo) -> Vec<String> {
         }
     }
     lines
+}
+
+/// An item as messages name it: its number from 1, and its label when the
+/// item is known.
+pub fn item_name(index: usize, item: Option<&SetlistItem>) -> String {
+    match item {
+        Some(item) => format!("item {} (\"{}\")", index + 1, item_label(item)),
+        None => format!("item {}", index + 1),
+    }
+}
+
+/// One reason item `index` cannot play, as play-cli prints it: as a
+/// warning before a setlist plays, or as an error when nothing can.
+pub fn item_cannot_play(index: usize, item: Option<&SetlistItem>, reason: &str) -> String {
+    format!("{} cannot play: {reason}", item_name(index, item))
 }
 
 /// The setlist mode's status line: the item number being typed after `g`,
@@ -339,19 +358,16 @@ pub fn setlist_status_line(
             label(blend.from)
         ));
     }
+    let follow = |name: &str, next: usize| {
+        let loading = if state.next_ready { "" } else { " (loading)" };
+        format!("then: {name} -> {} \"{}\"{loading}", next + 1, label(next))
+    };
     fields.push(match (state.transition, state.next) {
         (Transition::Stay, _) => "then: Stay".to_owned(),
         (_, None) => "then: end of setlist".to_owned(),
-        (transition, Some(next)) => {
-            let name = match transition {
-                Transition::CueNext => "Cue next",
-                Transition::AutoLink => "AutoLink",
-                Transition::Crossfade => "Crossfade",
-                Transition::Stay => "Stay",
-            };
-            let loading = if state.next_ready { "" } else { " (loading)" };
-            format!("then: {name} -> {} \"{}\"{loading}", next + 1, label(next))
-        }
+        (Transition::CueNext, Some(next)) => follow("Cue next", next),
+        (Transition::AutoLink, Some(next)) => follow("AutoLink", next),
+        (Transition::Crossfade, Some(next)) => follow("Crossfade", next),
     });
     fields.push(status_line(&snapshot.song, song));
     if let Some(problem) = &state.problem {
@@ -366,7 +382,8 @@ pub fn setlist_status_line(
 /// The library folder and the file name a setlist file `path` stands for:
 /// a setlist lives in the [`SETLISTS_FOLDER`] of its library folder, so the
 /// library is the folder holding that one (any case of its name). Relative
-/// paths count from the current folder; nothing on disk is read.
+/// paths count from the current folder, and `.` and `..` are resolved by
+/// name, without following symlinks; nothing on disk is read.
 pub fn setlist_location(path: &Path) -> Result<(PathBuf, String), String> {
     let not_there = || {
         format!(
@@ -374,7 +391,12 @@ pub fn setlist_location(path: &Path) -> Result<(PathBuf, String), String> {
             path.display()
         )
     };
+    // A path ending in `..` names a folder, never a setlist file.
+    if path.ends_with(Component::ParentDir.as_os_str()) {
+        return Err(not_there());
+    }
     let absolute = path::absolute(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let absolute = resolve_dots(&absolute);
     let file = absolute
         .file_name()
         .and_then(|name| name.to_str())
@@ -389,4 +411,22 @@ pub fn setlist_location(path: &Path) -> Result<(PathBuf, String), String> {
         .filter(|_| in_setlists)
         .ok_or_else(not_there)?;
     Ok((library.to_owned(), file.to_owned()))
+}
+
+/// `path` (absolute) with `.` dropped and each `..` taking off the name
+/// before it; `..` at the root stays at the root.
+fn resolve_dots(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if resolved.parent().is_some() {
+                    resolved.pop();
+                }
+            }
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    resolved
 }

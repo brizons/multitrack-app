@@ -26,7 +26,7 @@ use io_cpal::CpalOutput;
 use library::Library;
 use play_cli::{
     Action, CONTROLS, KEY_BACKSPACE, KEY_ENTER, KEY_ESCAPE, SetlistAction, SetlistKeys,
-    action_for_key, device_list, item_label, setlist_location, setlist_problems,
+    action_for_key, device_list, item_cannot_play, setlist_location, setlist_problems,
     setlist_status_line, status_line,
 };
 
@@ -240,8 +240,8 @@ fn stop(session: &mut Session) {
     }
 }
 
-/// Opens the setlist, says what of it cannot play, checks the device and
-/// the terminal before any stream opens, then runs the controls until quit.
+/// Opens the setlist, says what of it cannot play, checks the terminal and
+/// the device before any stream opens, then runs the controls until quit.
 fn play_setlist(args: &Args, file: &Path) -> Result<(), Vec<String>> {
     let (root, name) = setlist_location(file).map_err(|error| vec![error])?;
     let library = Library::new(root);
@@ -258,14 +258,16 @@ fn play_setlist(args: &Args, file: &Path) -> Result<(), Vec<String>> {
             let _ = writeln!(stderr, "warning: {}", escape(&problem));
         }
     }
-    let output = CpalOutput::new();
-    if let OutputCheck::Refused(error) = prepared.check(&output) {
-        return Err(vec![error.to_string()]);
-    }
+    // The terminal first: whether it can run does not depend on the
+    // machine's audio devices.
     if !io::stdin().is_terminal() {
         return Err(vec![
             "play-cli reads single keys, so its standard input must be a terminal".to_owned(),
         ]);
+    }
+    let output = CpalOutput::new();
+    if let OutputCheck::Refused(error) = prepared.check(&output) {
+        return Err(vec![error.to_string()]);
     }
     let mut session = prepared.start(Box::new(output)).map_err(open_errors)?;
     print_setlist_header(&mut session);
@@ -385,14 +387,10 @@ fn setlist_errors(error: SetlistOpenError, library: &Library, file: &str) -> Vec
                 .unwrap_or_default();
             let mut lines = vec![headline];
             for (index, reasons) in problems.iter().enumerate() {
-                let name = match items.get(index) {
-                    Some(item) => format!("item {} (\"{}\")", index + 1, item_label(item)),
-                    None => format!("item {}", index + 1),
-                };
                 lines.extend(
                     reasons
                         .iter()
-                        .map(|reason| format!("{name} cannot play: {reason}")),
+                        .map(|reason| item_cannot_play(index, items.get(index), reason)),
                 );
             }
             lines

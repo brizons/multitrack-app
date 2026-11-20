@@ -437,3 +437,76 @@ fn a_setlist_file_is_found_in_the_setlists_folder_of_its_library() {
     let error = setlist_location(&elsewhere).unwrap_err();
     assert!(error.contains("is not in a Setlists folder"), "{error}");
 }
+
+#[test]
+fn delete_and_line_feed_act_as_backspace_and_enter() {
+    let mut keys = SetlistKeys::default();
+    let now = setlist_snapshot();
+    keys.key('g', &now);
+    keys.key('4', &now);
+    keys.key('2', &now);
+    assert_eq!(keys.key('\u{7f}', &now), None, "DEL deletes a digit");
+    assert_eq!(keys.entry(), Some("4"));
+    assert_eq!(keys.key('\n', &now), send(SetlistCommand::Select(3)));
+}
+
+#[test]
+fn dot_dot_in_a_setlist_path_is_resolved_by_name() {
+    let library = Path::new("music").join("Library");
+    for path in [
+        library
+            .join("Setlists")
+            .join("old")
+            .join("..")
+            .join("Sunday.setlist.json"),
+        library
+            .join("Setlists")
+            .join("..")
+            .join("Setlists")
+            .join("Sunday.setlist.json"),
+        library
+            .join("x")
+            .join("..")
+            .join("Setlists")
+            .join(".")
+            .join("Sunday.setlist.json"),
+    ] {
+        let (root, name) = setlist_location(&path).unwrap();
+        assert!(
+            root.ends_with(&library),
+            "{} -> {}",
+            path.display(),
+            root.display()
+        );
+        assert!(
+            root.components().all(|part| !matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )),
+            "{} -> {}",
+            path.display(),
+            root.display()
+        );
+        assert_eq!(name, "Sunday.setlist.json");
+    }
+    let parent_of_cwd = std::env::current_dir()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_owned();
+    let (root, _) =
+        setlist_location(&Path::new("..").join("Setlists").join("Sunday.setlist.json")).unwrap();
+    assert_eq!(
+        root, parent_of_cwd,
+        "a leading .. counts from the current folder"
+    );
+
+    let up = library
+        .join("Setlists")
+        .join("Sunday.setlist.json")
+        .join("..");
+    assert!(
+        setlist_location(&up).is_err(),
+        "a folder is not a setlist file"
+    );
+}
