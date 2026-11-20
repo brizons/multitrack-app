@@ -1,52 +1,61 @@
 //! The audio-thread side of a session.
 //!
-//! The [`Player`] and the writing end of the state snapshot travel together
-//! as one [`AudioState`]. While a device plays, an [`AudioRenderer`] owns it
+//! The [`Deck`] (the current item's player, and the next one when a setlist
+//! cues it) and the writing end of the state snapshot travel together as
+//! one [`AudioState`]. While a device plays, an [`AudioRenderer`] owns it
 //! on the audio thread; when the renderer is dropped (the stream closed or
 //! the device was lost), it hands the state back to the session through a
-//! one-slot `rtrb` queue instead of dropping it. The player is therefore
-//! only ever dropped on the control thread: dropping it drops the last
-//! streaming source, which joins the disk thread (advisory A6).
+//! one-slot `rtrb` queue instead of dropping it. The players are therefore
+//! only ever dropped on the control thread: dropping one drops its last
+//! streaming source, which joins the disk thread (advisory A6). The deck
+//! sends the players it no longer needs back the same way.
 
 use std::fmt;
 
-use engine::live::{Player, Status};
+use engine::live::{Deck, DeckStatus, Status};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 /// What the audio thread publishes after every buffer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Report {
-    /// The player's snapshot.
-    pub(crate) status: Status,
-    /// Whether every source can start playing from the playhead; always
-    /// true while the transport runs.
+    /// The deck's snapshot.
+    pub(crate) deck: DeckStatus,
+    /// Whether every source of the current item can start playing from the
+    /// playhead; always true while the transport runs.
     pub(crate) ready: bool,
-    /// Commands the player had applied: the report describes the state
-    /// every command sent up to this count left.
+    /// Messages the deck had applied: the report describes the state every
+    /// message sent up to this count left.
     pub(crate) applied: u64,
 }
 
-/// The player and the writing end of its snapshot.
+impl Report {
+    /// The current item's player.
+    pub(crate) fn status(&self) -> &Status {
+        &self.deck.current
+    }
+}
+
+/// The deck and the writing end of its snapshot.
 pub(crate) struct AudioState {
-    pub(crate) player: Player,
+    pub(crate) deck: Deck,
     pub(crate) reports: triple_buffer::Input<Report>,
 }
 
 impl AudioState {
     /// Renders `out` and publishes the result. Real-time safe.
     pub(crate) fn render(&mut self, out: &mut [f32]) {
-        self.player.process(out);
+        self.deck.process(out);
         self.publish();
     }
 
-    /// Publishes the player's state. Real-time safe: `Report` is plain data,
+    /// Publishes the deck's state. Real-time safe: `Report` is plain data,
     /// and the triple buffer neither allocates nor locks.
     pub(crate) fn publish(&mut self) {
-        let status = self.player.status();
-        let ready = status.transport.is_running() || self.player.playhead_ready();
-        let applied = self.player.applied_commands();
+        let deck = self.deck.status();
+        let ready = deck.current.transport.is_running() || self.deck.playhead_ready();
+        let applied = self.deck.applied_messages();
         self.reports.write(Report {
-            status,
+            deck,
             ready,
             applied,
         });
@@ -83,7 +92,7 @@ impl AudioRenderer {
 }
 
 impl Drop for AudioRenderer {
-    /// Hands the player back to its session rather than dropping it here,
+    /// Hands the deck back to its session rather than dropping it here,
     /// on what may be the audio thread. Pushing a box moves a pointer into a
     /// slot that already exists: nothing is allocated or freed.
     fn drop(&mut self) {

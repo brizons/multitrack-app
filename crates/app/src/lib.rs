@@ -14,15 +14,17 @@
 //! # Threads
 //!
 //! - The **control thread** owns the [`Session`]: commands travel to the
-//!   audio thread over the player's lock-free queue, and every snapshot is
-//!   read from a `triple_buffer` the audio thread writes.
+//!   audio thread over the deck's lock-free queue (`engine::live::Deck`),
+//!   and every snapshot is read from a `triple_buffer` the audio thread
+//!   writes.
 //! - The **audio thread** belongs to the output adapter. It calls
 //!   [`AudioRenderer::render`], which renders one buffer and publishes the
-//!   player's state: no allocation, no lock, no I/O.
+//!   deck's state: no allocation, no lock, no I/O.
 //! - The **disk thread** belongs to the streamed song (`library`).
 //!
-//! The player is only ever dropped on the control thread: a closed stream's
-//! renderer hands it back instead of dropping it, because dropping it joins
+//! A player is only ever dropped on the control thread: a closed stream's
+//! renderer hands the deck back instead of dropping it, and the deck hands
+//! back every player it no longer needs, because dropping one joins
 //! the disk thread.
 //!
 //! # Rules the session adds to the engine
@@ -55,6 +57,7 @@
 #![warn(missing_docs)]
 
 mod error;
+mod item;
 mod output;
 mod renderer;
 mod session;
