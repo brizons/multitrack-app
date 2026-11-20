@@ -123,14 +123,17 @@ fn names_that_are_not_removable_setlists_are_refused_and_nothing_moves() {
         (SETLIST_ORDER_FILE, "InvalidFileName"),
         (".hidden.setlist.json", "InvalidFileName"),
         ("", "InvalidFileName"),
-        ("Gone.setlist.json", "Read"),
-        ("Broken.setlist.json", "Format"),
+        ("Gone.setlist.json", "NotListed"),
+        // Names are compared exactly, case included, even where the disk
+        // ignores case.
+        ("a.setlist.json", "NotListed"),
+        ("BROKEN.setlist.json", "NotListed"),
     ] {
         let error = library.remove_setlist(file).unwrap_err();
         let kind = match error {
             SetlistError::InvalidFileName { .. } => "InvalidFileName",
             SetlistError::Read { .. } => "Read",
-            SetlistError::Format { .. } => "Format",
+            SetlistError::NotListed { .. } => "NotListed",
             ref other => panic!("{file:?}: {other}"),
         };
         assert_eq!(kind, refused, "{file:?}: {error}");
@@ -259,4 +262,47 @@ fn removing_with_the_system_trash_takes_the_file_out_of_the_folder() {
             .join("OpenVamp trash test.setlist.json")
             .exists()
     );
+}
+
+#[test]
+fn a_setlist_file_that_cannot_be_read_can_still_be_removed_from_the_list() {
+    let (dir, library) = library_with(&["A"]);
+    fs::write(folder(&dir).join("Broken.setlist.json"), "{ not json").unwrap();
+    assert_eq!(library.list_setlists().unwrap().unreadable.len(), 1);
+
+    let removed = library.remove_setlist("Broken.setlist.json").unwrap();
+
+    assert_eq!(removed.file, "Broken.setlist.json");
+    assert_eq!(removed.name, "Broken.setlist.json", "named by its file");
+    let listing = library.list_setlists().unwrap();
+    assert!(listing.unreadable.is_empty());
+    assert_eq!(names(&listing), ["A"]);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("Trash/Broken.setlist.json")).unwrap(),
+        "{ not json"
+    );
+}
+
+#[test]
+fn a_setlist_file_name_is_found_as_the_folder_lists_it() {
+    let (dir, library) = library_with(&["Bravo"]);
+    assert_eq!(
+        library.listed_setlist_file("Bravo.setlist.json").unwrap(),
+        Some("Bravo.setlist.json".to_owned())
+    );
+    assert_eq!(
+        library.listed_setlist_file("Gone.setlist.json").unwrap(),
+        None
+    );
+    let other_case = library.listed_setlist_file("bravo.setlist.json").unwrap();
+    if folder(&dir).join("bravo.setlist.json").exists() {
+        // A file system that ignores case: the same file, as listed.
+        assert_eq!(other_case, Some("Bravo.setlist.json".to_owned()));
+    } else {
+        assert_eq!(other_case, None);
+    }
+    assert!(matches!(
+        library.listed_setlist_file("../Bravo.setlist.json"),
+        Err(SetlistError::InvalidFileName { .. })
+    ));
 }

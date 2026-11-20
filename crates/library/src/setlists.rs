@@ -284,6 +284,16 @@ pub enum SetlistError {
         /// Why its place could not be stored.
         reason: String,
     },
+    /// No setlist file of the [`SETLISTS_FOLDER`] is listed with exactly
+    /// this name; names are compared as the folder lists them, case
+    /// included, also where the disk ignores case.
+    #[error(
+        "no setlist file is listed as \"{file}\" in the {SETLISTS_FOLDER} folder (names are compared exactly, case included)"
+    )]
+    NotListed {
+        /// The name asked for.
+        file: String,
+    },
     /// The trash refused the setlist file, which stays where it was.
     #[error("cannot move {} to the trash: {source}", path.display())]
     Trash {
@@ -424,22 +434,33 @@ impl Library {
     /// Removes the setlist in `file` from the library's list (F5.1, L33) by
     /// moving its file to the system trash, where it can be restored; it is
     /// never deleted. `file` must be a setlist file name as for
-    /// [`Library::load_setlist`], and the file must resolve inside the
-    /// [`SETLISTS_FOLDER`], be a regular file and hold a readable setlist;
-    /// otherwise nothing moves. A stored order loses its entry and keeps the
+    /// [`Library::load_setlist`], spelled exactly as the folder lists it
+    /// ([`SetlistError::NotListed`] otherwise, also where the disk ignores
+    /// case), and the file must resolve inside the [`SETLISTS_FOLDER`],
+    /// links included, and be a regular file; otherwise nothing moves. It
+    /// need not read as a setlist: a broken file, listed as unreadable, can
+    /// be removed too, and is then named by its file. A stored order loses its entry and keeps the
     /// rest. When the file is in the trash but the order cannot be written,
     /// [`SetlistError::RemovedOrderNotUpdated`] says so; the name left in
     /// the order names no file, so it is ignored.
     pub fn remove_setlist(&self, file: &str) -> Result<SetlistEntry, SetlistError> {
         check_file_name(file)?;
         let folder = self.existing_setlists_folder(file)?;
-        // The same checks as reading it: inside the folder, a regular file,
-        // a setlist.
-        let setlist = read_setlist(&folder, file)?;
+        // Exactly as listed: on a disk that ignores case another spelling
+        // would reach the same file under a name the order does not hold.
+        if !listed_file_names(&folder)?.iter().any(|name| name == file) {
+            return Err(SetlistError::NotListed {
+                file: file.to_owned(),
+            });
+        }
+        check_regular_inside(&folder, file)?;
+        // A file that does not read as a setlist is removed all the same,
+        // named by its file.
+        let name = read_setlist(&folder, file).map_or_else(|_| file.to_owned(), |s| s.name);
         let path = folder.join(file);
         (self.trash)(&path).map_err(|source| SetlistError::Trash { path, source })?;
         let removed = SetlistEntry {
-            name: setlist.name,
+            name,
             file: file.to_owned(),
         };
         match update_order(&folder, |order| order.retain(|listed| listed != file)) {
@@ -449,6 +470,32 @@ impl Library {
                 reason: error.to_string(),
             }),
         }
+    }
+
+    /// The name the [`SETLISTS_FOLDER`] lists for the setlist file `file`:
+    /// `file` itself when it is listed so, else the listed name of the
+    /// same file spelled otherwise (another case, or another Unicode
+    /// normalization, on a file system that ignores them), or `None` when
+    /// no listed setlist file is that file.
+    pub fn listed_setlist_file(&self, file: &str) -> Result<Option<String>, SetlistError> {
+        check_file_name(file)?;
+        let Some(folder) = self.setlists_folder()? else {
+            return Ok(None);
+        };
+        let listed = listed_file_names(&folder)?;
+        if listed.iter().any(|name| name == file) {
+            return Ok(Some(file.to_owned()));
+        }
+        let path = folder.join(file);
+        if !entry_exists(&path)? {
+            return Ok(None);
+        }
+        for name in listed {
+            if same_entry(file, &path, &name, &folder.join(&name))? {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
     }
 
     /// Reads the setlist file `file`, a file name inside the
@@ -680,6 +727,41 @@ fn check_file_name(file: &str) -> Result<(), SetlistError> {
         Err(SetlistError::InvalidFileName {
             file: file.to_owned(),
         })
+    }
+}
+
+/// The setlist file names the folder `folder` (canonical) lists, as
+/// [`Library::list_setlists`] takes them: valid setlist file names in UTF-8.
+fn listed_file_names(folder: &Path) -> Result<Vec<String>, SetlistError> {
+    let folder_error = |source| SetlistError::Folder {
+        path: folder.to_owned(),
+        source,
+    };
+    let mut names = Vec::new();
+    for found in fs::read_dir(folder).map_err(folder_error)? {
+        if let Ok(name) = found.map_err(folder_error)?.file_name().into_string()
+            && is_setlist_file_name(&name)
+        {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Checks that `file` (already checked by [`check_file_name`]) resolves
+/// inside `folder` (canonical), links included, and is a regular file,
+/// without opening it, so a FIFO cannot block.
+fn check_regular_inside(folder: &Path, file: &str) -> Result<(), SetlistError> {
+    let path = folder.join(file);
+    let resolved = match resolve_inside(folder, file) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return Err(SetlistError::OutsideLibrary { path }),
+        Err(source) => return Err(SetlistError::Read { path, source }),
+    };
+    match fs::metadata(&resolved) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(SetlistError::NotAFile { path }),
+        Err(source) => Err(SetlistError::Read { path, source }),
     }
 }
 
