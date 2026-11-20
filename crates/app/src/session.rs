@@ -296,15 +296,100 @@ pub struct Session {
     sent: u64,
 }
 
+/// A song folder opened for streaming with its player built, ready to play
+/// but on no device yet ([`Session::prepare`]). It holds the disk thread
+/// and the player's buffers, nothing more: preparing the next song while
+/// another one plays leaves that one's device alone, and
+/// [`Self::start`] opens the device once it is free.
+pub struct PreparedSong {
+    info: SongInfo,
+    controller: Controller,
+    reports: triple_buffer::Output<Report>,
+    monitor: DiskMonitor,
+    state: Box<AudioState>,
+    request: OutputRequest,
+    start_timeout: Duration,
+    reconnect_interval: Duration,
+}
+
+impl PreparedSong {
+    /// The song and the arrangement it will play.
+    pub fn song(&self) -> &SongInfo {
+        &self.info
+    }
+
+    /// Opens the output device at the song's sample rate and starts the
+    /// session, stopped at the start. When the device does not open, the
+    /// prepared song is dropped and the error says why.
+    pub fn start(self, mut output: Box<dyn AudioOutput>) -> Result<Session, OpenError> {
+        let Self {
+            info,
+            controller,
+            reports,
+            monitor,
+            state,
+            request,
+            start_timeout,
+            reconnect_interval,
+        } = self;
+        let (renderer, home) = AudioRenderer::new(state);
+        let (stream, request) = match output.open(&request, renderer) {
+            Ok(stream) => {
+                // Come back to this very device when it is lost, by its id:
+                // not to whatever the default output is by then, nor to
+                // another device with the same name.
+                let request = OutputRequest {
+                    device: Some(DeviceChoice::Id(stream.info().device_id.clone())),
+                    ..request
+                };
+                (stream, request)
+            }
+            Err(error) => {
+                drop(take_back(home));
+                return Err(error.into());
+            }
+        };
+
+        Ok(Session {
+            song: info,
+            output,
+            request,
+            device: stream.info().device.clone(),
+            controller,
+            reports,
+            monitor,
+            link: Link::Streaming { stream, home },
+            start: None,
+            start_timeout,
+            reconnect_interval,
+            fade_duration: Duration::from_secs(u64::from(DEFAULT_FADE_SECONDS)),
+            last_error: None,
+            decode_errors_seen: 0,
+            deferral_seen: None,
+            sent: 0,
+        })
+    }
+}
+
 impl Session {
     /// Opens the song folder `song_dir` for streaming, builds the player
     /// for `options.arrangement`, and opens the output device at the song's
-    /// sample rate. The transport starts stopped.
+    /// sample rate. The transport starts stopped. It is
+    /// [`Self::prepare`] followed by [`PreparedSong::start`].
     pub fn open(
         song_dir: &Path,
-        mut output: Box<dyn AudioOutput>,
+        output: Box<dyn AudioOutput>,
         options: SessionOptions,
     ) -> Result<Self, OpenError> {
+        Self::prepare(song_dir, options)?.start(output)
+    }
+
+    /// Opens the song folder `song_dir` for streaming and builds the player
+    /// for `options.arrangement`, without touching any device: every check
+    /// of the song, the buffer size and the arrangement happens here, so
+    /// only the device itself can still refuse it in
+    /// [`PreparedSong::start`].
+    pub fn prepare(song_dir: &Path, options: SessionOptions) -> Result<PreparedSong, OpenError> {
         let buffer_frames = options.buffer_frames;
         if !(MIN_BUFFER_FRAMES..=MAX_BUFFER_FRAMES).contains(&buffer_frames) {
             return Err(OpenError::BufferSize {
@@ -364,41 +449,15 @@ impl Session {
             sample_rate,
             buffer_frames,
         };
-        let (renderer, home) = AudioRenderer::new(state);
-        let (stream, request) = match output.open(&request, renderer) {
-            Ok(stream) => {
-                // Come back to this very device when it is lost, by its id:
-                // not to whatever the default output is by then, nor to
-                // another device with the same name.
-                let request = OutputRequest {
-                    device: Some(DeviceChoice::Id(stream.info().device_id.clone())),
-                    ..request
-                };
-                (stream, request)
-            }
-            Err(error) => {
-                drop(take_back(home));
-                return Err(error.into());
-            }
-        };
-
-        Ok(Self {
-            song: info,
-            output,
-            request,
-            device: stream.info().device.clone(),
+        Ok(PreparedSong {
+            info,
             controller,
             reports,
             monitor,
-            link: Link::Streaming { stream, home },
-            start: None,
+            state,
+            request,
             start_timeout: options.start_timeout,
             reconnect_interval: options.reconnect_interval,
-            fade_duration: Duration::from_secs(u64::from(DEFAULT_FADE_SECONDS)),
-            last_error: None,
-            decode_errors_seen: 0,
-            deferral_seen: None,
-            sent: 0,
         })
     }
 
