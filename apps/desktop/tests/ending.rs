@@ -3,8 +3,8 @@
 //! rules (its command is in view_model.rs).
 
 use app::TransportState;
-use multitrack_desktop::action::{Intent, UiAction, is_playing};
-use multitrack_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
+use openvamp_desktop::action::{Intent, UiAction, is_playing};
+use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
 
 const ALL: [TransportState; 7] = [
     TransportState::Stopped,

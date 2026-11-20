@@ -1,5 +1,5 @@
 [package]
-name = "multitrack-desktop"
+name = "openvamp"
 description = "Desktop shell for Mac, Windows and Linux: the Perform screen drawn with GPUI, calling the app crate directly."
 version.workspace = true
 edition.workspace = true
@@ -8,11 +8,11 @@ publish.workspace = true
 license.workspace = true
 
 [lib]
-name = "multitrack_desktop"
+name = "openvamp_desktop"
 path = "src/lib.rs"
 
 [[bin]]
-name = "multitrack-desktop"
+name = "openvamp"
 path = "src/main.rs"
 
 [dependencies]

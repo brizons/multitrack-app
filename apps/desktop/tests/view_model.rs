@@ -10,13 +10,13 @@ use app::{
     OpenError, OutputError, PositionInfo, QueuedView, RuntimeError, Snapshot, SongInfo,
     SongProblem, StreamInfo, TransportState,
 };
-use multitrack_desktop::action::{UiAction, command_for};
-use multitrack_desktop::hold::{PANIC_HOLD, PanicHold};
-use multitrack_desktop::keys::{
+use openvamp_desktop::action::{UiAction, command_for};
+use openvamp_desktop::hold::{PANIC_HOLD, PanicHold};
+use openvamp_desktop::keys::{
     HeldKeys, KeyAction, KeyPlatform, KeyPress, Mods, PANIC_KEY, SECONDARY_IS_PLATFORM,
     is_panic_key, key_down,
 };
-use multitrack_desktop::view::{Level, PerformView, SectionKind, open_error_lines, short_label};
+use openvamp_desktop::view::{Level, PerformView, SectionKind, open_error_lines, short_label};
 
 const RATE: u32 = 48_000;
 const SECTION: u64 = 96_000;

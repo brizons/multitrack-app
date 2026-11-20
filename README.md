@@ -36,13 +36,13 @@ cargo test --workspace
 Write a demo song folder:
 
 ```bash
-cargo run -p multitrack-desktop --example demo_song -- <DIR>
+cargo run -p openvamp --example demo_song -- <DIR>
 ```
 
 Open it in the desktop app:
 
 ```bash
-cargo run -p multitrack-desktop --release -- <DIR>
+cargo run -p openvamp --release -- <DIR>
 ```
 
 Play it from the terminal:

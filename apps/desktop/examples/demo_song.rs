@@ -1,7 +1,7 @@
 //! Writes a demo song folder to try the Perform screen with:
 //!
 //! ```text
-//! cargo run -p multitrack-desktop --example demo_song -- <DIR>
+//! cargo run -p openvamp --example demo_song -- <DIR>
 //! ```
 //!
 //! 48 kHz, 120 bpm in 4/4 (a bar is 2 s). Seven sections (intro, verse 1,
@@ -72,7 +72,7 @@ fn write(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let package = SongPackage {
         format_version: 1,
         title: "Demo Song".to_owned(),
-        artist: Some("Multitrack".to_owned()),
+        artist: Some("OpenVamp".to_owned()),
         sample_rate: RATE,
         key: None,
         tempo_map: vec![TempoPoint { at: 0, bpm: 120.0 }],

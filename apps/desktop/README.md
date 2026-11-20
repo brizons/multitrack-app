@@ -1,9 +1,9 @@
-# multitrack-desktop
+# OpenVamp desktop app
 
 The desktop shell for Mac, Windows and Linux: the Perform screen from the design canvas, drawn with GPUI (`gpui` 0.2.2) and calling the `app` crate directly. It plays one song folder on the system's default audio output, at the song's sample rate.
 
 ```text
-multitrack-desktop [SONG_DIR]
+openvamp [SONG_DIR]
 ```
 
 `SONG_DIR` is a song folder: `song.json` and the WAV stems it lists; its `default` arrangement plays. Without it, the screen offers **Open song…** (also Cmd-O on the Mac, Ctrl-O elsewhere). `--help` prints the usage; any other option, or a second argument, is named in the error and exits with code 2. A window that cannot open exits with code 1.
@@ -11,8 +11,8 @@ multitrack-desktop [SONG_DIR]
 To try it without a song of your own, write the demo song (48 kHz, 8 positions, 48 s, one quiet chord stem) and open it:
 
 ```console
-$ cargo run -p multitrack-desktop --example demo_song -- /tmp/demo-song
-$ cargo run -p multitrack-desktop -- /tmp/demo-song
+$ cargo run -p openvamp --example demo_song -- /tmp/demo-song
+$ cargo run -p openvamp -- /tmp/demo-song
 ```
 
 ## The Perform screen
@@ -59,4 +59,4 @@ The same single keys as `play-cli`; letters work in either case, and a key held 
 
 On macOS, GPUI's `runtime_shaders` feature compiles the Metal shaders when the app starts, so the build needs no Metal Toolchain (Xcode 26 ships it as a separate download). The screen uses the system UI font, and Menlo, Consolas or DejaVu Sans Mono for times and keys; the canvas's Barlow and JetBrains Mono are not bundled.
 
-The view-model (`src/view.rs`, `src/action.rs`, `src/hold.rs`, `src/keys.rs`, `src/song.rs`, `src/ending.rs`) holds every decision the screen makes and is tested without a window (`cargo test -p multitrack-desktop`); the GPUI code (`src/screen.rs`, `src/ui.rs`) only draws it and dispatches.
+The view-model (`src/view.rs`, `src/action.rs`, `src/hold.rs`, `src/keys.rs`, `src/song.rs`, `src/ending.rs`) holds every decision the screen makes and is tested without a window (`cargo test -p openvamp`); the GPUI code (`src/screen.rs`, `src/ui.rs`) only draws it and dispatches.

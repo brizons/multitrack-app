@@ -19,9 +19,7 @@ use domain::{
     TimeSignaturePoint,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
-use multitrack_desktop::song::{
-    Closing, STOP_POLL, STOP_WAIT, Song, close, replace, stop_and_wait,
-};
+use openvamp_desktop::song::{Closing, STOP_POLL, STOP_WAIT, Song, close, replace, stop_and_wait};
 
 const RATE: u32 = 8_000;
 const FRAMES: usize = 256;

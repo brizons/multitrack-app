@@ -7,12 +7,12 @@ use gpui::{
     AnyElement, App, ClickEvent, Context, Div, ElementId, FocusHandle, FontWeight, IntoElement,
     MouseButton, Rgba, SharedString, Stateful, Window, div, prelude::*, px, relative, svg,
 };
-use multitrack_desktop::action::UiAction;
-use multitrack_desktop::view::{
+use openvamp_desktop::action::UiAction;
+use openvamp_desktop::view::{
     FadeButton, Level, NextCard, NowCard, Pad, PerformView, SongMap, StatusView, TransportView,
 };
 
-use multitrack_desktop::action::Intent;
+use openvamp_desktop::action::Intent;
 
 use crate::screen::Perform;
 use crate::theme;
@@ -166,6 +166,7 @@ fn header(view: &PerformView, hold: f32, cx: &mut Context<Perform>) -> impl Into
         .pb(px(12.))
         .border_b_1()
         .border_color(theme::divider())
+        .child(brand_mark())
         .child(
             chip_button("open", cx, Intent::OpenSong)
                 .child(icon("folder", theme::text_muted(), 20.))
@@ -850,6 +851,37 @@ fn on_click(
     intent: Intent,
 ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
     cx.listener(move |screen, _, window, cx| screen.handle(intent, window, cx))
+}
+
+/// The OpenVamp mark and name: the loop in the brand color with the play
+/// shape inside, drawn as two tinted icons because GPUI tints a whole SVG.
+fn brand_mark() -> impl IntoElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .child(
+            div()
+                .relative()
+                .size(px(28.))
+                .child(
+                    div()
+                        .absolute()
+                        .child(icon("openvamp-loop", theme::brand(), 28.)),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .child(icon("openvamp-play", theme::text(), 28.)),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(15.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("OpenVamp"),
+        )
 }
 
 fn icon(name: &str, color: Rgba, size: f32) -> impl IntoElement {

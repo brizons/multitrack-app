@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 
 use gpui::{AssetSource, Result, Rgba, SharedString, rgb, rgba};
-use multitrack_desktop::view::SectionKind;
+use openvamp_desktop::view::SectionKind;
 
 /// Window background.
 pub fn bg() -> Rgba {
@@ -33,6 +33,10 @@ pub fn divider() -> Rgba {
 /// Main text.
 pub fn text() -> Rgba {
     rgb(0xECEEF1)
+}
+/// The OpenVamp mark's loop (docs/brand).
+pub fn brand() -> Rgba {
+    rgb(0x2DD4BF)
 }
 /// Secondary text.
 pub fn text_muted() -> Rgba {
@@ -141,6 +145,14 @@ const ICONS: &[(&str, &[u8])] = &[
     (
         "icons/next-bar.svg",
         include_bytes!("../assets/icons/next-bar.svg"),
+    ),
+    (
+        "icons/openvamp-loop.svg",
+        include_bytes!("../assets/icons/openvamp-loop.svg"),
+    ),
+    (
+        "icons/openvamp-play.svg",
+        include_bytes!("../assets/icons/openvamp-play.svg"),
     ),
     (
         "icons/panic.svg",
