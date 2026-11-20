@@ -10,7 +10,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  # Superseded pull request runs are cancelled; every commit on main keeps its result.
+  # A newer push cancels a pull request's running CI; runs on main are not cancelled,
+  # though GitHub keeps only the newest pending run per branch.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -29,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the pinned Rust toolchain
-        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal --component rustfmt
+        run: rustup toolchain install "$(tr -d '\r' < rust-toolchain.toml | sed -n 's/^channel = "\([^"]*\)".*/\1/p')" --profile minimal --component rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -53,7 +54,7 @@ jobs:
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libx11-xcb-dev libxcb1-dev libvulkan-dev
       - name: Install the pinned Rust toolchain
-        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal --component clippy
+        run: rustup toolchain install "$(tr -d '\r' < rust-toolchain.toml | sed -n 's/^channel = "\([^"]*\)".*/\1/p')" --profile minimal --component clippy
       - name: Cache cargo registry and build output
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
