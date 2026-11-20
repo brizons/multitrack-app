@@ -963,3 +963,44 @@ fn hostile_values_are_rejected_without_panicking() {
         );
     }
 }
+
+/// The stem-path, bpm, and time-signature rules are shared with setlists; the
+/// package still reports them exactly as before.
+#[test]
+fn rules_shared_with_setlists_keep_their_package_errors_and_messages() {
+    let mut package = spec_package();
+    package.stems[0].file = "../drums.flac".into();
+    package.tempo_map[0].bpm = 1_000.0;
+    package.time_signature_map[0].numerator = 0;
+    package.time_signature_map[0].denominator = 3;
+    let errors = errors_of(&package, &spec_infos());
+    assert_eq!(
+        errors,
+        [
+            ValidationError::InvalidStemPath {
+                id: "drums".into(),
+                file: "../drums.flac".into(),
+                problem: StemPathProblem::ParentDirectory
+            },
+            ValidationError::InvalidBpm {
+                at: 0,
+                bpm: 1_000.0
+            },
+            ValidationError::InvalidNumerator { at: 0 },
+            ValidationError::InvalidDenominator {
+                at: 0,
+                denominator: 3
+            },
+        ]
+    );
+    let messages: Vec<String> = errors.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        messages,
+        [
+            "stem \"drums\" file \"../drums.flac\" has a \"..\" component; it must be a relative path inside the song folder",
+            "tempoMap entry at 0 has bpm 1000; bpm must be from 1 to 999",
+            "timeSignatureMap entry at 0 has numerator 0; it must be at least 1",
+            "timeSignatureMap entry at 0 has denominator 3; it must be 1, 2, 4, 8, 16, or 32",
+        ]
+    );
+}

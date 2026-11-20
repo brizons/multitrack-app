@@ -199,11 +199,12 @@ impl SongPackage {
     }
 }
 
-/// The one field every manifest version shares; read before the rest.
+/// The one field every manifest version shares; read before the rest. Setlist
+/// files share it too.
 #[derive(Deserialize)]
-struct VersionHeader {
+pub(crate) struct VersionHeader {
     #[serde(rename = "formatVersion")]
-    format_version: u32,
+    pub(crate) format_version: u32,
 }
 
 /// Longest accepted song, and longest accepted arrangement (every repeat
@@ -626,8 +627,9 @@ fn check_stems<'a>(
 }
 
 /// A stem path must stay inside the song folder on every platform, so both
-/// `/` and `\` separate components and drive prefixes count as absolute.
-fn stem_path_problem(file: &str) -> Option<StemPathProblem> {
+/// `/` and `\` separate components and drive prefixes count as absolute. A
+/// setlist's song paths follow the same rule inside the library folder.
+pub(crate) fn stem_path_problem(file: &str) -> Option<StemPathProblem> {
     let bytes = file.as_bytes();
     let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
     if file.is_empty() {
@@ -688,11 +690,28 @@ fn check_positions(
     }
 }
 
+/// Whether `bpm` is a finite tempo from [`MIN_BPM`] to [`MAX_BPM`]; NaN and
+/// infinities fall outside the range. Setlist click tiles share the rule.
+pub(crate) fn bpm_in_range(bpm: f64) -> bool {
+    (MIN_BPM..=MAX_BPM).contains(&bpm)
+}
+
+/// Whether a time signature has at least one beat per bar. Setlist click tiles
+/// share the rule.
+pub(crate) fn numerator_valid(numerator: u32) -> bool {
+    numerator >= 1
+}
+
+/// Whether a time-signature denominator is 1, 2, 4, 8, 16, or 32. Setlist
+/// click tiles share the rule.
+pub(crate) fn denominator_valid(denominator: u32) -> bool {
+    matches!(denominator, 1 | 2 | 4 | 8 | 16 | 32)
+}
+
 fn check_tempo_map(map: &[TempoPoint], errors: &mut Vec<ValidationError>) {
     check_positions(MapKind::Tempo, map.iter().map(|point| point.at), errors);
     for point in map {
-        // NaN and infinities fall outside the range too.
-        if !(MIN_BPM..=MAX_BPM).contains(&point.bpm) {
+        if !bpm_in_range(point.bpm) {
             errors.push(ValidationError::InvalidBpm {
                 at: point.at,
                 bpm: point.bpm,
@@ -708,10 +727,10 @@ fn check_time_signature_map(map: &[TimeSignaturePoint], errors: &mut Vec<Validat
         errors,
     );
     for point in map {
-        if point.numerator == 0 {
+        if !numerator_valid(point.numerator) {
             errors.push(ValidationError::InvalidNumerator { at: point.at });
         }
-        if !matches!(point.denominator, 1 | 2 | 4 | 8 | 16 | 32) {
+        if !denominator_valid(point.denominator) {
             errors.push(ValidationError::InvalidDenominator {
                 at: point.at,
                 denominator: point.denominator,
