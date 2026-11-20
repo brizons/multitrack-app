@@ -108,7 +108,8 @@ pub struct Status {
     pub jump_timing: JumpTiming,
     /// Whether the current position repeats until switched off.
     pub infinite: bool,
-    /// Fade of the `track` stems.
+    /// The operator's fade of the `track` stems. An end fade set with
+    /// `Player::set_end_fade` is a separate gain and does not show here.
     pub fade: FadeStatus,
     /// Whether the generated click is on.
     pub click: bool,
