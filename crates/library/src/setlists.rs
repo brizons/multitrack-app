@@ -255,7 +255,7 @@ pub enum SetlistError {
         reason: String,
     },
     /// A setlist was asked to move past the end of the list.
-    #[error("cannot move a setlist to place {}: the library lists {len} setlists", .to + 1)]
+    #[error("cannot move a setlist to place {}: the library lists {len} setlists", .to.saturating_add(1))]
     MoveOutOfRange {
         /// The place asked for, counted from 0.
         to: usize,

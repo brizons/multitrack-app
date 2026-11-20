@@ -435,3 +435,17 @@ fn a_setlist_saved_whose_place_cannot_be_stored_says_it_was_saved() {
     assert_eq!(listed(&library), ["B", "B copy", "C", "Zed"]);
     assert_eq!(fs::read(order_path(&dir)).unwrap(), order);
 }
+
+#[test]
+fn a_move_far_past_the_end_is_refused_without_overflow() {
+    let (_dir, library) = library_with(&["A", "B"]);
+    let error = library
+        .move_setlist("A.setlist.json", usize::MAX)
+        .unwrap_err();
+    assert!(matches!(error, SetlistError::MoveOutOfRange { .. }));
+    assert!(
+        error
+            .to_string()
+            .starts_with("cannot move a setlist to place ")
+    );
+}
