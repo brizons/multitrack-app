@@ -4,7 +4,10 @@
 //! with the `domain` crate, and decodes every stem to `f32` for the engine.
 //! [`open_streaming`] checks the same folder but streams the stems from disk
 //! for the live player, with memory that does not grow with song length.
-//! [`write_wav_stereo_f32`] writes a rendered mix.
+//! [`write_wav_stereo_f32`] writes a rendered mix. A [`Library`] keeps the
+//! setlists of a library folder as `*.setlist.json` files in its
+//! [`SETLISTS_FOLDER`]: it lists, loads, saves, renames and duplicates them,
+//! never leaving a half-written file or overwriting another setlist.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -25,8 +28,13 @@ use engine::StemAudio;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use thiserror::Error;
 
+mod setlists;
 mod stream;
 
+pub use setlists::{
+    Library, MAX_SETLIST_FILE_BYTES, SETLIST_EXTENSION, SETLISTS_FOLDER, SetlistEntry,
+    SetlistError, SetlistListing, UnreadableSetlist,
+};
 pub use stream::{DiskMonitor, Gate, StreamCapacity, StreamConfig, StreamingSong, open_streaming};
 
 /// Name of the manifest inside a song folder.
