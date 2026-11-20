@@ -200,8 +200,10 @@ struct Counters {
     running: AtomicBool,
 }
 
-/// Watches the disk thread of a streamed song, from any thread.
-#[derive(Debug, Clone)]
+/// Watches the disk thread of a streamed song, from any thread. The
+/// [`Default`] monitor watches no thread: it is idle and never running, for
+/// something that streams nothing, such as a click-only tile.
+#[derive(Debug, Clone, Default)]
 pub struct DiskMonitor {
     counters: Arc<Counters>,
 }
