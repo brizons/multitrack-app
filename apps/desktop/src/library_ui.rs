@@ -74,6 +74,9 @@ pub fn library(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElemen
         .when_some(view.notice.clone(), |page, notice| {
             page.child(notice_banner(notice, cx))
         })
+        .when_some(view.warning.clone(), |page, warning| {
+            page.child(warning_line(warning, cx))
+        })
         .child(
             div()
                 .flex_1()
@@ -122,6 +125,37 @@ fn notice_banner(notice: String, cx: &mut Context<Perform>) -> impl IntoElement 
             small_square("dismiss-notice", cx, act(LibraryAction::DismissNotice)).child(icon(
                 "close",
                 theme::danger_text(),
+                18.,
+            )),
+        )
+}
+
+/// Something done that is not quite whole, such as a setlist saved
+/// without its place in the stored order: a warning, not a failure.
+fn warning_line(warning: String, cx: &mut Context<Perform>) -> impl IntoElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .px(px(14.))
+        .py(px(8.))
+        .bg(theme::queued_bg())
+        .border_1()
+        .border_color(theme::queued_border())
+        .rounded(px(14.))
+        .text_size(px(13.))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(theme::queued())
+                .child(warning),
+        )
+        .child(
+            small_square("dismiss-warning", cx, act(LibraryAction::DismissNotice)).child(icon(
+                "close",
+                theme::queued(),
                 18.,
             )),
         )

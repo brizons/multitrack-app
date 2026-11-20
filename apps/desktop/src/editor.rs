@@ -11,6 +11,8 @@ use domain::{
 };
 use library::{Library, SetlistError};
 
+use crate::shelf::saved;
+
 /// A click-only tile as the editor adds it: 120 BPM in 4/4, until the
 /// operator moves on.
 pub fn new_click() -> ClickItem {
@@ -134,41 +136,44 @@ impl SetlistEditor {
         &self.problems
     }
 
-    /// Makes `edit` and saves the setlist; on an error nothing changes.
-    pub fn apply(&mut self, edit: Edit) -> Result<(), EditError> {
+    /// Makes `edit` and saves the setlist; on an error nothing changes. A
+    /// warning comes back when the setlist was saved but its place in the
+    /// stored order was not ([`crate::shelf::saved`]).
+    pub fn apply(&mut self, edit: Edit) -> Result<Option<String>, EditError> {
         let mut changed = self.setlist.clone();
         apply(&mut changed, edit)?;
-        self.save(&changed)?;
+        let warning = self.save(&changed)?;
         self.setlist = changed;
         self.check();
-        Ok(())
+        Ok(warning)
     }
 
     /// Renames the setlist (F5.1), moving its file to the one the new name
-    /// maps to.
-    pub fn rename(&mut self, name: &str) -> Result<(), SetlistError> {
-        let entry = self.library.rename_setlist(&self.file, name)?;
+    /// maps to; a warning comes back as for [`Self::apply`].
+    pub fn rename(&mut self, name: &str) -> Result<Option<String>, SetlistError> {
+        let (entry, warning) = saved(self.library.rename_setlist(&self.file, name))?;
         self.file = entry.file;
         self.setlist.name = entry.name;
         self.in_place = true;
         self.check();
-        Ok(())
+        Ok(warning)
     }
 
     /// Writes `setlist` to the file its name maps to. The first time, a
     /// file named otherwise (by hand) is moved there first, so saving does
     /// not leave the old file behind.
-    fn save(&mut self, setlist: &Setlist) -> Result<(), SetlistError> {
+    fn save(&mut self, setlist: &Setlist) -> Result<Option<String>, SetlistError> {
+        let mut moved = None;
         if !self.in_place {
-            let entry = self
-                .library
-                .rename_setlist(&self.file, &self.setlist.name)?;
+            let (entry, warning) =
+                saved(self.library.rename_setlist(&self.file, &self.setlist.name))?;
             self.file = entry.file;
             self.in_place = true;
+            moved = warning;
         }
-        let entry = self.library.save_setlist(setlist)?;
+        let (entry, warning) = saved(self.library.save_setlist(setlist))?;
         self.file = entry.file;
-        Ok(())
+        Ok(warning.or(moved))
     }
 
     /// Checks the setlist against the songs the library holds now.

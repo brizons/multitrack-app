@@ -698,3 +698,67 @@ fn an_order_that_cannot_be_used_is_reported_and_setlists_are_listed_by_name() {
         "{problem}"
     );
 }
+
+/// Fills every name the library's temporary file for `Setlists/order.json`
+/// can take (`.order.json.<pid>-<n>.tmp`, n from 0 to 99) with a folder, so
+/// storing the order fails while setlists are still written.
+fn block_order_writes(root: &Path) {
+    for attempt in 0..100 {
+        let name = format!(".order.json.{}-{attempt}.tmp", std::process::id());
+        fs::create_dir(root.join("Setlists").join(name)).unwrap();
+    }
+}
+
+#[test]
+fn a_setlist_saved_whose_place_cannot_be_stored_is_listed_with_a_warning() {
+    let dir = library();
+    for name in ["A", "B"] {
+        save(dir.path(), name, Vec::new());
+    }
+    let mut page = LibraryPage::open(dir.path(), None).unwrap();
+    page.act(LibraryAction::MoveSetlistDown(0));
+    assert_eq!(setlist_names(&page), ["B", "A"]);
+    block_order_writes(dir.path());
+
+    page.act(LibraryAction::NewSetlist);
+    assert_eq!(page.notice(), None, "not a failed edit");
+    let warning = page.view(None).warning.expect("a warning shows");
+    assert!(
+        warning.starts_with("setlist \"New setlist\" was saved as New setlist.setlist.json"),
+        "{warning}"
+    );
+    assert_eq!(page.selected_file(), Some("New setlist.setlist.json"));
+    assert_eq!(page.typing(), Some(Field::Rename));
+    // Not in the stored order, it has no place to keep when renamed.
+    rename_to(&mut page, "Sunday");
+    assert_eq!(page.notice(), None);
+    assert_eq!(page.selected_file(), Some("Sunday.setlist.json"));
+    assert_eq!(setlist_names(&page), ["B", "A", "Sunday"]);
+
+    // In the stored order, renaming and duplicating warn the same way.
+    page.act(LibraryAction::SelectSetlist(1));
+    page.act(LibraryAction::RenameSetlist);
+    rename_to(&mut page, "Zed");
+    assert_eq!(page.notice(), None);
+    assert_eq!(page.selected_file(), Some("Zed.setlist.json"));
+    let warning = page.view(None).warning.unwrap();
+    assert!(
+        warning.starts_with("setlist \"Zed\" was saved"),
+        "{warning}"
+    );
+
+    page.act(LibraryAction::SelectSetlist(0));
+    page.act(LibraryAction::DuplicateSetlist);
+    page.stop_typing();
+    assert_eq!(page.notice(), None);
+    assert_eq!(page.selected_file(), Some("B copy.setlist.json"));
+    let warning = page.view(None).warning.unwrap();
+    assert!(
+        warning.starts_with("setlist \"B copy\" was saved"),
+        "{warning}"
+    );
+    assert_eq!(setlist_names(&page), ["B", "B copy", "Sunday", "Zed"]);
+
+    page.act(LibraryAction::DismissNotice);
+    assert_eq!(page.view(None).warning, None);
+}

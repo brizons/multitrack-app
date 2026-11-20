@@ -96,21 +96,28 @@ impl Shelf {
 
     /// Creates an empty setlist named [`NEW_SETLIST_NAME`], numbered when
     /// the name is taken, and lists it.
-    pub fn create(&mut self) -> Result<SetlistEntry, SetlistError> {
+    ///
+    /// A warning comes with the entry when the setlist was saved but its
+    /// place in the stored order was not ([`saved`]).
+    pub fn create(&mut self) -> Result<(SetlistEntry, Option<String>), SetlistError> {
         let name = unique_name(NEW_SETLIST_NAME, &self.names());
-        let entry = self.library.save_setlist(&Setlist::new(name))?;
+        let created = saved(self.library.save_setlist(&Setlist::new(name)))?;
         self.refresh()?;
-        Ok(entry)
+        Ok(created)
     }
 
     /// Copies the setlist in `file` to a new setlist named "NAME copy"
     /// (numbered when taken) and lists it.
-    pub fn duplicate(&mut self, file: &str) -> Result<SetlistEntry, SetlistError> {
+    /// A warning comes with the entry as for [`Self::create`].
+    pub fn duplicate(
+        &mut self,
+        file: &str,
+    ) -> Result<(SetlistEntry, Option<String>), SetlistError> {
         let original = self.library.load_setlist(file)?;
         let name = unique_name(&format!("{} copy", original.name), &self.names());
-        let entry = self.library.duplicate_setlist(file, &name)?;
+        let copied = saved(self.library.duplicate_setlist(file, &name))?;
         self.refresh()?;
-        Ok(entry)
+        Ok(copied)
     }
 
     fn names(&self) -> Vec<&str> {
@@ -118,6 +125,26 @@ impl Shelf {
             .iter()
             .map(|s| s.entry.name.as_str())
             .collect()
+    }
+}
+
+/// The outcome of a library call that writes a setlist: its entry, with a
+/// warning when the setlist was written but its place in the stored order
+/// was not ([`SetlistError::OrderNotUpdated`]), which is not a failure.
+pub fn saved(
+    result: Result<SetlistEntry, SetlistError>,
+) -> Result<(SetlistEntry, Option<String>), SetlistError> {
+    match result {
+        Ok(entry) => Ok((entry, None)),
+        Err(SetlistError::OrderNotUpdated { saved, reason }) => {
+            let warning = SetlistError::OrderNotUpdated {
+                saved: saved.clone(),
+                reason,
+            }
+            .to_string();
+            Ok((saved, Some(warning)))
+        }
+        Err(error) => Err(error),
     }
 }
 

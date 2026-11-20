@@ -82,7 +82,7 @@ pub enum LibraryAction {
     BarsUp(usize),
     /// Types into the song search.
     Search,
-    /// Hides the last problem.
+    /// Hides the last problem and the last warning.
     DismissNotice,
 }
 
@@ -108,6 +108,7 @@ pub struct LibraryPage {
     rename: LineEdit,
     typing: Option<Field>,
     notice: Option<String>,
+    warning: Option<String>,
 }
 
 impl LibraryPage {
@@ -137,6 +138,7 @@ impl LibraryPage {
             rename: LineEdit::default(),
             typing: None,
             notice: None,
+            warning: None,
         };
         let file = file
             .map(str::to_owned)
@@ -188,7 +190,8 @@ impl LibraryPage {
                 }
             }
             A::NewSetlist => {
-                let entry = self.shelf.create().map_err(|e| e.to_string())?;
+                let (entry, warning) = self.shelf.create().map_err(|e| e.to_string())?;
+                self.warn(warning);
                 self.select(&entry.file);
                 self.start_rename();
             }
@@ -204,7 +207,9 @@ impl LibraryPage {
             A::MoveSetlistUp(_) | A::MoveSetlistDown(_) => {}
             A::DuplicateSetlist => {
                 if let Some(file) = self.selected_file().map(str::to_owned) {
-                    let entry = self.shelf.duplicate(&file).map_err(|e| e.to_string())?;
+                    let (entry, warning) =
+                        self.shelf.duplicate(&file).map_err(|e| e.to_string())?;
+                    self.warn(warning);
                     self.select(&entry.file);
                     self.start_rename();
                 }
@@ -287,7 +292,10 @@ impl LibraryPage {
                 self.change_click(index, |c| c.bars = Some(c.bars.map_or(1, |b| b + 1)))?;
             }
             A::Search => self.typing = Some(Field::Search),
-            A::DismissNotice => self.notice = None,
+            A::DismissNotice => {
+                self.notice = None;
+                self.warning = None;
+            }
         }
         Ok(())
     }
@@ -359,7 +367,8 @@ impl LibraryPage {
             return;
         }
         match editor.rename(name) {
-            Ok(()) => {
+            Ok(warning) => {
+                self.warn(warning);
                 if let Err(error) = self.shelf.refresh() {
                     self.notice = Some(error.to_string());
                 }
@@ -380,8 +389,16 @@ impl LibraryPage {
         let Some(editor) = &mut self.editor else {
             return Ok(());
         };
-        editor.apply(edit).map_err(|error| error.to_string())?;
+        let warning = editor.apply(edit).map_err(|error| error.to_string())?;
+        self.warn(warning);
         self.shelf.refresh().map_err(|error| error.to_string())
+    }
+
+    /// Shows `warning`, when there is one, until dismissed or replaced.
+    fn warn(&mut self, warning: Option<String>) {
+        if warning.is_some() {
+            self.warning = warning;
+        }
     }
 
     fn move_item(&mut self, from: usize, to: usize) -> Result<(), String> {
@@ -506,6 +523,7 @@ impl LibraryPage {
             search: self.search.text().to_owned(),
             searching: self.typing == Some(Field::Search),
             notice: self.notice.clone(),
+            warning: self.warning.clone(),
         }
     }
 
@@ -894,4 +912,7 @@ pub struct LibraryView {
     pub searching: bool,
     /// The last problem.
     pub notice: Option<String>,
+    /// The last warning: something done that is not quite whole, such as a
+    /// setlist saved without its place in the stored order.
+    pub warning: Option<String>,
 }
