@@ -4289,6 +4289,7 @@ dependencies = [
  "domain",
  "hound",
  "io-cpal",
+ "library",
  "tempfile",
 ]
 
