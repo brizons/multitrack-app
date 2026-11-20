@@ -8,6 +8,9 @@
 //! setlists of a library folder as `*.setlist.json` files in its
 //! [`SETLISTS_FOLDER`]: it lists, loads, saves, renames and duplicates them,
 //! never leaving a half-written file or overwriting another setlist.
+//! [`Library::setlist_songs`] reads the songs a setlist names, so
+//! [`domain::Setlist::validate`] can report the ones the library lacks while
+//! the rest of the setlist stays usable.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -28,9 +31,11 @@ use engine::StemAudio;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use thiserror::Error;
 
+mod setlist_songs;
 mod setlists;
 mod stream;
 
+pub use setlist_songs::{SetlistSongs, SongUnavailable};
 pub use setlists::{
     Library, MAX_SETLIST_FILE_BYTES, SETLIST_EXTENSION, SETLISTS_FOLDER, SetlistEntry,
     SetlistError, SetlistListing, UnreadableSetlist,
