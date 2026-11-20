@@ -177,10 +177,52 @@ pub trait OutputStream: Send {
     fn health(&self) -> StreamHealth;
 }
 
+/// What [`AudioOutput::check`] can tell about a request before any stream
+/// opens.
+///
+/// "Cannot tell" is its own outcome rather than a plain `Ok`: a port that
+/// has no check, or a device that cannot be asked right now (busy, or the
+/// audio system did not answer), is not the same as a device that was
+/// asked and takes the request. Both go ahead ([`Self::goes_ahead`]), and
+/// opening decides; only [`Self::Refused`] stops the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputCheck {
+    /// The device is there and takes the request, as far as can be told
+    /// without a stream: building or starting the stream can still fail.
+    Fits,
+    /// Opening would refuse the request, for this reason: no such device,
+    /// or nothing it supports fits the request.
+    Refused(OutputError),
+    /// The port cannot tell without opening a stream, for this reason; go
+    /// ahead and let opening decide.
+    Unknown(String),
+}
+
+impl OutputCheck {
+    /// Whether the caller should go on and open the stream: unless the
+    /// request was refused.
+    pub fn goes_ahead(&self) -> bool {
+        !matches!(self, Self::Refused(_))
+    }
+}
+
 /// The audio-output port.
 pub trait AudioOutput: Send {
     /// The output devices (F8.1).
     fn devices(&self) -> Result<Vec<DeviceInfo>, OutputError>;
+
+    /// Checks `request` as [`Self::open`] would before it builds a stream:
+    /// that the device it means is there and supports the rate, the buffer
+    /// size and stereo. It never opens a stream and never counts as one; a
+    /// stream already playing on the device does not count against the
+    /// request, since it may be the one about to be replaced. The default,
+    /// for ports without a check, is [`OutputCheck::Unknown`].
+    fn check(&self, request: &OutputRequest) -> OutputCheck {
+        let _ = request;
+        OutputCheck::Unknown(
+            "this audio output cannot check a request before it opens it".to_owned(),
+        )
+    }
 
     /// Opens `request.device` at exactly `request.sample_rate` and
     /// `request.buffer_frames`, plays the renderer's stereo frames on its

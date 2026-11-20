@@ -17,7 +17,8 @@ use rtrb::Consumer;
 use crate::error::{OpenError, RuntimeError};
 use crate::output::{
     AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceChoice, LossReason, MAX_BUFFER_FRAMES,
-    MIN_BUFFER_FRAMES, OutputError, OutputRequest, OutputStream, StreamHealth, StreamInfo,
+    MIN_BUFFER_FRAMES, OutputCheck, OutputError, OutputRequest, OutputStream, StreamHealth,
+    StreamInfo,
 };
 use crate::renderer::{AudioRenderer, AudioState, Report};
 use crate::song::SongInfo;
@@ -316,6 +317,13 @@ impl PreparedSong {
     /// The song and the arrangement it will play.
     pub fn song(&self) -> &SongInfo {
         &self.info
+    }
+
+    /// Asks `output` whether it would take this song ([`AudioOutput::check`])
+    /// before any stream opens: the device, the song's sample rate, the
+    /// buffer size. Nothing opens, so the device stays as it is.
+    pub fn check(&self, output: &dyn AudioOutput) -> OutputCheck {
+        output.check(&self.request)
     }
 
     /// Opens the output device at the song's sample rate and starts the
