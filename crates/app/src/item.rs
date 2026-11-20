@@ -1,11 +1,12 @@
-//! What a session plays, with its player built and its start buffering,
-//! ready to hand to the audio thread.
+//! What a session plays: one song, or one setlist item, with its player
+//! built and its start buffering, ready to hand to the audio thread.
 
 use std::path::Path;
+use std::time::Duration;
 
-use domain::{SONG_FADE_OUT_SECONDS, Song};
+use domain::{ClickItem, DEFAULT_ARRANGEMENT_ID, SONG_FADE_OUT_SECONDS, Song};
 use engine::MixSettings;
-use engine::live::{Player, PlayerConfig};
+use engine::live::{self, Controller, JumpTiming, Player, PlayerConfig};
 use library::{DiskMonitor, StreamConfig, StreamingSong, open_streaming};
 
 use crate::error::OpenError;
@@ -17,6 +18,9 @@ use crate::song::SongInfo;
 pub(crate) struct Item {
     pub(crate) info: SongInfo,
     pub(crate) player: Player,
+    /// The player's own queue: commands sent here before the player is
+    /// handed over apply when it first plays.
+    pub(crate) controller: Controller,
     pub(crate) monitor: DiskMonitor,
 }
 
@@ -58,7 +62,7 @@ impl Item {
             Some(range) => excerpt(song, arrangement, range),
             None => song,
         };
-        let (mut player, _controller) = Player::new(
+        let (mut player, controller) = Player::new(
             &song,
             arrangement,
             &MixSettings::default(),
@@ -75,8 +79,47 @@ impl Item {
         Ok(Self {
             info,
             player,
+            controller,
             monitor,
         })
+    }
+
+    /// The player of a click-only tile at `sample_rate` (F5.5): its bars,
+    /// or one bar repeating until the operator moves on. `None` when the
+    /// tile breaks a setlist rule.
+    pub(crate) fn click(
+        click: &ClickItem,
+        sample_rate: u32,
+        options: &SessionOptions,
+    ) -> Option<Self> {
+        let song = Song::click_only(sample_rate, click.bpm, click.time_signature, click.bars)?;
+        let (mut player, controller) = Player::new(
+            &song,
+            DEFAULT_ARRANGEMENT_ID,
+            &MixSettings::default(),
+            &config(sample_rate, options),
+            Vec::new(),
+        )
+        .ok()?;
+        player.set_infinite_at_start(click.bars.is_none());
+        let info = SongInfo::new(&song, DEFAULT_ARRANGEMENT_ID, Vec::new())?;
+        Some(Self {
+            info,
+            player,
+            controller,
+            monitor: DiskMonitor::default(),
+        })
+    }
+
+    /// Carries the operator's jump timing and fade duration over to this
+    /// item, so a setting does not flip back when the next item starts.
+    pub(crate) fn carry(&mut self, timing: JumpTiming, fade: Duration) {
+        let frames = (fade.as_secs_f64() * f64::from(self.info.sample_rate)).round() as u64;
+        // A fresh queue has room for both.
+        let _ = self.controller.send(live::Command::SetJumpTiming(timing));
+        let _ = self
+            .controller
+            .send(live::Command::SetFadeDuration { frames });
     }
 }
 

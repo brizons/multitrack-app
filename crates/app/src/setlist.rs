@@ -1,0 +1,949 @@
+//! A setlist playing on one audio device (S3): its items one after another,
+//! each with its arrangement, start and end points, fade-out and
+//! transition, and click-only tiles (F5, F6.1).
+
+use std::fmt;
+use std::mem;
+use std::path::PathBuf;
+
+use domain::{
+    CROSSFADE_SECONDS, ClickItem, SetlistItem, SetlistValidationError, SongItem, SongLookup,
+    Transition,
+};
+use engine::live::Handoff;
+use library::{DiskMonitor, Library, SetlistError, SetlistSongs};
+use thiserror::Error;
+
+use crate::error::{OpenError, RuntimeError};
+use crate::item::Item;
+use crate::output::{AudioOutput, OutputCheck};
+use crate::session::{Command, PreparedSong, Session, SessionOptions, Snapshot, check_buffer};
+use crate::song::SongInfo;
+
+/// The rate the device opens at for a setlist with no playable song: only
+/// click-only tiles, which play at any rate.
+pub const CLICK_ONLY_SAMPLE_RATE: u32 = 48_000;
+
+/// What a setlist holds and what the library can provide for it, known
+/// before anything plays.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetlistInfo {
+    /// The setlist's name.
+    pub name: String,
+    /// The rate the device opens at: the first playable song's, or
+    /// [`CLICK_ONLY_SAMPLE_RATE`] when only click-only tiles can play.
+    pub sample_rate: u32,
+    /// Every item, in play order; commands and snapshots index into it.
+    pub items: Vec<ItemInfo>,
+}
+
+impl SetlistInfo {
+    /// Indexes of the items that cannot play, in order.
+    pub fn unavailable(&self) -> Vec<usize> {
+        (0..self.items.len())
+            .filter(|&index| !self.items[index].is_playable())
+            .collect()
+    }
+
+    /// Indexes of the playable songs whose sample rate is not
+    /// [`Self::sample_rate`]: each plays after the device reopens at its
+    /// rate, and no AutoLink or Crossfade leads into it.
+    pub fn other_rate(&self) -> Vec<usize> {
+        (0..self.items.len())
+            .filter(|&index| {
+                let item = &self.items[index];
+                item.is_playable()
+                    && item
+                        .sample_rate
+                        .is_some_and(|rate| rate != self.sample_rate)
+            })
+            .collect()
+    }
+}
+
+/// One item of a [`SetlistInfo`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ItemInfo {
+    /// The item as the setlist stores it.
+    pub item: SetlistItem,
+    /// The song's sample rate; `None` for a click-only tile, which plays at
+    /// the device's rate, and for a song the library cannot provide.
+    pub sample_rate: Option<u32>,
+    /// Why the item cannot play, every reason; empty when it can.
+    pub problems: Vec<String>,
+}
+
+impl ItemInfo {
+    /// Whether the item can play.
+    pub fn is_playable(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
+/// A command a shell sends with [`SetlistSession::send`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SetlistCommand {
+    /// A command for the current item, as a single-song session takes it:
+    /// play, pause, stop, back to start, jumps, loops, fade, panic.
+    Item(Command),
+    /// Selects the next playable item (F6.1).
+    Next,
+    /// Selects the previous playable item (F6.1).
+    Previous,
+    /// Selects the item at this index of [`SetlistInfo::items`]; selecting
+    /// the current item stops it at its start.
+    Select(usize),
+}
+
+/// The state of a setlist session, for a shell to draw;
+/// [`SetlistSession::poll`] returns one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetlistSnapshot {
+    /// The current item, as a single-song session describes its song
+    /// ([`crate::Session::poll`]).
+    pub song: Snapshot,
+    /// Where the setlist stands.
+    pub setlist: SetlistState,
+}
+
+/// Where a setlist stands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetlistState {
+    /// Index of the current item in [`SetlistInfo::items`]. During a
+    /// crossfade it is the item fading in.
+    pub current: usize,
+    /// Index of the playable item the current one leads to, if any.
+    pub next: Option<usize>,
+    /// The current item's transition.
+    pub transition: Transition,
+    /// Whether the next item is prepared and its start buffered, so its
+    /// transition will not wait for the disk.
+    pub next_ready: bool,
+    /// The crossfade under way, if any.
+    pub blend: Option<BlendView>,
+    /// The most recent setlist problem; an operator's next, previous or
+    /// select clears it.
+    pub problem: Option<SetlistProblem>,
+}
+
+/// A crossfade under way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendView {
+    /// Index of the item fading out.
+    pub from: usize,
+    /// Index of the item fading in.
+    pub to: usize,
+    /// Length of the blend in frames.
+    pub frames: u64,
+    /// Frames of the blend played.
+    pub played: u64,
+}
+
+impl BlendView {
+    /// How far the blend has gone, from 0.0 to 1.0.
+    pub fn progress(&self) -> f32 {
+        (self.played as f64 / self.frames.max(1) as f64) as f32
+    }
+}
+
+/// Something that went wrong between commands, kept as
+/// [`SetlistState::problem`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SetlistProblem {
+    /// The next item could not be prepared, so it cannot follow on; the
+    /// session tries again when it is selected.
+    #[error("item {} could not be prepared: {error}", .item + 1)]
+    Prepare {
+        /// Index of the item.
+        item: usize,
+        /// Why.
+        error: String,
+    },
+    /// An AutoLink or Crossfade found the next item not buffered in time;
+    /// it started as soon as it was.
+    #[error("item {} was not loaded in time to follow on; it started once it was", .item + 1)]
+    LateLink {
+        /// Index of the item.
+        item: usize,
+    },
+}
+
+/// Why a setlist did not open.
+#[derive(Debug, Error)]
+pub enum SetlistOpenError {
+    /// The setlist file could not be read, or the library folder not
+    /// opened.
+    #[error(transparent)]
+    Library(#[from] SetlistError),
+    /// No item can play; [`SetlistInfo`] would list why for each.
+    #[error("setlist \"{name}\" has no item that can play")]
+    NothingPlayable {
+        /// The setlist's name.
+        name: String,
+        /// Why each item cannot play, in item order.
+        problems: Vec<Vec<String>>,
+    },
+    /// The first playable item or the device could not be opened.
+    #[error(transparent)]
+    Open(#[from] OpenError),
+}
+
+/// Why [`SetlistSession::send`] refused a command; nothing changed.
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum SetlistCommandError {
+    /// The current item refused the command, as a single-song session
+    /// would.
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+    /// No playable item follows the current one.
+    #[error("no item after the current one can play")]
+    NoNext,
+    /// No playable item comes before the current one.
+    #[error("no item before the current one can play")]
+    NoPrevious,
+    /// There is no item at this index.
+    #[error("item {} does not exist; the setlist has {items} items", .item + 1)]
+    OutOfRange {
+        /// The index asked for.
+        item: usize,
+        /// Items in the setlist.
+        items: usize,
+    },
+    /// The item cannot play; [`ItemInfo::problems`] says why.
+    #[error("item {} cannot play", .item + 1)]
+    Unplayable {
+        /// Index of the item.
+        item: usize,
+    },
+    /// The item could not be prepared to play.
+    #[error("item {} could not be prepared: {error}", .item + 1)]
+    Prepare {
+        /// Index of the item.
+        item: usize,
+        /// Why.
+        error: String,
+    },
+}
+
+/// How a playable item is built.
+#[derive(Debug, Clone)]
+enum Plan {
+    Song {
+        folder: PathBuf,
+        arrangement: String,
+        positions: Option<(usize, usize)>,
+        fade_out: bool,
+        sample_rate: u32,
+    },
+    Click(ClickItem),
+}
+
+/// Why an item could not be built.
+enum BuildError {
+    Open(OpenError),
+    Click,
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(error) => error.fmt(f),
+            Self::Click => f.write_str("the click-only tile breaks the setlist rules"),
+        }
+    }
+}
+
+/// An item whose player is in the deck's cue slot.
+struct Staged {
+    index: usize,
+    tag: u64,
+    info: SongInfo,
+    monitor: DiskMonitor,
+}
+
+/// An item prepared on the control thread, not handed over yet.
+struct Pending {
+    index: usize,
+    item: Item,
+}
+
+/// A setlist opened from a library with its first item prepared, on no
+/// device yet ([`SetlistSession::prepare`]): a shell can check the device
+/// ([`Self::check`]) before it stops whatever plays there.
+pub struct PreparedSetlist {
+    prepared: PreparedSong,
+    info: SetlistInfo,
+    plans: Vec<Option<Plan>>,
+    options: SessionOptions,
+    first: usize,
+}
+
+impl PreparedSetlist {
+    /// The setlist and what the library could provide for it.
+    pub fn info(&self) -> &SetlistInfo {
+        &self.info
+    }
+
+    /// Asks `output` whether it would take the setlist's device rate and
+    /// buffer, without opening anything ([`AudioOutput::check`]).
+    pub fn check(&self, output: &dyn AudioOutput) -> OutputCheck {
+        self.prepared.check(output)
+    }
+
+    /// Opens the output device at [`SetlistInfo::sample_rate`] and starts
+    /// the session at the first playable item, stopped at its start.
+    pub fn start(self, output: Box<dyn AudioOutput>) -> Result<SetlistSession, OpenError> {
+        let Self {
+            prepared,
+            info,
+            plans,
+            options,
+            first,
+        } = self;
+        let session = prepared.start(output)?;
+        Ok(SetlistSession {
+            session,
+            info,
+            plans,
+            options,
+            current: first,
+            cued: None,
+            pending: None,
+            reopen: None,
+            play_after_reopen: false,
+            failed: None,
+            blend_from: None,
+            finished_seen: 0,
+            next_tag: 1,
+            problem: None,
+        })
+    }
+}
+
+/// A setlist playing on one audio device: the use cases a shell calls for
+/// it (S3). Shells send [`SetlistCommand`]s and draw the
+/// [`SetlistSnapshot`]s [`Self::poll`] returns, about 30 times a second;
+/// the session moves on only when polled.
+///
+/// [`SetlistSession::open`] reads a setlist from a [`Library`] and checks it
+/// against the songs the library has. Before anything plays,
+/// [`SetlistSession::info`] says which items cannot play (a song the library
+/// lacks or cannot read, an item that breaks a setlist rule) and which
+/// songs run at another sample rate than the device; neither stops the rest
+/// of the setlist. The device opens at the first playable song's rate.
+///
+/// # How items follow each other
+///
+/// The session keeps the next playable item prepared while the current one
+/// plays: its folder opened, its player built, its start buffered. Once it
+/// is buffered it is cued on the audio thread's [`engine::live::Deck`], so
+/// the current item's transition never waits for the disk:
+///
+/// - **Cue next**: at its end the item stops and the next one is selected,
+///   stopped at its start.
+/// - **Stay**: at its end the item stops and stays selected.
+/// - **AutoLink**: the next item starts on the frame after the item's last.
+/// - **Crossfade**: the next item starts [`domain::CROSSFADE_SECONDS`]
+///   before the item's end and the two blend linearly (the gains sum to 1),
+///   so two songs peaking at −1 dBFS stay below 0 dBFS.
+///
+/// A song at another rate than the device plays after the device reopens
+/// at its rate, which stops the stream: an AutoLink or Crossfade into it
+/// falls back to Cue next. An AutoLink or Crossfade whose next item was not
+/// buffered in time also starts it as soon as it is, and says so
+/// ([`SetlistProblem::LateLink`]). When the device refuses the other rate,
+/// the session holds the item as it holds a lost device: the snapshot says
+/// why ([`RuntimeError::DeviceReopenFailed`]) and the session keeps trying;
+/// selecting an item at a rate the device takes brings it back.
+///
+/// A song item with a fade-out fades its stems out over its last
+/// [`domain::SONG_FADE_OUT_SECONDS`], silent on its last frame; click and
+/// guide play on to its end, as with the Fade control (F6.4).
+///
+/// # Operator commands
+///
+/// [`SetlistCommand::Item`] takes every command a single-song
+/// [`crate::Session`] takes, for the current item (during a crossfade the
+/// transport commands reach both items). Next, previous and select move to
+/// another playable item, stopped at its start; while an item plays it
+/// stops first, with its ramp. A click-only tile without a bar count
+/// repeats its bar until the operator moves on; switching its infinite loop
+/// off ends it at the bar line, and its transition follows. The jump timing
+/// and fade duration the operator chose carry over to the items that
+/// follow.
+pub struct SetlistSession {
+    session: Session,
+    info: SetlistInfo,
+    plans: Vec<Option<Plan>>,
+    options: SessionOptions,
+    current: usize,
+    cued: Option<Staged>,
+    pending: Option<Pending>,
+    /// An item at another rate waiting for the current one to stop before
+    /// the device reopens.
+    reopen: Option<Pending>,
+    play_after_reopen: bool,
+    /// The next item, when preparing it failed; tried again once selected.
+    failed: Option<usize>,
+    /// The item a crossfade under way fades out.
+    blend_from: Option<usize>,
+    finished_seen: u64,
+    next_tag: u64,
+    problem: Option<SetlistProblem>,
+}
+
+impl SetlistSession {
+    /// Reads the setlist file `file` from `library` (as
+    /// [`Library::load_setlist`] takes it), checks it against the library's
+    /// songs, prepares the first playable item and opens the output at
+    /// [`SetlistInfo::sample_rate`]. It is [`Self::prepare`] followed by
+    /// [`PreparedSetlist::start`].
+    pub fn open(
+        library: &Library,
+        file: &str,
+        output: Box<dyn AudioOutput>,
+        options: SessionOptions,
+    ) -> Result<Self, SetlistOpenError> {
+        Ok(Self::prepare(library, file, options)?.start(output)?)
+    }
+
+    /// Reads and checks the setlist and prepares its first playable item,
+    /// without touching any device. [`SessionOptions::arrangement`] is not
+    /// used: every song item names its own.
+    pub fn prepare(
+        library: &Library,
+        file: &str,
+        options: SessionOptions,
+    ) -> Result<PreparedSetlist, SetlistOpenError> {
+        check_buffer(options.buffer_frames)?;
+        let setlist = library.load_setlist(file)?;
+        let songs = library.setlist_songs(&setlist)?;
+        let errors = setlist.validate(&songs).err().unwrap_or_default();
+        let (items, plans): (Vec<ItemInfo>, Vec<Option<Plan>>) = setlist
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| plan_item(library, &songs, &errors, index, item))
+            .unzip();
+        let sample_rate = plans
+            .iter()
+            .find_map(|plan| match plan {
+                Some(Plan::Song { sample_rate, .. }) => Some(*sample_rate),
+                _ => None,
+            })
+            .unwrap_or(CLICK_ONLY_SAMPLE_RATE);
+        let Some(first) = plans.iter().position(Option::is_some) else {
+            return Err(SetlistOpenError::NothingPlayable {
+                name: setlist.name,
+                problems: items.into_iter().map(|item| item.problems).collect(),
+            });
+        };
+        let info = SetlistInfo {
+            name: setlist.name,
+            sample_rate,
+            items,
+        };
+        let item = match build(plans[first].as_ref(), sample_rate, &options) {
+            Ok(item) => item,
+            Err(BuildError::Open(error)) => return Err(error.into()),
+            Err(BuildError::Click) => {
+                return Err(SetlistOpenError::NothingPlayable {
+                    name: info.name,
+                    problems: info.items.into_iter().map(|item| item.problems).collect(),
+                });
+            }
+        };
+        Ok(PreparedSetlist {
+            prepared: PreparedSong::new(item, 0, &options),
+            info,
+            plans,
+            options,
+            first,
+        })
+    }
+
+    /// The setlist and what the library could provide for it.
+    pub fn info(&self) -> &SetlistInfo {
+        &self.info
+    }
+
+    /// The current item's song: its arrangement as the item plays it (cut
+    /// to its start and end points), or a click-only tile's one section.
+    pub fn song(&self) -> &SongInfo {
+        self.session.song()
+    }
+
+    /// The output devices (F8.1).
+    pub fn devices(&self) -> Result<Vec<crate::DeviceInfo>, crate::OutputError> {
+        self.session.devices()
+    }
+
+    /// Watches the disk threads of the current item and the items prepared
+    /// ahead; for tests and diagnostics.
+    pub fn disk_monitors(&self) -> Vec<DiskMonitor> {
+        let mut monitors = vec![self.session.disk_monitor()];
+        monitors.extend(self.cued.iter().map(|staged| staged.monitor.clone()));
+        monitors.extend(
+            self.pending
+                .iter()
+                .chain(&self.reopen)
+                .map(|pending| pending.item.monitor.clone()),
+        );
+        monitors
+    }
+
+    /// Sends `command`. An error from the current item is also kept as
+    /// [`Snapshot::last_error`], as a single-song session keeps it.
+    pub fn send(&mut self, command: SetlistCommand) -> Result<(), SetlistCommandError> {
+        let target = self
+            .reopen
+            .as_ref()
+            .map_or(self.current, |pending| pending.index);
+        let item = match command {
+            SetlistCommand::Item(command) => {
+                // The device is about to reopen for the item selected: play
+                // starts that one, not the item ramping out.
+                if self.reopen.is_some() && command == Command::Play {
+                    self.play_after_reopen = true;
+                    return Ok(());
+                }
+                return Ok(self.session.send(command)?);
+            }
+            SetlistCommand::Next => self
+                .next_playable(target)
+                .ok_or(SetlistCommandError::NoNext)?,
+            SetlistCommand::Previous => self
+                .previous_playable(target)
+                .ok_or(SetlistCommandError::NoPrevious)?,
+            SetlistCommand::Select(item) => {
+                if item >= self.plans.len() {
+                    return Err(SetlistCommandError::OutOfRange {
+                        item,
+                        items: self.plans.len(),
+                    });
+                }
+                if self.plans[item].is_none() {
+                    return Err(SetlistCommandError::Unplayable { item });
+                }
+                item
+            }
+        };
+        self.problem = None;
+        self.failed = None;
+        self.select(item, false)
+    }
+
+    /// Moves the session on and returns its state: follows the deck's
+    /// handoffs, applies a transition when an item ends, reopens the device
+    /// for an item at another rate once the current one has stopped,
+    /// prepares and cues the next item, and does what
+    /// [`crate::Session::poll`] does for the current item.
+    pub fn poll(&mut self) -> SetlistSnapshot {
+        let (report, now) = self.session.begin_poll();
+        self.follow_deck(&report.deck, report.status().transport.is_running());
+        self.keep_next_ready();
+        let song = self.session.end_poll(&report, now);
+        let next = self.next_playable(self.current);
+        let next_ready = self.next_ready(next);
+        SetlistSnapshot {
+            song,
+            setlist: SetlistState {
+                current: self.current,
+                next,
+                transition: self.transition(self.current),
+                next_ready,
+                blend: report.deck.blend.map(|blend| BlendView {
+                    from: self.blend_from.unwrap_or(self.current),
+                    to: self.current,
+                    frames: blend.frames,
+                    played: blend.played,
+                }),
+                problem: self.problem.clone(),
+            },
+        }
+    }
+
+    /// Follows what the deck did since the last poll: a handoff to the cued
+    /// item, an item that played to its end, a stop that a reopen waits
+    /// for.
+    fn follow_deck(&mut self, deck: &engine::live::DeckStatus, running: bool) {
+        if self
+            .cued
+            .as_ref()
+            .is_some_and(|staged| staged.tag == deck.item)
+            && let Some(staged) = self.cued.take()
+        {
+            self.blend_from = deck.blend.map(|_| self.current);
+            self.session.bind(staged.info, staged.monitor, staged.tag);
+            self.current = staged.index;
+        }
+        if deck.blend.is_none() {
+            self.blend_from = None;
+        }
+        if deck.finished > self.finished_seen {
+            self.finished_seen = deck.finished;
+            if deck.finished_item == Some(self.session.item()) {
+                self.after_end();
+            }
+        }
+        if !running && let Some(pending) = self.reopen.take() {
+            let play = mem::take(&mut self.play_after_reopen);
+            let index = pending.index;
+            let tag = self.tag();
+            if self.session.reopen_with(pending.item, tag).is_ok() {
+                self.current = index;
+                if play {
+                    let _ = self.session.send(Command::Play);
+                }
+            }
+        }
+    }
+
+    /// The current item played to its end: its transition decides what
+    /// comes next. An AutoLink or Crossfade the deck did not hand over had
+    /// nothing cued: the next item runs at another rate (Cue next instead),
+    /// or was not buffered in time (it starts as soon as it is).
+    fn after_end(&mut self) {
+        let Some(next) = self.next_playable(self.current) else {
+            return;
+        };
+        let late = match self.transition(self.current) {
+            Transition::Stay => return,
+            Transition::CueNext => false,
+            Transition::AutoLink | Transition::Crossfade => {
+                self.rate_of(next) == self.session.sample_rate()
+            }
+        };
+        match self.select(next, late) {
+            Ok(()) if late => self.problem = Some(SetlistProblem::LateLink { item: next }),
+            Ok(()) => {}
+            Err(error) => self.problem = Some(problem(next, error)),
+        }
+    }
+
+    /// Makes `target` the current item, stopped at its start, and plays it
+    /// when `play` says so. The item playing stops with its ramp.
+    fn select(&mut self, target: usize, play: bool) -> Result<(), SetlistCommandError> {
+        if let Some(waiting) = self.reopen.take() {
+            if waiting.index == target {
+                self.reopen = Some(waiting);
+                self.play_after_reopen |= play;
+                return Ok(());
+            }
+            self.play_after_reopen = false;
+        }
+        if target == self.current {
+            self.session.send(Command::Stop)?;
+            return Ok(());
+        }
+        if let Some(staged) = self.cued.take_if(|staged| staged.index == target) {
+            self.session
+                .select_cued(staged.info, staged.monitor, staged.tag)?;
+            self.current = target;
+        } else {
+            if self.cued.take().is_some() {
+                self.session.uncue()?;
+            }
+            let mut pending = match self.pending.take() {
+                Some(pending) if pending.index == target => pending,
+                _ => self.prepare_item(target)?,
+            };
+            let (timing, fade) = self.session.carried();
+            pending.item.carry(timing, fade);
+            if pending.item.info.sample_rate == self.session.sample_rate() {
+                let tag = self.tag();
+                self.session.select(pending.item, tag)?;
+                self.current = target;
+            } else if self.session.is_running() {
+                // The device reopens at the item's rate once the current
+                // item has ramped out.
+                self.session.send(Command::Stop)?;
+                self.reopen = Some(pending);
+                self.play_after_reopen = play;
+                return Ok(());
+            } else {
+                let tag = self.tag();
+                self.session.reopen_with(pending.item, tag)?;
+                self.current = target;
+            }
+        }
+        self.blend_from = None;
+        if play {
+            self.session.send(Command::Play)?;
+        }
+        Ok(())
+    }
+
+    /// Prepares the next playable item ahead and cues it once its start is
+    /// buffered, with the current item's transition as the handoff. A cue
+    /// or preparation for another item is dropped first.
+    fn keep_next_ready(&mut self) {
+        if self.reopen.is_some() {
+            return;
+        }
+        let want = self.next_playable(self.current);
+        if self.failed.is_some_and(|failed| Some(failed) != want) {
+            self.failed = None;
+        }
+        if self
+            .cued
+            .as_ref()
+            .is_some_and(|staged| Some(staged.index) != want)
+        {
+            self.cued = None;
+            let _ = self.session.uncue();
+        }
+        if let Some(pending) = &self.pending
+            && (Some(pending.index) != want
+                || pending.item.info.sample_rate != self.rate_of(pending.index))
+        {
+            self.pending = None;
+        }
+        let Some(want) = want else {
+            return;
+        };
+        if self.cued.is_some() || self.failed == Some(want) {
+            return;
+        }
+        if self.pending.is_none() {
+            match self.prepare_item(want) {
+                Ok(pending) => self.pending = Some(pending),
+                Err(error) => {
+                    self.failed = Some(want);
+                    self.problem = Some(problem(want, error));
+                    return;
+                }
+            }
+        }
+        let rate = self.session.sample_rate();
+        let ready = self.pending.as_mut().is_some_and(|pending| {
+            pending.item.info.sample_rate == rate && pending.item.player.playhead_ready()
+        });
+        if !ready {
+            return;
+        }
+        let Some(mut pending) = self.pending.take() else {
+            return;
+        };
+        let handoff = match self.transition(self.current) {
+            Transition::AutoLink => Handoff::AutoLink,
+            Transition::Crossfade => Handoff::Crossfade {
+                frames: u64::from(CROSSFADE_SECONDS) * u64::from(rate),
+            },
+            Transition::CueNext | Transition::Stay => Handoff::Stop,
+        };
+        let (timing, fade) = self.session.carried();
+        pending.item.carry(timing, fade);
+        let tag = self.tag();
+        let Item {
+            info,
+            player,
+            monitor,
+            ..
+        } = pending.item;
+        if self.session.cue(player, tag, handoff).is_ok() {
+            self.cued = Some(Staged {
+                index: pending.index,
+                tag,
+                info,
+                monitor,
+            });
+        }
+    }
+
+    /// Builds item `index` at the device's rate.
+    fn prepare_item(&self, index: usize) -> Result<Pending, SetlistCommandError> {
+        let plan = self.plans.get(index).and_then(Option::as_ref);
+        if plan.is_none() {
+            return Err(SetlistCommandError::Unplayable { item: index });
+        }
+        let item = build(plan, self.session.sample_rate(), &self.options).map_err(|error| {
+            SetlistCommandError::Prepare {
+                item: index,
+                error: error.to_string(),
+            }
+        })?;
+        Ok(Pending { index, item })
+    }
+
+    fn next_ready(&mut self, next: Option<usize>) -> bool {
+        let Some(next) = next else {
+            return false;
+        };
+        if self
+            .cued
+            .as_ref()
+            .is_some_and(|staged| staged.index == next)
+        {
+            return true;
+        }
+        self.pending
+            .as_mut()
+            .is_some_and(|pending| pending.index == next && pending.item.player.playhead_ready())
+    }
+
+    fn next_playable(&self, from: usize) -> Option<usize> {
+        (from + 1..self.plans.len()).find(|&index| self.plans[index].is_some())
+    }
+
+    fn previous_playable(&self, from: usize) -> Option<usize> {
+        (0..from).rev().find(|&index| self.plans[index].is_some())
+    }
+
+    fn transition(&self, index: usize) -> Transition {
+        self.info.items[index].item.transition()
+    }
+
+    /// The rate item `index` plays at: a song's own, a click-only tile's
+    /// the device's.
+    fn rate_of(&self, index: usize) -> u32 {
+        match &self.plans[index] {
+            Some(Plan::Song { sample_rate, .. }) => *sample_rate,
+            _ => self.session.sample_rate(),
+        }
+    }
+
+    fn tag(&mut self) -> u64 {
+        let tag = self.next_tag;
+        self.next_tag += 1;
+        tag
+    }
+}
+
+impl fmt::Debug for SetlistSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SetlistSession")
+            .field("name", &self.info.name)
+            .field("current", &self.current)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What `item` (at `index`) is, whether it can play, and how to build it.
+fn plan_item(
+    library: &Library,
+    songs: &SetlistSongs,
+    errors: &[SetlistValidationError],
+    index: usize,
+    item: &SetlistItem,
+) -> (ItemInfo, Option<Plan>) {
+    let song = match item {
+        SetlistItem::Song(song) => song,
+        SetlistItem::Click(click) => {
+            let problems = problems_of(errors, index, false);
+            let plan = problems.is_empty().then_some(Plan::Click(*click));
+            let info = ItemInfo {
+                item: item.clone(),
+                sample_rate: None,
+                problems,
+            };
+            return (info, plan);
+        }
+    };
+    let unavailable = songs
+        .unavailable()
+        .iter()
+        .find(|unavailable| unavailable.song() == song.song);
+    // The library says why a song is missing; validation only that it is.
+    let mut problems = problems_of(errors, index, unavailable.is_some());
+    if let Some(unavailable) = unavailable {
+        problems.insert(0, unavailable.to_string());
+    }
+    let sample_rate = songs.sample_rate(&song.song);
+    let mut plan = None;
+    if problems.is_empty() {
+        match library.song_folder(&song.song) {
+            Ok(folder) => plan = song_plan(songs, song, folder, sample_rate),
+            Err(error) => problems.push(error.to_string()),
+        }
+    }
+    if plan.is_none() && problems.is_empty() {
+        problems.push(format!("song \"{}\" cannot be read", song.song));
+    }
+    let info = ItemInfo {
+        item: item.clone(),
+        sample_rate,
+        problems,
+    };
+    (info, plan)
+}
+
+fn song_plan(
+    songs: &SetlistSongs,
+    song: &SongItem,
+    folder: PathBuf,
+    sample_rate: Option<u32>,
+) -> Option<Plan> {
+    let positions = songs.outline(&song.song)?.positions(&song.arrangement)?;
+    let range = (song.start_position.is_some() || song.end_position.is_some()).then(|| {
+        (
+            song.start_position.unwrap_or(0),
+            song.end_position.unwrap_or(positions.saturating_sub(1)),
+        )
+    });
+    Some(Plan::Song {
+        folder,
+        arrangement: song.arrangement.clone(),
+        positions: range,
+        fade_out: song.fade_out,
+        sample_rate: sample_rate?,
+    })
+}
+
+/// The validation errors of item `index`, as text; `UnknownSong` left out
+/// when the library has its own reason.
+fn problems_of(errors: &[SetlistValidationError], index: usize, has_reason: bool) -> Vec<String> {
+    errors
+        .iter()
+        .filter(|error| item_of(error) == Some(index))
+        .filter(|error| {
+            !(has_reason && matches!(error, SetlistValidationError::UnknownSong { .. }))
+        })
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// The item a validation error is about; `None` for the setlist as a
+/// whole.
+fn item_of(error: &SetlistValidationError) -> Option<usize> {
+    use SetlistValidationError as E;
+    match error {
+        E::UnsupportedFormatVersion { .. } | E::EmptyName => None,
+        E::InvalidSongPath { item, .. }
+        | E::UnknownSong { item, .. }
+        | E::UnknownArrangement { item, .. }
+        | E::StartAfterEnd { item, .. }
+        | E::PositionOutsideArrangement { item, .. }
+        | E::InvalidClickBpm { item, .. }
+        | E::InvalidClickNumerator { item }
+        | E::InvalidClickDenominator { item, .. }
+        | E::ZeroClickBars { item } => Some(*item),
+    }
+}
+
+/// Builds the item `plan` describes; a click-only tile plays at `rate`.
+fn build(plan: Option<&Plan>, rate: u32, options: &SessionOptions) -> Result<Item, BuildError> {
+    match plan {
+        Some(Plan::Song {
+            folder,
+            arrangement,
+            positions,
+            fade_out,
+            ..
+        }) => Item::open_song(folder, arrangement, *positions, *fade_out, options)
+            .map_err(BuildError::Open),
+        Some(Plan::Click(click)) => Item::click(click, rate, options).ok_or(BuildError::Click),
+        None => Err(BuildError::Click),
+    }
+}
+
+/// A command error as a setlist problem about item `index`.
+fn problem(index: usize, error: SetlistCommandError) -> SetlistProblem {
+    match error {
+        SetlistCommandError::Prepare { item, error } => SetlistProblem::Prepare { item, error },
+        error => SetlistProblem::Prepare {
+            item: index,
+            error: error.to_string(),
+        },
+    }
+}
