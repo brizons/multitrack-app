@@ -93,6 +93,14 @@ pub enum LibraryAction {
     DismissNotice,
 }
 
+impl LibraryAction {
+    /// Whether it is one of the remove controls, the only actions that
+    /// leave a remove control armed ([`crate::action::disarms_removal`]).
+    pub fn is_removal(self) -> bool {
+        matches!(self, Self::RemoveSetlist | Self::RemoveUnreadable(_))
+    }
+}
+
 /// Which field the keys type into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -238,7 +246,7 @@ impl LibraryPage {
     fn try_act(&mut self, action: LibraryAction) -> Result<(), String> {
         use LibraryAction as A;
         // Removing takes two presses in a row: anything else disarms it.
-        if !matches!(action, A::RemoveSetlist | A::RemoveUnreadable(_)) {
+        if !action.is_removal() {
             self.armed = None;
         }
         match action {
@@ -686,6 +694,7 @@ impl LibraryPage {
                 })
                 .collect(),
             order_problem: self.shelf.order_problem.clone(),
+            entry_problems: self.shelf.entry_problems.clone(),
             editor: self
                 .editor
                 .as_ref()
@@ -1131,6 +1140,9 @@ pub struct LibraryView {
     /// Why the stored order of the setlists cannot be used, so they are
     /// listed by name.
     pub order_problem: Option<String>,
+    /// Entries of the setlists folder that could not be read at all; every
+    /// other setlist is listed.
+    pub entry_problems: Vec<String>,
     /// The editor, when a setlist is selected.
     pub editor: Option<EditorView>,
     /// The songs that match the search, by title.

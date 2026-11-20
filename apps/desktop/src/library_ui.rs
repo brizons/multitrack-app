@@ -232,12 +232,17 @@ fn setlists(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
                         .iter()
                         .map(|row| setlist_row(row, view.setlists.len(), cx)),
                 )
-                .children(view.order_problem.iter().map(|line| {
-                    div()
-                        .text_size(px(12.))
-                        .text_color(theme::queued())
-                        .child(line.clone())
-                }))
+                .children(
+                    view.order_problem
+                        .iter()
+                        .chain(&view.entry_problems)
+                        .map(|line| {
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme::queued())
+                                .child(line.clone())
+                        }),
+                )
                 .children(
                     view.unreadable_setlists
                         .iter()

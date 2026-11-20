@@ -82,10 +82,7 @@ pub enum Intent {
 /// "Click again to remove …" never survives leaving the screen, a
 /// transport key or any other control.
 pub fn disarms_removal(intent: Intent) -> bool {
-    !matches!(
-        intent,
-        Intent::Library(LibraryAction::RemoveSetlist | LibraryAction::RemoveUnreadable(_))
-    )
+    !matches!(intent, Intent::Library(action) if action.is_removal())
 }
 
 /// The command `action` sends, given the session's state; `None` when it

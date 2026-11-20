@@ -41,6 +41,8 @@ pub struct Shelf {
     /// Why the stored order cannot be used, so the setlists are listed by
     /// name.
     pub order_problem: Option<String>,
+    /// Entries of the setlists folder that could not be read at all.
+    pub entry_problems: Vec<String>,
 }
 
 impl Shelf {
@@ -51,6 +53,7 @@ impl Shelf {
             setlists: Vec::new(),
             unreadable: Vec::new(),
             order_problem: None,
+            entry_problems: Vec::new(),
         };
         shelf.refresh()?;
         Ok(shelf)
@@ -86,6 +89,11 @@ impl Shelf {
         self.order_problem = listing
             .order_error
             .map(|error| format!("{error}; the setlists are listed by name"));
+        self.entry_problems = listing
+            .entry_errors
+            .iter()
+            .map(|error| format!("An entry of the setlists folder could not be read: {error}"))
+            .collect();
         Ok(())
     }
 
@@ -132,10 +140,12 @@ impl Shelf {
 
     /// Removes the setlist in `file` from the list by moving its file to
     /// the trash ([`Library::remove_setlist`]), and lists the setlists
-    /// again. A warning comes with the entry when the file went to the
-    /// trash but the stored order kept its name.
+    /// again. Once the file is in the trash the removal is done: a warning
+    /// comes with the entry when the stored order kept its name, or when
+    /// the setlists cannot be listed again (the list then stays as it was,
+    /// without the setlist removed). An error means nothing was removed.
     pub fn remove(&mut self, file: &str) -> Result<(SetlistEntry, Option<String>), SetlistError> {
-        let removed = match self.library.remove_setlist(file) {
+        let (removed, mut warning) = match self.library.remove_setlist(file) {
             Ok(entry) => (entry, None),
             Err(SetlistError::RemovedOrderNotUpdated { removed, reason }) => {
                 let warning = SetlistError::RemovedOrderNotUpdated {
@@ -147,8 +157,21 @@ impl Shelf {
             }
             Err(error) => return Err(error),
         };
-        self.refresh()?;
-        Ok(removed)
+        if let Err(error) = self.refresh() {
+            self.setlists
+                .retain(|setlist| setlist.entry.file != removed.file);
+            self.unreadable
+                .retain(|problem| problem.file != removed.file);
+            let line = format!(
+                "\"{}\" was moved to the trash, but the setlists could not be listed again: {error}",
+                removed.name
+            );
+            warning = Some(match warning {
+                Some(warning) => format!("{warning} {line}"),
+                None => line,
+            });
+        }
+        Ok((removed, warning))
     }
 
     fn names(&self) -> Vec<&str> {

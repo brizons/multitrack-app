@@ -1159,3 +1159,49 @@ fn a_setlist_file_that_cannot_be_read_is_removed_from_the_list_in_two_presses() 
     assert!(dir.path().join("Trash/Broken.setlist.json").exists());
     assert_eq!(setlist_names(&page), ["A", "B", "C"]);
 }
+
+/// A trash that takes the file and then leaves the `Setlists` folder
+/// unreadable, so listing the setlists again fails after the removal.
+#[cfg(unix)]
+fn trash_then_lock(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    test_trash(path)?;
+    let folder = path.parent().expect("the Setlists folder");
+    fs::set_permissions(folder, fs::Permissions::from_mode(0o000))
+}
+
+#[cfg(unix)]
+#[test]
+fn a_removed_setlist_never_stays_open_even_when_the_list_cannot_be_read_again() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = library();
+    for name in ["A", "B", "C"] {
+        save(dir.path(), name, Vec::new());
+    }
+    let mut page =
+        LibraryPage::open_with_trash(dir.path(), Some("B.setlist.json"), trash_then_lock).unwrap();
+
+    page.act(LibraryAction::RemoveSetlist);
+    page.act(LibraryAction::RemoveSetlist);
+    let folder = dir.path().join("Setlists");
+    let locked = fs::read_dir(&folder).is_err();
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+    if !locked {
+        return; // running as root: the folder stays readable
+    }
+
+    assert!(dir.path().join("Trash/B.setlist.json").exists());
+    assert_ne!(page.selected_file(), Some("B.setlist.json"));
+    let view = page.view(None);
+    assert!(
+        !view.setlists.iter().any(|s| s.name == "B"),
+        "{:?}",
+        view.setlists
+    );
+    let warning = view.warning.expect("the failed listing shows as a warning");
+    assert!(warning.contains("cannot open folder"), "{warning}");
+    // Whatever was selected, no edit can save B again.
+    page.act(LibraryAction::AddClick);
+    assert!(!folder.join("B.setlist.json").exists());
+}
