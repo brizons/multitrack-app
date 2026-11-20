@@ -145,8 +145,9 @@ impl Blend {
 ///   1 on every frame, so two items that peak at −1 dBFS never sum above it
 ///   (an equal-power blend would). The blend clock follows the incoming
 ///   item's playhead: a pause holds it, and transport commands (play,
-///   pause, stop, panic) reach both items while they blend; every other
-///   command reaches the current item only.
+///   pause, stop, panic) reach both items while they blend. The operator's
+///   settings (jump timing, fade duration, click) reach the cued item as
+///   well; every other command reaches the current item only.
 /// - [`Handoff::Stop`]: nothing; the item stops at its start as a player
 ///   does at its end, and [`DeckStatus::finished`] counts it, so the
 ///   control thread can apply a setlist's Cue next or Stay.
@@ -303,19 +304,26 @@ impl Deck {
         }
     }
 
-    /// Transport commands reach both items of a blend; the others only the
-    /// current item, since positions and settings are its own.
+    /// Transport commands reach both items of a blend, and the operator's
+    /// settings (jump timing, fade duration, click) the cued item too, so it
+    /// starts the way the operator works; the others reach only the current
+    /// item, since its positions and loops are its own.
     fn apply(&mut self, command: Command) {
         self.current.command(command);
-        if matches!(
-            command,
-            Command::Play | Command::Pause | Command::Stop | Command::Panic
-        ) {
-            for leaving in &mut self.leaving {
-                if let Exit::Blend = leaving.exit {
-                    leaving.player.command(command);
+        match command {
+            Command::Play | Command::Pause | Command::Stop | Command::Panic => {
+                for leaving in &mut self.leaving {
+                    if let Exit::Blend = leaving.exit {
+                        leaving.player.command(command);
+                    }
                 }
             }
+            Command::SetJumpTiming(_) | Command::SetFadeDuration { .. } | Command::SetClick(_) => {
+                if let Some(cued) = &mut self.cued {
+                    cued.player.command(command);
+                }
+            }
+            _ => {}
         }
     }
 

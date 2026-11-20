@@ -470,3 +470,35 @@ fn an_uncued_item_comes_back_and_the_current_one_just_ends() {
     assert!(out[2 * la..].iter().all(|&s| s == 0.0));
     assert_eq!(deck.status().item, 1);
 }
+
+#[test]
+fn the_operators_settings_reach_the_cued_item_and_nothing_else_does() {
+    let (a, b) = (song_a(), song_b());
+    let (mut deck, mut control) = deck_of(&a, 256);
+    control
+        .cue(player(&b.0, b.1.clone(), 256), 2, Handoff::AutoLink)
+        .unwrap();
+    control
+        .send(Command::SetJumpTiming(engine::live::JumpTiming::NextBar))
+        .unwrap();
+    control.send(Command::SetInfinite(true)).unwrap();
+    control.send(Command::SetInfinite(false)).unwrap();
+    control
+        .send(Command::SetFadeDuration { frames: 1_000 })
+        .unwrap();
+    control.send(Command::Play).unwrap();
+    run(&mut deck, 256, a.0.length() as usize + 10);
+    let status = deck.status();
+    assert_eq!(status.item, 2, "B followed on");
+    assert_eq!(
+        status.current.jump_timing,
+        engine::live::JumpTiming::NextBar
+    );
+    control.send(Command::ToggleFade).unwrap();
+    run(&mut deck, 256, 2_000);
+    assert_eq!(
+        deck.status().current.fade.state,
+        engine::live::FadeState::Out,
+        "B took the 1 000-frame fade"
+    );
+}
