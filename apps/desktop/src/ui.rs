@@ -15,7 +15,7 @@ use openvamp_desktop::view::{
     FadeButton, Level, NextCard, NowCard, Pad, PerformView, SongMap, StatusView, TransportView,
 };
 
-use openvamp_desktop::action::Intent;
+use openvamp_desktop::action::{Intent, Page};
 
 use crate::screen::Perform;
 use crate::theme;
@@ -37,7 +37,8 @@ const OPEN_HINT: &str = if cfg!(target_os = "macos") {
     "Ctrl-O opens a song at any time"
 };
 
-/// The window's root: background, type, and the keyboard focus.
+/// The window's root: background, type, and the keyboard focus; the side
+/// navigation and [`main`] go in it.
 pub fn root(focus: &FocusHandle, cx: &mut Context<Perform>) -> Div {
     let focus_on_click = focus.clone();
     div()
@@ -48,12 +49,51 @@ pub fn root(focus: &FocusHandle, cx: &mut Context<Perform>) -> Div {
         )
         .size_full()
         .flex()
-        .flex_col()
-        .gap(px(12.))
-        .p(px(16.))
         .bg(theme::bg())
         .text_color(theme::text())
         .text_size(px(15.))
+}
+
+/// The area beside the side navigation that holds a screen.
+pub fn main() -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .p(px(16.))
+}
+
+/// The side navigation of the design canvas, with the screens that exist:
+/// Perform and Library.
+pub fn nav(page: Page, cx: &mut Context<Perform>) -> impl IntoElement {
+    let item = |id: &'static str, name: &'static str, target: Page, cx: &mut Context<Perform>| {
+        let (bg, fg) = if page == target {
+            (theme::badge(), theme::text())
+        } else {
+            (theme::panel(), theme::text_muted())
+        };
+        button(id, cx, Intent::ShowPage(target))
+            .size(px(48.))
+            .justify_center()
+            .rounded(px(12.))
+            .bg(bg)
+            .child(icon(name, fg, 22.))
+    };
+    div()
+        .w(px(64.))
+        .flex_none()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(8.))
+        .py(px(16.))
+        .bg(theme::panel())
+        .border_r_1()
+        .border_color(theme::border())
+        .child(item("nav-perform", "perform", Page::Perform, cx))
+        .child(item("nav-library", "library", Page::Library, cx))
 }
 
 /// Covers the whole screen while the question before ending the show is
@@ -851,6 +891,16 @@ fn strip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoElement {
                 .child(strip_tile(item, cx))
                 .children(item.transition.as_ref().map(transition_chip))
         }))
+        .child(
+            button("add-to-setlist", cx, Intent::ShowPage(Page::Library))
+                .w(px(52.))
+                .justify_center()
+                .rounded(px(12.))
+                .bg(theme::surface())
+                .border_1()
+                .border_color(theme::border())
+                .child(icon("plus", theme::text_muted(), 22.)),
+        )
 }
 
 fn strip_tile(item: &StripItem, cx: &mut Context<Perform>) -> AnyElement {
@@ -1085,7 +1135,11 @@ fn status(status: &StatusView, setlist: bool) -> impl IntoElement {
 }
 
 /// A clickable row of an icon and a label that reports `intent`.
-fn button(id: &'static str, cx: &mut Context<Perform>, intent: Intent) -> Stateful<Div> {
+pub(crate) fn button(
+    id: impl Into<ElementId>,
+    cx: &mut Context<Perform>,
+    intent: Intent,
+) -> Stateful<Div> {
     div()
         .id(id)
         .flex()
@@ -1098,7 +1152,11 @@ fn button(id: &'static str, cx: &mut Context<Perform>, intent: Intent) -> Statef
 }
 
 /// A 48 px square icon button.
-fn square_button(id: &'static str, cx: &mut Context<Perform>, intent: Intent) -> Stateful<Div> {
+pub(crate) fn square_button(
+    id: impl Into<ElementId>,
+    cx: &mut Context<Perform>,
+    intent: Intent,
+) -> Stateful<Div> {
     button(id, cx, intent)
         .size(px(48.))
         .justify_center()
@@ -1108,7 +1166,11 @@ fn square_button(id: &'static str, cx: &mut Context<Perform>, intent: Intent) ->
 }
 
 /// A bordered button in the header.
-fn chip_button(id: &'static str, cx: &mut Context<Perform>, intent: Intent) -> Stateful<Div> {
+pub(crate) fn chip_button(
+    id: impl Into<ElementId>,
+    cx: &mut Context<Perform>,
+    intent: Intent,
+) -> Stateful<Div> {
     button(id, cx, intent)
         .h(px(48.))
         .px(px(14.))
@@ -1118,7 +1180,7 @@ fn chip_button(id: &'static str, cx: &mut Context<Perform>, intent: Intent) -> S
         .font_weight(FontWeight::SEMIBOLD)
 }
 
-fn on_click(
+pub(crate) fn on_click(
     cx: &mut Context<Perform>,
     intent: Intent,
 ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
@@ -1156,7 +1218,7 @@ fn brand_mark() -> impl IntoElement {
         )
 }
 
-fn icon(name: &str, color: Rgba, size: f32) -> impl IntoElement {
+pub(crate) fn icon(name: &str, color: Rgba, size: f32) -> impl IntoElement {
     svg()
         .path(SharedString::from(format!("icons/{name}.svg")))
         .flex_none()
@@ -1164,7 +1226,7 @@ fn icon(name: &str, color: Rgba, size: f32) -> impl IntoElement {
         .text_color(color)
 }
 
-fn small_heading(text: impl Into<SharedString>, color: Rgba) -> impl IntoElement {
+pub(crate) fn small_heading(text: impl Into<SharedString>, color: Rgba) -> impl IntoElement {
     div()
         .text_size(px(12.))
         .font_weight(FontWeight::SEMIBOLD)

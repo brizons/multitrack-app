@@ -5,6 +5,8 @@ use app::{
     TransportState,
 };
 
+use crate::library_page::LibraryAction;
+
 /// A control on the Perform screen, or the key that stands for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiAction {
@@ -41,6 +43,15 @@ pub enum UiAction {
     SelectItem(usize),
 }
 
+/// A screen of the side navigation: only the ones that exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    /// The Perform screen.
+    Perform,
+    /// The Library & setlists screen.
+    Library,
+}
+
 /// What the screen's controls and keys ask the screen for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
@@ -54,6 +65,14 @@ pub enum Intent {
     OpenSong,
     /// "Open setlist…".
     OpenSetlist,
+    /// A screen of the side navigation.
+    ShowPage(Page),
+    /// "Open library…": picks a library folder for the Library screen.
+    OpenLibrary,
+    /// A control of the Library screen.
+    Library(LibraryAction),
+    /// "Perform": opens the setlist in the editor on the Perform screen.
+    PerformSetlist,
     /// Hides the problems shown above a playing song.
     DismissProblems,
 }

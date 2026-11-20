@@ -41,6 +41,22 @@ Quitting or closing the window while a song plays or waits to start (`Loading…
 
 Closing a song (opening another one, closing the window, quitting) stops it with the usual short ramp before the device closes. If the player refuses Stop because its command queue is full, Stop is sent again every 5 ms for up to 500 ms. A refusal, or a ramp that has not ended by then, is reported on stderr, and on screen when another song replaced it.
 
+## The Library & setlists screen
+
+The side navigation switches between **Perform** and **Library** (the design canvas's other screens are not built yet, so they are not shown). The Library screen shows one library folder: the library of the setlist on the Perform screen, or the one picked with **Open library…**.
+
+| Area | Shows and does |
+|------|----------------|
+| Setlists | Every setlist of the library's `Setlists` folder, by name, with its item count and whether it is open on Perform; files that cannot be read, with the reason. **New** creates an empty setlist ("New setlist", numbered when taken) and starts naming it. The library folder and **Open library…** at the bottom. |
+| Editor | The selected setlist's name (the pencil renames it, the copy button duplicates it as "NAME copy" and starts naming the copy), its item count and length, and **Perform**, which opens it on the Perform screen as Open setlist… does. One row per item: move up and down, number, title and what it plays, arrangement, transition out, length, remove. Clicking an item shows its controls: for a song its arrangement (choosing another plays it in full again), start and end positions by section (start never after end), the five-second fade-out and the transition; for a click-only tile its tempo, meter, bar count (down from one bar plays until you move on) and transition. **Add song** goes to the song search, **Add click tile** adds 120 BPM in 4/4. Every rule the setlist breaks shows under its item, in the `domain` crate's words. |
+| Songs | Every song folder of the library (`library::Library::list_songs`) by title, with key, tempo, length and stem count, and folders that cannot be read; the search keeps the songs whose title holds the text, whose key is it, or whose tempo starts with it. **+** adds a song at the end of the setlist, playing its Default arrangement in full. |
+
+Every change is saved at once through the `library` crate, which writes the setlist file atomically and never overwrites another setlist; a name another setlist already uses is refused and says so. A setlist file named by hand is moved to the file its name maps to on its first change, so it never ends up in two files. The Perform screen plays a setlist as it was when it was opened: changes to it play once it is opened again, which the editor says while it is open there.
+
+The setlist's name and the song search are typed with the keyboard while they have the focus: Enter keeps the text, Escape leaves it (a rename is not made, the search is cleared), Backspace deletes the last character, Cmd-V (Ctrl-V elsewhere) pastes. Every other key types, Space, `x` and the digits too, so the transport keys and the panic key do nothing while typing; Cmd/Ctrl-O and Cmd/Ctrl-Q still work. There is no caret to move and no input-method composition, since gpui 0.2.2 has no text field of its own.
+
+Setlists are listed by name: the `library` crate keeps no order of its own for them, so they cannot be reordered yet.
+
 ## Keys
 
 The same single keys as `play-cli`; letters work in either case, and a key held with Ctrl, Alt or Cmd does nothing (except Open and Quit). A key held down acts once: its repeats are ignored until it is released, on every platform (on X11, gpui reports each repeat as a new press, so the screen tracks the keys that are down itself). On the Mac, pressing Cmd counts every key as up, since macOS never reports a key released while Cmd is held; elsewhere the Super or Windows key changes nothing.
@@ -65,4 +81,4 @@ The same single keys as `play-cli`; letters work in either case, and a key held 
 
 On macOS, GPUI's `runtime_shaders` feature compiles the Metal shaders when the app starts, so the build needs no Metal Toolchain (Xcode 26 ships it as a separate download). The screen uses the system UI font, and Menlo, Consolas or DejaVu Sans Mono for times and keys; the canvas's Barlow and JetBrains Mono are not bundled.
 
-The view-model (`src/view.rs`, `src/strip.rs`, `src/catalog.rs`, `src/action.rs`, `src/hold.rs`, `src/keys.rs`, `src/song.rs`, `src/show.rs`, `src/ending.rs`) holds every decision the screen makes and is tested without a window (`cargo test -p openvamp`); the GPUI code (`src/screen.rs`, `src/ui.rs`) only draws it and dispatches, and has no automated test.
+The view-model (`src/view.rs`, `src/strip.rs`, `src/catalog.rs`, `src/action.rs`, `src/hold.rs`, `src/keys.rs`, `src/song.rs`, `src/show.rs`, `src/ending.rs`, and for the Library screen `src/library_page.rs`, `src/editor.rs`, `src/shelf.rs`, `src/line_edit.rs`) holds every decision the screens make and is tested without a window (`cargo test -p openvamp`); the GPUI code (`src/screen.rs`, `src/ui.rs`, `src/library_ui.rs`) only draws it and dispatches, and has no automated test.

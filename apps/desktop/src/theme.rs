@@ -147,6 +147,7 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/close.svg",
         include_bytes!("../assets/icons/close.svg"),
     ),
+    ("icons/copy.svg", include_bytes!("../assets/icons/copy.svg")),
     (
         "icons/crossfade.svg",
         include_bytes!("../assets/icons/crossfade.svg"),
@@ -156,6 +157,7 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/device.svg",
         include_bytes!("../assets/icons/device.svg"),
     ),
+    ("icons/down.svg", include_bytes!("../assets/icons/down.svg")),
     ("icons/fade.svg", include_bytes!("../assets/icons/fade.svg")),
     (
         "icons/folder.svg",
@@ -166,11 +168,19 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/infinite.svg"),
     ),
     ("icons/jump.svg", include_bytes!("../assets/icons/jump.svg")),
+    (
+        "icons/library.svg",
+        include_bytes!("../assets/icons/library.svg"),
+    ),
     ("icons/link.svg", include_bytes!("../assets/icons/link.svg")),
     ("icons/loop.svg", include_bytes!("../assets/icons/loop.svg")),
     (
         "icons/metronome.svg",
         include_bytes!("../assets/icons/metronome.svg"),
+    ),
+    (
+        "icons/minus.svg",
+        include_bytes!("../assets/icons/minus.svg"),
     ),
     ("icons/next.svg", include_bytes!("../assets/icons/next.svg")),
     (
@@ -194,10 +204,23 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/pause.svg",
         include_bytes!("../assets/icons/pause.svg"),
     ),
+    (
+        "icons/pencil.svg",
+        include_bytes!("../assets/icons/pencil.svg"),
+    ),
+    (
+        "icons/perform.svg",
+        include_bytes!("../assets/icons/perform.svg"),
+    ),
     ("icons/play.svg", include_bytes!("../assets/icons/play.svg")),
+    ("icons/plus.svg", include_bytes!("../assets/icons/plus.svg")),
     (
         "icons/previous.svg",
         include_bytes!("../assets/icons/previous.svg"),
+    ),
+    (
+        "icons/search.svg",
+        include_bytes!("../assets/icons/search.svg"),
     ),
     (
         "icons/section-end.svg",
@@ -209,6 +232,7 @@ const ICONS: &[(&str, &[u8])] = &[
     ),
     ("icons/stay.svg", include_bytes!("../assets/icons/stay.svg")),
     ("icons/stop.svg", include_bytes!("../assets/icons/stop.svg")),
+    ("icons/up.svg", include_bytes!("../assets/icons/up.svg")),
 ];
 
 impl AssetSource for Icons {

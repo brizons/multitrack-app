@@ -15,14 +15,15 @@ use gpui::{
     Task, Window, prelude::*,
 };
 use io_cpal::CpalOutput;
-use openvamp_desktop::action::{Intent, UiAction};
+use openvamp_desktop::action::{Intent, Page, UiAction};
 use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
 use openvamp_desktop::hold::PanicHold;
-use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, is_panic_key};
+use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
+use openvamp_desktop::library_page::LibraryPage;
 use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
 use openvamp_desktop::view::PerformView;
 
-use crate::ui;
+use crate::{library_ui, ui};
 
 /// How often the session is polled: about 30 Hz (Decision 3). The timer
 /// keeps running while the window is hidden, since a waiting play starts
@@ -40,6 +41,12 @@ pub struct Perform {
     keys: HeldKeys,
     /// Whether the question before ending the show is on screen.
     asking: bool,
+    /// The screen of the side navigation on show.
+    page: Page,
+    /// The library folder the Library screen shows, once one is open.
+    library: Option<LibraryPage>,
+    /// Why the last library folder picked did not open.
+    library_problem: Option<String>,
     _poll: Task<()>,
     _quit: Subscription,
     _deactivated: Subscription,
@@ -79,6 +86,9 @@ impl Perform {
             hold: PanicHold::new(),
             keys: HeldKeys::new(),
             asking: false,
+            page: Page::Perform,
+            library: None,
+            library_problem: None,
             _poll: poll,
             _quit: quit,
             _deactivated: deactivated,
@@ -251,6 +261,14 @@ impl Perform {
             }
             Intent::OpenSong => self.prompt_for(Pick::Song, window, cx),
             Intent::OpenSetlist => self.prompt_for(Pick::Setlist, window, cx),
+            Intent::OpenLibrary => self.prompt_for(Pick::Library, window, cx),
+            Intent::ShowPage(page) => self.show_page(page),
+            Intent::Library(action) => {
+                if let Some(library) = &mut self.library {
+                    library.act(action);
+                }
+            }
+            Intent::PerformSetlist => self.perform_setlist(),
             Intent::DismissProblems => self.problems.clear(),
         }
         cx.notify();
@@ -270,6 +288,12 @@ impl Perform {
                 directories: false,
                 multiple: false,
                 prompt: Some("Open setlist".into()),
+            },
+            Pick::Library => PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: false,
+                prompt: Some("Open library".into()),
             },
         });
         cx.spawn(async move |this, cx| {
@@ -294,6 +318,7 @@ impl Perform {
                             Ok(source) => screen.open(&source),
                             Err(problem) => screen.problems = vec![problem],
                         },
+                        Pick::Library => screen.open_library(&path, None),
                     }
                     cx.notify();
                 });
@@ -302,7 +327,106 @@ impl Perform {
         .detach();
     }
 
+    /// Shows `page`. The Library screen opens on the library of the
+    /// setlist that plays, with that setlist in the editor, when no library
+    /// is open yet.
+    fn show_page(&mut self, page: Page) {
+        self.page = page;
+        if page == Page::Library
+            && let Some(Show::Setlist(setlist)) = &self.loaded
+            && self
+                .library
+                .as_ref()
+                .is_none_or(|library| library.root() != setlist.library)
+        {
+            let (root, file) = (setlist.library.clone(), setlist.file.clone());
+            self.open_library(&root, Some(&file));
+        }
+    }
+
+    /// Opens the library folder `root` on the Library screen, with `file`
+    /// in the editor when given.
+    fn open_library(&mut self, root: &Path, file: Option<&str>) {
+        match LibraryPage::open(root, file) {
+            Ok(library) => {
+                self.library = Some(library);
+                self.library_problem = None;
+            }
+            Err(error) => {
+                self.library_problem = Some(format!("Could not open {}: {error}", root.display()));
+            }
+        }
+    }
+
+    /// Opens the setlist in the Library screen's editor on the Perform
+    /// screen, as Open setlist… does.
+    fn perform_setlist(&mut self) {
+        let Some(library) = &self.library else {
+            return;
+        };
+        let Some(file) = library.selected_file() else {
+            return;
+        };
+        let source = Source::Setlist {
+            library: library.root().to_owned(),
+            file: file.to_owned(),
+        };
+        self.open(&source);
+        self.page = Page::Perform;
+    }
+
+    /// The setlist file open on the Perform screen, when it is in the
+    /// library the Library screen shows.
+    fn playing_file(&self) -> Option<&str> {
+        let library = self.library.as_ref()?;
+        match &self.loaded {
+            Some(Show::Setlist(setlist)) if setlist.library == library.root() => {
+                Some(setlist.file.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// A key while a field of the Library screen has the focus: it types
+    /// into the field, except the shortcuts ([`typed`]).
+    fn type_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let press = KeyPress {
+            key: &event.keystroke.key,
+            mods: mods(&event.keystroke.modifiers),
+        };
+        cx.stop_propagation();
+        match typed(&press, event.keystroke.key_char.as_deref()) {
+            Typed::Line(key) => {
+                if let Some(library) = &mut self.library {
+                    library.type_key(key);
+                }
+            }
+            Typed::Paste => {
+                let text = cx.read_from_clipboard().and_then(|item| item.text());
+                if let (Some(library), Some(text)) = (&mut self.library, text) {
+                    library.paste(&text);
+                }
+            }
+            Typed::Key(KeyAction::Quit) => {
+                self.end_show(Ending::Quit, window, cx);
+                return;
+            }
+            Typed::Key(KeyAction::OpenSong) => self.handle(Intent::OpenSong, window, cx),
+            Typed::Key(_) | Typed::Ignored => {}
+        }
+        cx.notify();
+    }
+
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page == Page::Library
+            && self
+                .library
+                .as_ref()
+                .is_some_and(|library| library.typing().is_some())
+        {
+            self.type_key(event, window, cx);
+            return;
+        }
         let press = KeyPress {
             key: &event.keystroke.key,
             mods: mods(&event.keystroke.modifiers),
@@ -357,12 +481,23 @@ enum Pick {
     Song,
     /// A setlist file in the Setlists folder of a library folder.
     Setlist,
+    /// A library folder.
+    Library,
 }
 
 impl Render for Perform {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = match &self.loaded {
-            Some(show) => {
+        let body = match (self.page, &self.loaded) {
+            (Page::Library, _) => match &self.library {
+                Some(library) => {
+                    let view = library.view(self.playing_file());
+                    library_ui::library(&view, cx).into_any_element()
+                }
+                None => {
+                    library_ui::no_library(self.library_problem.as_deref(), cx).into_any_element()
+                }
+            },
+            (Page::Perform, Some(show)) => {
                 let view = PerformView::new(show.snapshot(), show.song());
                 let setlist = show.setlist().map(LoadedSetlist::view);
                 ui::perform(
@@ -374,13 +509,14 @@ impl Render for Perform {
                 )
                 .into_any_element()
             }
-            None => ui::no_song(&self.problems, cx).into_any_element(),
+            (Page::Perform, None) => ui::no_song(&self.problems, cx).into_any_element(),
         };
         ui::root(&self.focus, cx)
             .on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(Self::key_up))
             .on_modifiers_changed(cx.listener(Self::modifiers_changed))
-            .child(body)
+            .child(ui::nav(self.page, cx))
+            .child(ui::main().child(body))
             .when(self.asking, |root| root.child(ui::shield()))
     }
 }

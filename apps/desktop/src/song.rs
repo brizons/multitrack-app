@@ -149,7 +149,7 @@ impl Replaced {
 ///    ([`PreparedSong::check`]). When the song cannot open, or the device
 ///    refuses it (no such device, or not at the song's rate, for example),
 ///    the error comes back and `current` plays on, untouched. A device that
-///    cannot tell ([`OutputCheck::Unknown`]) goes ahead.
+///    cannot tell ([`app::OutputCheck::Unknown`]) goes ahead.
 /// 2. The current song stops with its ramp ([`stop_and_wait`], `sleep`
 ///    between tries) and closes, which closes its device.
 /// 3. The picked song starts on that output. When opening still fails (the

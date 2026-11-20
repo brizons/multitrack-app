@@ -1,0 +1,643 @@
+//! S4, F5.1–F5.5: the Library & setlists screen without a window, on a
+//! temporary library folder. Every change is saved through the `library`
+//! crate and read back from disk; the setlist the editor makes is the one
+//! the `domain` crate validates and the setlist session plays.
+
+use std::fs;
+use std::path::Path;
+
+use app::{SessionOptions, SetlistSession};
+use domain::{
+    Arrangement, ClickItem, SectionMarker, SectionType, Setlist, SetlistItem, SongItem,
+    SongPackage, Stem, StemRole, TempoPoint, TimeSignature, TimeSignaturePoint, Transition,
+};
+use hound::{SampleFormat, WavSpec, WavWriter};
+use library::Library;
+use openvamp_desktop::editor::{Edit, SetlistEditor};
+use openvamp_desktop::library_page::{
+    Choice, Field, LibraryAction, LibraryPage, RowDetails, SongDetails,
+};
+use openvamp_desktop::line_edit::{LineEdit, LineKey, LineOutcome};
+use openvamp_desktop::shelf::unique_name;
+
+const RATE: u32 = 8_000;
+
+/// A song of four one-second sections (intro, verse 1, chorus, outro) at
+/// 8 kHz with two arrangements: Default plays all four, Short the verse
+/// and the chorus.
+fn write_song(dir: &Path, title: &str, key: Option<&str>, bpm: f64) {
+    let section = |id: &str, section_type, number, second: u64| SectionMarker {
+        id: id.to_owned(),
+        section_type,
+        number,
+        start: second * u64::from(RATE),
+    };
+    let arrangement = |id: &str, name: &str, sections: &[&str]| Arrangement {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        sections: sections.iter().map(|&s| s.to_owned()).collect(),
+        infinite_loop: Vec::new(),
+    };
+    let package = SongPackage {
+        format_version: 1,
+        title: title.to_owned(),
+        artist: None,
+        sample_rate: RATE,
+        key: key.map(str::to_owned),
+        tempo_map: vec![TempoPoint { at: 0, bpm }],
+        time_signature_map: vec![TimeSignaturePoint {
+            at: 0,
+            numerator: 4,
+            denominator: 4,
+        }],
+        stems: vec![Stem {
+            id: "keys".to_owned(),
+            file: "keys.wav".to_owned(),
+            part: "keys".to_owned(),
+            role: StemRole::Track,
+        }],
+        sections: vec![
+            section("intro", SectionType::Intro, None, 0),
+            section("verse", SectionType::Verse, Some(1), 1),
+            section("chorus", SectionType::Chorus, None, 2),
+            section("outro", SectionType::Outro, None, 3),
+        ],
+        arrangements: vec![
+            arrangement("default", "Default", &["intro", "verse", "chorus", "outro"]),
+            arrangement("short", "Short", &["verse", "chorus"]),
+        ],
+    };
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("song.json"), package.to_json().unwrap()).unwrap();
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: RATE,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut writer = WavWriter::create(dir.join("keys.wav"), spec).unwrap();
+    for _ in 0..4 * RATE {
+        writer.write_sample(0i16).unwrap();
+    }
+    writer.finalize().unwrap();
+}
+
+/// A library with "Amazing" (A, 132 BPM) and "Bright" (no key, 90 BPM).
+fn library() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write_song(
+        &dir.path().join("Songs/Amazing.song"),
+        "Amazing",
+        Some("A"),
+        132.0,
+    );
+    write_song(&dir.path().join("Songs/Bright.song"), "Bright", None, 90.0);
+    dir
+}
+
+fn save(root: &Path, name: &str, items: Vec<SetlistItem>) -> String {
+    let mut setlist = Setlist::new(name);
+    setlist.items = items;
+    Library::new(root).save_setlist(&setlist).unwrap().file
+}
+
+/// The setlist in the editor as the library reads it back from disk.
+fn on_disk(page: &LibraryPage) -> Setlist {
+    let file = page.selected_file().expect("a setlist is in the editor");
+    let saved = Library::new(page.root()).load_setlist(file).unwrap();
+    assert_eq!(&saved, page.editor().unwrap().setlist(), "saved as edited");
+    saved
+}
+
+fn rename_to(page: &mut LibraryPage, name: &str) {
+    assert_eq!(page.typing(), Some(Field::Rename));
+    let old = page.view(None).editor.unwrap().renaming.unwrap();
+    for _ in old.chars() {
+        page.type_key(LineKey::Backspace);
+    }
+    page.type_key(LineKey::Text(name));
+    page.type_key(LineKey::Enter);
+    assert_eq!(page.typing(), None);
+}
+
+fn setlist_names(page: &LibraryPage) -> Vec<String> {
+    page.view(None)
+        .setlists
+        .into_iter()
+        .map(|s| s.name)
+        .collect()
+}
+
+fn files(root: &Path) -> Vec<String> {
+    let mut files: Vec<String> = fs::read_dir(root.join("Setlists"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn setlists_are_created_renamed_and_duplicated_in_the_library_folder() {
+    let dir = library();
+    let mut page = LibraryPage::open(dir.path(), None).unwrap();
+    assert!(page.view(None).setlists.is_empty());
+    assert_eq!(page.view(None).editor, None);
+
+    page.act(LibraryAction::NewSetlist);
+    assert_eq!(setlist_names(&page), ["New setlist"]);
+    assert_eq!(
+        page.view(None).editor.unwrap().renaming.as_deref(),
+        Some("New setlist")
+    );
+    rename_to(&mut page, "Sunday");
+
+    assert_eq!(setlist_names(&page), ["Sunday"]);
+    assert_eq!(page.selected_file(), Some("Sunday.setlist.json"));
+    assert_eq!(files(dir.path()), ["Sunday.setlist.json"]);
+    assert_eq!(on_disk(&page).name, "Sunday");
+
+    page.act(LibraryAction::AddClick);
+    page.act(LibraryAction::DuplicateSetlist);
+    assert_eq!(page.typing(), Some(Field::Rename));
+    page.type_key(LineKey::Escape);
+    assert_eq!(page.selected_file(), Some("Sunday copy.setlist.json"));
+    assert_eq!(on_disk(&page).items.len(), 1, "the copy holds the items");
+
+    page.act(LibraryAction::NewSetlist);
+    page.stop_typing();
+    assert_eq!(
+        setlist_names(&page),
+        ["New setlist", "Sunday", "Sunday copy"]
+    );
+    let rows = page.view(None).setlists;
+    assert_eq!(rows[1].meta, "1 item");
+    assert_eq!(rows[0].meta, "0 items");
+    assert!(rows[0].selected);
+
+    // A name another setlist has is refused and says so; nothing moves.
+    page.act(LibraryAction::RenameSetlist);
+    rename_to(&mut page, "Sunday");
+    assert!(
+        page.notice()
+            .unwrap()
+            .contains("another setlist already uses"),
+        "{:?}",
+        page.notice()
+    );
+    assert_eq!(
+        setlist_names(&page),
+        ["New setlist", "Sunday", "Sunday copy"]
+    );
+
+    page.act(LibraryAction::SelectSetlist(2));
+    assert_eq!(page.selected_file(), Some("Sunday copy.setlist.json"));
+}
+
+#[test]
+fn items_are_added_removed_and_reordered_and_each_change_is_saved() {
+    let dir = library();
+    let file = save(dir.path(), "Sunday", Vec::new());
+    let mut page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
+    let songs = page.view(None).songs;
+    assert_eq!(
+        songs.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(),
+        ["Amazing", "Bright"]
+    );
+
+    page.act(LibraryAction::AddSong(1));
+    page.act(LibraryAction::AddSong(0));
+    page.act(LibraryAction::AddClick);
+    let saved = on_disk(&page);
+    assert_eq!(
+        saved.items,
+        [
+            SetlistItem::Song(SongItem::new("Songs/Bright.song")),
+            SetlistItem::Song(SongItem::new("Songs/Amazing.song")),
+            SetlistItem::Click(ClickItem::new(
+                120.0,
+                TimeSignature {
+                    numerator: 4,
+                    denominator: 4
+                }
+            )),
+        ]
+    );
+    // The item added shows its details.
+    let editor = page.view(None).editor.unwrap();
+    assert!(editor.rows[2].selected);
+
+    page.act(LibraryAction::MoveUp(2));
+    page.act(LibraryAction::MoveDown(0));
+    let titles = |page: &LibraryPage| {
+        page.view(None)
+            .editor
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|row| row.title)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(titles(&page), ["Click", "Bright", "Amazing"]);
+    on_disk(&page);
+
+    page.act(LibraryAction::Remove(1));
+    assert_eq!(titles(&page), ["Click", "Amazing"]);
+    assert_eq!(on_disk(&page).items.len(), 2);
+
+    // The ends of the list stay put.
+    page.act(LibraryAction::MoveUp(0));
+    page.act(LibraryAction::MoveDown(1));
+    assert_eq!(titles(&page), ["Click", "Amazing"]);
+}
+
+#[test]
+fn a_song_gets_its_arrangement_start_end_fade_out_and_transition() {
+    let dir = library();
+    let file = save(
+        dir.path(),
+        "Sunday",
+        vec![SetlistItem::Song(SongItem::new("Songs/Amazing.song"))],
+    );
+    let mut page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
+    page.act(LibraryAction::SelectRow(0));
+    let details = |page: &LibraryPage| match page.view(None).editor.unwrap().rows[0].details.clone()
+    {
+        Some(RowDetails::Song(details)) => details,
+        other => panic!("song details expected: {other:?}"),
+    };
+    assert_eq!(
+        details(&page),
+        SongDetails {
+            arrangements: vec![
+                Choice {
+                    label: "Default".to_owned(),
+                    selected: true
+                },
+                Choice {
+                    label: "Short".to_owned(),
+                    selected: false
+                },
+            ],
+            start: "1 · Intro".to_owned(),
+            end: "4 · Outro".to_owned(),
+            start_earlier: false,
+            start_later: true,
+            end_earlier: true,
+            end_later: false,
+            fade_out: false,
+        }
+    );
+
+    page.act(LibraryAction::StartLater(0));
+    page.act(LibraryAction::EndEarlier(0));
+    page.act(LibraryAction::ToggleFadeOut(0));
+    page.act(LibraryAction::Transition(0, Transition::Crossfade));
+    let item = SongItem {
+        start_position: Some(1),
+        end_position: Some(2),
+        fade_out: true,
+        transition: Transition::Crossfade,
+        ..SongItem::new("Songs/Amazing.song")
+    };
+    assert_eq!(on_disk(&page).items, [SetlistItem::Song(item.clone())]);
+    let shown = details(&page);
+    assert_eq!(
+        (shown.start.as_str(), shown.end.as_str()),
+        ("2 · Verse 1", "3 · Chorus")
+    );
+    let row = &page.view(None).editor.unwrap().rows[0];
+    assert_eq!(
+        row.meta,
+        "A · 132 BPM · Default · Verse 1 – Chorus · fade-out"
+    );
+    assert_eq!(row.length, "0:02");
+
+    // The start never passes the end.
+    page.act(LibraryAction::StartLater(0));
+    page.act(LibraryAction::StartLater(0));
+    assert_eq!(details(&page).start, "3 · Chorus");
+    assert!(!details(&page).start_later && !details(&page).end_earlier);
+
+    // Another arrangement plays in full again.
+    page.act(LibraryAction::Arrangement(0, 1));
+    assert_eq!(
+        on_disk(&page).items,
+        [SetlistItem::Song(SongItem {
+            arrangement: "short".to_owned(),
+            start_position: None,
+            end_position: None,
+            ..item
+        })]
+    );
+    assert_eq!(details(&page).end, "2 · Chorus");
+}
+
+#[test]
+fn a_click_tile_gets_its_tempo_meter_bars_and_transition() {
+    let dir = library();
+    let file = save(dir.path(), "Sunday", Vec::new());
+    let mut page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
+    page.act(LibraryAction::AddClick);
+
+    page.act(LibraryAction::BpmDown(0));
+    page.act(LibraryAction::BpmDown(0));
+    page.act(LibraryAction::Meter(0, 4));
+    page.act(LibraryAction::BarsUp(0));
+    page.act(LibraryAction::BarsUp(0));
+    page.act(LibraryAction::Transition(0, Transition::AutoLink));
+
+    assert_eq!(
+        on_disk(&page).items,
+        [SetlistItem::Click(ClickItem {
+            bpm: 118.0,
+            time_signature: TimeSignature {
+                numerator: 6,
+                denominator: 8
+            },
+            bars: Some(2),
+            transition: Transition::AutoLink,
+        })]
+    );
+    let row = page.view(None).editor.unwrap().rows[0].clone();
+    assert_eq!(row.meta, "118 BPM · 6/8 · 2 bars");
+    // Two bars of six eighth notes at 118 eighths a minute.
+    assert_eq!(row.length, "0:06");
+    let Some(RowDetails::Click(details)) = row.details else {
+        panic!("click details expected");
+    };
+    assert_eq!(details.bpm, "118 BPM");
+    assert_eq!(details.bars, "2 bars");
+    assert!(details.meters[4].selected && details.meters[4].label == "6/8");
+
+    page.act(LibraryAction::BarsDown(0));
+    page.act(LibraryAction::BarsDown(0));
+    let row = page.view(None).editor.unwrap().rows[0].clone();
+    assert_eq!(row.meta, "118 BPM · 6/8 · until you move on");
+    assert_eq!(row.length, "—");
+}
+
+#[test]
+fn the_rules_a_setlist_breaks_show_as_the_domain_reports_them() {
+    let dir = library();
+    let file = save(
+        dir.path(),
+        "Sunday",
+        vec![
+            SetlistItem::Song(SongItem::new("Songs/Gone.song")),
+            SetlistItem::Song(SongItem {
+                start_position: Some(3),
+                end_position: Some(1),
+                ..SongItem::new("Songs/Bright.song")
+            }),
+        ],
+    );
+    let page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
+
+    let editor = page.view(None).editor.unwrap();
+    assert_eq!(
+        editor.rows[0].problems,
+        ["item 1 names song \"Songs/Gone.song\", which is not in the library"]
+    );
+    assert_eq!(
+        editor.rows[1].problems,
+        ["item 2 has start position 3 after its end position 1"]
+    );
+    assert_eq!(editor.rows[0].title, "Gone");
+    assert_eq!(editor.rows[0].length, "—");
+    assert!(editor.problems.is_empty());
+}
+
+#[test]
+fn the_setlist_made_is_the_one_the_setlist_session_plays() {
+    let dir = library();
+    let file = save(dir.path(), "Sunday", Vec::new());
+    let mut page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
+    page.act(LibraryAction::AddSong(0));
+    page.act(LibraryAction::Transition(0, Transition::AutoLink));
+    page.act(LibraryAction::AddClick);
+    page.act(LibraryAction::BarsUp(1));
+    page.act(LibraryAction::AddSong(1));
+    page.act(LibraryAction::Arrangement(2, 1));
+
+    let prepared =
+        SetlistSession::prepare(&Library::new(dir.path()), &file, SessionOptions::default())
+            .unwrap();
+
+    let info = prepared.info();
+    assert_eq!(info.name, "Sunday");
+    assert!(info.unavailable().is_empty(), "{:?}", info.items);
+    assert_eq!(info.items.len(), 3);
+    assert_eq!(info.items[0].item.transition(), Transition::AutoLink);
+}
+
+#[test]
+fn a_setlist_in_a_file_named_by_hand_is_saved_in_one_file() {
+    let dir = library();
+    let mut setlist = Setlist::new("Sunday");
+    setlist.items = vec![SetlistItem::Song(SongItem::new("Songs/Amazing.song"))];
+    fs::create_dir_all(dir.path().join("Setlists")).unwrap();
+    fs::write(
+        dir.path().join("Setlists/by hand.setlist.json"),
+        setlist.to_json().unwrap(),
+    )
+    .unwrap();
+    let mut editor = SetlistEditor::open(Library::new(dir.path()), "by hand.setlist.json").unwrap();
+
+    editor.apply(Edit::FadeOut(0, true)).unwrap();
+
+    assert_eq!(files(dir.path()), ["Sunday.setlist.json"]);
+    assert_eq!(editor.file(), "Sunday.setlist.json");
+    let saved = Library::new(dir.path())
+        .load_setlist("Sunday.setlist.json")
+        .unwrap();
+    assert_eq!(&saved, editor.setlist());
+}
+
+#[test]
+fn a_refused_edit_changes_nothing() {
+    let dir = library();
+    let file = save(
+        dir.path(),
+        "Sunday",
+        vec![SetlistItem::Song(SongItem::new("Songs/Amazing.song"))],
+    );
+    let mut editor = SetlistEditor::open(Library::new(dir.path()), &file).unwrap();
+    let before = editor.setlist().clone();
+
+    let error = editor.apply(Edit::Remove(4)).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "item index 4 is out of range for a setlist of 1 items"
+    );
+    let error = editor
+        .apply(Edit::Click(
+            0,
+            ClickItem::new(
+                90.0,
+                TimeSignature {
+                    numerator: 3,
+                    denominator: 4,
+                },
+            ),
+        ))
+        .unwrap_err();
+    assert_eq!(error.to_string(), "item 1 is a song, not a click-only tile");
+
+    assert_eq!(editor.setlist(), &before);
+    assert_eq!(
+        Library::new(dir.path()).load_setlist(&file).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn the_song_list_shows_the_library_and_filters_by_title_key_or_tempo() {
+    let dir = library();
+    let mut page = LibraryPage::open(dir.path(), None).unwrap();
+
+    let view = page.view(None);
+    assert_eq!(view.song_summary, "2 songs");
+    let amazing = &view.songs[0];
+    assert_eq!(
+        (
+            amazing.title.as_str(),
+            amazing.key.as_str(),
+            amazing.bpm.as_str(),
+            amazing.length.as_str(),
+            amazing.stems.as_str(),
+            amazing.path.as_str()
+        ),
+        (
+            "Amazing",
+            "A",
+            "132",
+            "0:04",
+            "1 stem",
+            "Songs/Amazing.song"
+        )
+    );
+    assert_eq!(view.songs[1].key, "—");
+
+    page.act(LibraryAction::Search);
+    assert_eq!(page.typing(), Some(Field::Search));
+    page.type_key(LineKey::Text("9"));
+    let view = page.view(None);
+    assert_eq!(view.search, "9");
+    assert_eq!(view.song_summary, "1 of 2 songs");
+    assert_eq!(view.songs[0].title, "Bright");
+    // Adding from a filtered list adds the song shown.
+    page.act(LibraryAction::NewSetlist);
+    page.stop_typing();
+    page.act(LibraryAction::AddSong(0));
+    assert_eq!(
+        on_disk(&page).items,
+        [SetlistItem::Song(SongItem::new("Songs/Bright.song"))]
+    );
+
+    page.act(LibraryAction::Search);
+    page.type_key(LineKey::Backspace);
+    page.type_key(LineKey::Text("bri"));
+    assert_eq!(page.view(None).songs.len(), 1);
+    page.type_key(LineKey::Escape);
+    assert_eq!(page.view(None).search, "");
+    assert_eq!(page.view(None).songs.len(), 2);
+}
+
+#[test]
+fn the_editor_says_when_the_setlist_is_the_one_on_perform() {
+    let dir = library();
+    let file = save(dir.path(), "Sunday", Vec::new());
+    let page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
+
+    let view = page.view(Some(&file));
+    assert!(view.editor.unwrap().playing);
+    assert!(view.setlists[0].playing);
+    assert!(!page.view(None).editor.unwrap().playing);
+    assert_eq!(page.view(None).editor.unwrap().summary, "No items yet");
+}
+
+#[test]
+fn a_line_edit_types_deletes_commits_and_cancels() {
+    let mut field = LineEdit::new("Sun");
+    assert_eq!(field.key(LineKey::Text("day")), LineOutcome::Editing);
+    assert_eq!(field.text(), "Sunday");
+    assert_eq!(field.key(LineKey::Backspace), LineOutcome::Editing);
+    field.paste("s\nignored");
+    assert_eq!(field.text(), "Sundas");
+    field.paste("\u{7}é");
+    assert_eq!(
+        field.key(LineKey::Enter),
+        LineOutcome::Commit("Sundasé".to_owned())
+    );
+    assert_eq!(field.key(LineKey::Escape), LineOutcome::Cancel);
+
+    assert_eq!(
+        LineKey::from_key("backspace", None),
+        Some(LineKey::Backspace)
+    );
+    assert_eq!(LineKey::from_key("enter", None), Some(LineKey::Enter));
+    assert_eq!(LineKey::from_key("escape", None), Some(LineKey::Escape));
+    assert_eq!(LineKey::from_key("a", Some("A")), Some(LineKey::Text("A")));
+    assert_eq!(
+        LineKey::from_key("space", Some(" ")),
+        Some(LineKey::Text(" "))
+    );
+    assert_eq!(LineKey::from_key("left", None), None);
+}
+
+#[test]
+fn a_name_is_made_unique_with_a_number_ignoring_case() {
+    assert_eq!(unique_name("New setlist", &[]), "New setlist");
+    assert_eq!(
+        unique_name("New setlist", &["new SETLIST", "New setlist 2"]),
+        "New setlist 3"
+    );
+}
+
+#[test]
+fn while_a_field_has_the_focus_keys_type_into_it_except_shortcuts() {
+    use openvamp_desktop::keys::{KeyAction, KeyPress, Mods, SECONDARY_IS_PLATFORM, Typed, typed};
+
+    let plain = |key| KeyPress {
+        key,
+        mods: Mods::default(),
+    };
+    let secondary = Mods {
+        platform: SECONDARY_IS_PLATFORM,
+        control: !SECONDARY_IS_PLATFORM,
+        ..Mods::default()
+    };
+    // Space, x and digits type rather than play, panic or queue.
+    assert_eq!(
+        typed(&plain("space"), Some(" ")),
+        Typed::Line(LineKey::Text(" "))
+    );
+    assert_eq!(
+        typed(&plain("x"), Some("x")),
+        Typed::Line(LineKey::Text("x"))
+    );
+    assert_eq!(
+        typed(&plain("1"), Some("1")),
+        Typed::Line(LineKey::Text("1"))
+    );
+    assert_eq!(
+        typed(&plain("backspace"), None),
+        Typed::Line(LineKey::Backspace)
+    );
+    assert_eq!(typed(&plain("left"), None), Typed::Ignored);
+    let with_secondary = |key| KeyPress {
+        key,
+        mods: secondary,
+    };
+    assert_eq!(typed(&with_secondary("v"), Some("v")), Typed::Paste);
+    assert_eq!(
+        typed(&with_secondary("q"), Some("q")),
+        Typed::Key(KeyAction::Quit)
+    );
+    assert_eq!(
+        typed(&with_secondary("o"), Some("o")),
+        Typed::Key(KeyAction::OpenSong)
+    );
+    assert_eq!(typed(&with_secondary("a"), Some("a")), Typed::Ignored);
+}

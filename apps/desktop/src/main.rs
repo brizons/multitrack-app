@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod library_ui;
 mod screen;
 mod theme;
 mod ui;
