@@ -429,8 +429,30 @@ impl Player {
         })
     }
 
-    /// Times the arrangement played to its end and returned to the start
-    /// there, not counting stops and panics.
+    /// The earliest output frame, from now, where the arrangement can end
+    /// if no other command arrives: where [`Self::frames_to_end`] says, or,
+    /// when a queued jump or loop is deferred for its audio, where the
+    /// arrangement ends without it. A jump to another position that
+    /// switches the infinite loop off can end it too. `None` when nothing
+    /// can end it. Real-time safe.
+    pub(crate) fn earliest_end(&self) -> Option<u64> {
+        let entry = self.entries[self.voice.position];
+        let natural = (!self.infinite)
+            .then(|| (entry.len - self.voice.offset) + self.suffix[self.voice.position + 1]);
+        let jumped = self.queued.and_then(|queued| {
+            let leaves_loop = queued.kind == JumpKind::Jump && queued.target != self.voice.position;
+            (!self.infinite || leaves_loop)
+                .then(|| (self.jump_frame(queued) - self.output_frame) + self.suffix[queued.target])
+        });
+        match (natural, jumped) {
+            (Some(natural), Some(jumped)) => Some(natural.min(jumped)),
+            (natural, jumped) => natural.or(jumped),
+        }
+    }
+
+    /// Times the arrangement played to its end while playing and returned
+    /// to the start there. An end reached while a pause, stop or panic
+    /// ramps out does not count: the operator stopped the item.
     pub(crate) fn ends(&self) -> u64 {
         self.ends
     }
@@ -591,7 +613,11 @@ impl Player {
             }
             if self.voice.offset == self.entries[self.voice.position].len {
                 let Some(next) = self.natural_next() else {
-                    self.ends += 1;
+                    // An end reached while a pause, stop or panic ramps
+                    // out is the operator's stop, not the item ending.
+                    if self.transport == Transport::Playing {
+                        self.ends += 1;
+                    }
                     self.reset();
                     return;
                 };

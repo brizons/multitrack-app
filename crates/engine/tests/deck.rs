@@ -6,11 +6,14 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use common::{SongSpec, bits, mono, noise, onsets, plan, stereo};
 use domain::{SectionType, Song, StemRole, TimeSignature};
 use engine::live::{
-    Command, DECLICK_FRAMES, Deck, DeckController, Handoff, Player, PlayerConfig, Transport,
-    memory_sources,
+    Command, DECLICK_FRAMES, Deck, DeckController, Handoff, MemorySource, Player, PlayerConfig,
+    StemSource, Transport, memory_sources,
 };
 use engine::{MixSettings, StemAudio, render_offline};
 
@@ -540,4 +543,248 @@ fn selecting_during_a_crossfade_ramps_both_items_out_at_the_levels_they_had() {
     control.send(Command::Play).unwrap();
     let played = run(&mut deck, 64, expected_c.len() / 2);
     assert_eq!(bits(&played), bits(&expected_c), "C plays from its start");
+}
+
+/// A two-section song of `frames` frames, noise on two tracks.
+fn song_len(frames: u64, seed: u64) -> (Song, Vec<StemAudio>) {
+    let song = SongSpec::new(
+        RATE,
+        frames,
+        vec![
+            ("intro", SectionType::Intro, 0),
+            ("verse", SectionType::Verse, frames / 2),
+        ],
+        vec![("drums", StemRole::Track), ("keys", StemRole::Track)],
+    )
+    .build();
+    let stems = vec![
+        mono("drums", StemRole::Track, noise(seed, frames as usize)),
+        stereo(
+            "keys",
+            StemRole::Track,
+            noise(seed + 1, 2 * frames as usize),
+        ),
+    ];
+    (song, stems)
+}
+
+/// A click tile's player and its length.
+fn click_player(bars: Option<u32>, buffer: usize) -> (Player, u64) {
+    let click = Song::click_only(
+        RATE,
+        120.0,
+        TimeSignature {
+            numerator: 4,
+            denominator: 4,
+        },
+        bars,
+    )
+    .unwrap();
+    let (mut player, _controller) = Player::new(
+        &click,
+        "default",
+        &MixSettings::default(),
+        &PlayerConfig::new(RATE, buffer),
+        Vec::new(),
+    )
+    .unwrap();
+    player.set_infinite_at_start(bars.is_none());
+    (player, click.length())
+}
+
+fn first_diff(a: &[f32], b: &[f32]) -> Option<usize> {
+    a.iter()
+        .zip(b)
+        .position(|(x, y)| x.to_bits() != y.to_bits())
+        .map(|i| i / 2)
+}
+
+/// A memory source whose `is_ready` follows a shared flag, to hold a jump
+/// target back.
+struct Gated {
+    inner: MemorySource,
+    open: Arc<AtomicBool>,
+}
+
+impl StemSource for Gated {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn role(&self) -> StemRole {
+        self.inner.role()
+    }
+    fn read(&mut self, at: u64, out: &mut [f32]) -> bool {
+        self.inner.read(at, out)
+    }
+    fn is_ready(&mut self, at: u64, frames: u64) -> bool {
+        self.open.load(Ordering::SeqCst) && self.inner.is_ready(at, frames)
+    }
+    fn prefetch(&mut self, playhead: u64, targets: &[u64]) {
+        self.inner.prefetch(playhead, targets);
+    }
+}
+
+#[derive(Clone)]
+struct Probes {
+    open: Arc<AtomicBool>,
+}
+
+impl Probes {
+    fn new() -> Self {
+        Self {
+            open: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// A player whose sources are all gated by [`Self::open`].
+    fn player(&self, song: &(Song, Vec<StemAudio>), max_frames: usize) -> Player {
+        let sources: Vec<Box<dyn StemSource>> = song
+            .1
+            .iter()
+            .cloned()
+            .map(|stem| {
+                Box::new(Gated {
+                    inner: MemorySource::new(stem).unwrap(),
+                    open: Arc::clone(&self.open),
+                }) as Box<dyn StemSource>
+            })
+            .collect();
+        let (player, _controller) = Player::new(
+            &song.0,
+            "default",
+            &MixSettings::default(),
+            &PlayerConfig::new(RATE, max_frames),
+            sources,
+        )
+        .unwrap();
+        player
+    }
+}
+
+/// a panic in the last half second of an item with an AutoLink cue
+/// must not start the next item.
+#[test]
+fn a_panic_near_the_end_does_not_start_the_autolinked_item() {
+    let buffer = 256;
+    let a = song_len(24_000, 3);
+    let b = song_len(24_000, 70);
+    let (mut deck, mut control) = Deck::new(player(&a.0, a.1.clone(), buffer), 1, buffer);
+    control
+        .cue(player(&b.0, b.1.clone(), buffer), 2, Handoff::AutoLink)
+        .unwrap();
+    control.send(Command::Play).unwrap();
+    // Play to 2 000 frames before A's end (panic takes 4 000 frames).
+    let _ = run(&mut deck, buffer, 22_016);
+    control.send(Command::Panic).unwrap();
+    let after = run(&mut deck, buffer, 16_000);
+    let status = deck.status();
+    let loud_after = after[2 * 6_000..].iter().filter(|s| s.abs() > 0.0).count();
+    assert_eq!(
+        (status.item, status.current.transport, loud_after),
+        (1, Transport::Stopped, 0),
+        "after a panic, B started: item {} {:?}, {} non-zero samples",
+        status.item,
+        status.current.transport,
+        loud_after
+    );
+}
+
+/// a stop in the last DECLICK frames of an item with an AutoLink cue
+/// must not start the next item.
+#[test]
+fn a_stop_or_pause_near_the_end_does_not_start_the_autolinked_item() {
+    let buffer = 64;
+    let a = song_len(24_000, 3);
+    let b = song_len(24_000, 70);
+    for (name, command) in [("stop", Command::Stop), ("pause", Command::Pause)] {
+        let (mut deck, mut control) = Deck::new(player(&a.0, a.1.clone(), buffer), 1, buffer);
+        control
+            .cue(player(&b.0, b.1.clone(), buffer), 2, Handoff::AutoLink)
+            .unwrap();
+        control.send(Command::Play).unwrap();
+        let _ = run(&mut deck, buffer, 24_000 - 128);
+        control.send(command).unwrap();
+        let after = run(&mut deck, buffer, 4_000);
+        let status = deck.status();
+        let loud = after[2 * 1_000..].iter().filter(|s| s.abs() > 0.0).count();
+        assert_eq!(
+            (status.item, loud),
+            (1, 0),
+            "{name} 128 frames before the end: item {} {:?}, {} non-zero samples after",
+            status.item,
+            status.current.transport,
+            loud
+        );
+    }
+}
+
+/// a live loop of the last section deferred for its audio at the end:
+/// A ends where it would, so B should start on the next frame.
+#[test]
+fn a_deferred_loop_at_the_end_keeps_autolink_sample_exact() {
+    let buffer = 256;
+    let a = song_len(24_000, 3);
+    let b = song_len(9_000, 70);
+    let (oa, ob) = (offline(&a.0, &a.1), offline(&b.0, &b.1));
+    let probes = Probes::new();
+    let (mut deck, mut control) = Deck::new(probes.player(&a, buffer), 1, buffer);
+    control
+        .cue(player(&b.0, b.1.clone(), buffer), 2, Handoff::AutoLink)
+        .unwrap();
+    control.send(Command::Play).unwrap();
+    let mut out = run(&mut deck, buffer, 20_480);
+    control.send(Command::LiveLoop).unwrap();
+    probes.open.store(false, Ordering::SeqCst); // the loop target is not ready
+    out.extend(run(&mut deck, buffer, 24_000));
+    let mut expected = oa.clone();
+    expected.extend_from_slice(&ob);
+    expected.resize(out.len(), 0.0);
+    let diff = first_diff(&out, &expected);
+    let b_first = (0..out.len() / 2).find(|&f| f >= 24_000 && out[2 * f] != 0.0);
+    assert_eq!(
+        diff, None,
+        "A ends at frame 24000; B's first sample landed at {b_first:?}"
+    );
+}
+
+/// P10: a crossfade into a click tile shorter than the blend (a 2-bar
+/// count-in, 4 s) that AutoLinks into the next song: the song should start
+/// on the frame after the tile's last.
+#[test]
+fn autolink_out_of_a_short_item_inside_a_crossfade_is_sample_exact() {
+    let buffer = 256;
+    let a = song_len(56_000, 3);
+    let c = song_len(20_000, 90);
+    let oc = offline(&c.0, &c.1);
+    let (tile, lt) = click_player(Some(2), buffer); // 32 000 frames
+    let (mut deck, mut control) = Deck::new(player(&a.0, a.1.clone(), buffer), 1, buffer);
+    control
+        .cue(tile, 2, Handoff::Crossfade { frames: 40_000 })
+        .unwrap();
+    control.send(Command::Play).unwrap();
+    let mut out = Vec::new();
+    let mut chunk = vec![0.0f32; 2 * buffer];
+    let mut c_cued = false;
+    while out.len() < 2 * 80_000 {
+        deck.process(&mut chunk);
+        out.extend_from_slice(&chunk);
+        if !c_cued && deck.status().item == 2 {
+            control
+                .cue(player(&c.0, c.1.clone(), buffer), 3, Handoff::AutoLink)
+                .unwrap();
+            c_cued = true;
+        }
+        while control.returned().is_some() {}
+    }
+    // The tile starts at 16 000 and ends after 32 000 frames: C's first
+    // frame belongs at 48 000. A's own end is 56 000.
+    let tile_end = 16_000 + lt as usize;
+    let c_at = (0..80_000).find(|&f| {
+        out[2 * f..2 * f + 2 * 1_000]
+            .iter()
+            .zip(&oc[..2 * 1_000])
+            .all(|(x, y)| (x - y).abs() < 0.3)
+            && f > 40_000
+    });
+    assert_eq!(c_at, Some(tile_end), "C starts on the frame after the tile");
 }

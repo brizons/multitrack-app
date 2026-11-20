@@ -135,11 +135,9 @@ impl Blend {
 /// [`Handoff`]:
 ///
 /// - [`Handoff::AutoLink`]: the cued item starts on the frame right after
-///   the current item's last frame. The deck splits the buffer at that
-///   frame, so the switch is sample-exact whatever the buffer size. (The
-///   end is where the arrangement ends if nothing else changes; a queued
-///   jump or loop deferred for its audio moves it, and the switch then
-///   lands at the end of the piece the real end falls in.)
+///   the current item's last frame. The deck splits the buffer wherever the
+///   end can come (a queued jump or loop executing or deferred, a blend
+///   under way), so the switch is sample-exact whatever the buffer size.
 /// - [`Handoff::Crossfade`]: the cued item starts that many frames before
 ///   the current item's end and the two blend linearly, the gains summing to
 ///   1 on every frame, so two items that peak at −1 dBFS never sum above it
@@ -151,6 +149,10 @@ impl Blend {
 /// - [`Handoff::Stop`]: nothing; the item stops at its start as a player
 ///   does at its end, and [`DeckStatus::finished`] counts it, so the
 ///   control thread can apply a setlist's Cue next or Stay.
+///
+/// Only an end reached while the item plays hands over or counts as
+/// finished: when a pause, stop or panic ramps out past the end, the item
+/// just stops at its start and the cued item waits.
 ///
 /// The control thread can also make an item current at once
 /// ([`DeckController::select`], [`DeckController::select_cued`]): the
@@ -372,13 +374,25 @@ impl Deck {
         }
         if let Some(blend) = self.blend {
             n = n.min(blend.len - blend.played);
-        } else if let Some(cued) = &self.cued
+        }
+        if let Some(cued) = &self.cued
             && self.current.transport() == Transport::Playing
-            && let Some(to_end) = self.current.frames_to_end()
         {
             match cued.handoff {
-                Handoff::AutoLink => n = n.min(to_end),
-                Handoff::Crossfade { frames } if to_end > frames => n = n.min(to_end - frames),
+                // Wherever the end can come, so an AutoLink lands on the
+                // next frame even inside a blend or after a deferred jump.
+                Handoff::AutoLink => {
+                    if let Some(end) = self.current.earliest_end() {
+                        n = n.min(end);
+                    }
+                }
+                Handoff::Crossfade { frames } if self.blend.is_none() => {
+                    if let Some(to_end) = self.current.frames_to_end()
+                        && to_end > frames
+                    {
+                        n = n.min(to_end - frames);
+                    }
+                }
                 _ => {}
             }
         }
@@ -433,6 +447,9 @@ impl Deck {
         let n = out.len() / 2;
         let before = self.current.output_frame();
         let ends = self.current.ends();
+        // Commands apply before the first piece, so a transport that plays
+        // at the start of a piece played up to any end inside it.
+        let playing = self.current.transport() == Transport::Playing;
         self.current.process(out);
         let after = self.current.output_frame();
         // The incoming item advances over the first frames of the piece
@@ -477,7 +494,7 @@ impl Deck {
                 self.end_blend();
             }
         }
-        if self.current.ends() > ends {
+        if playing && self.current.ends() > ends {
             self.handoff_at_end();
         }
     }
