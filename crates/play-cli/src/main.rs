@@ -43,8 +43,8 @@ struct Args {
     #[arg(value_name = "SONG_DIR", required_unless_present = "list_devices")]
     song_dir: Option<PathBuf>,
 
-    /// Output device, by the name --list-devices prints. Default: the system
-    /// default output.
+    /// Output device, by the name or the id --list-devices prints; a name
+    /// two devices share needs the id. Default: the system default output.
     #[arg(long, value_name = "NAME")]
     device: Option<String>,
 
@@ -59,9 +59,9 @@ struct Args {
     )]
     buffer: u32,
 
-    /// List the output devices with their output channel counts (the default
-    /// marked with *), then exit. Cannot be combined with a song folder,
-    /// --device or --buffer.
+    /// List the output devices with their output channel counts and ids (the
+    /// default marked with *), then exit. Cannot be combined with a song
+    /// folder, --device or --buffer.
     #[arg(long, conflicts_with_all = ["song_dir", "device", "buffer"])]
     list_devices: bool,
 }

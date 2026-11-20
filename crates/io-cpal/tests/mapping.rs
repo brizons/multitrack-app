@@ -2,7 +2,7 @@
 //! session's stereo reaches the device's channels, and what a stream error
 //! means for the session.
 
-use app::OutputError;
+use app::{LossReason, OutputError};
 use cpal::{ErrorKind, SampleFormat, SupportedBufferSize, SupportedStreamConfigRange};
 use io_cpal::{StreamChoice, choose_config, loss_reason, write_interleaved};
 
@@ -175,17 +175,20 @@ fn integer_devices_get_the_converted_samples() {
 
 #[test]
 fn a_lost_device_or_an_invalidated_stream_stops_the_session_but_an_xrun_does_not() {
+    for (kind, reason) in [
+        (ErrorKind::DeviceNotAvailable, LossReason::Unplugged),
+        (ErrorKind::StreamInvalidated, LossReason::StreamInvalidated),
+        (ErrorKind::DeviceChanged, LossReason::DeviceChanged),
+        (ErrorKind::DeviceBusy, LossReason::DeviceBusy),
+        (ErrorKind::HostUnavailable, LossReason::HostStopped),
+        (ErrorKind::BackendError, LossReason::Failed),
+    ] {
+        assert_eq!(loss_reason(kind), Some(reason), "{kind:?}");
+    }
     assert_eq!(
-        loss_reason(ErrorKind::DeviceNotAvailable).as_deref(),
-        Some("the device was disconnected")
+        LossReason::StreamInvalidated.to_string(),
+        "the system invalidated the stream, for example because the device's sample rate changed"
     );
-    assert_eq!(
-        loss_reason(ErrorKind::StreamInvalidated).as_deref(),
-        Some(
-            "the system invalidated the stream, for example because the device's sample rate changed"
-        )
-    );
-    assert!(loss_reason(ErrorKind::BackendError).is_some());
     assert_eq!(loss_reason(ErrorKind::Xrun), None);
     assert_eq!(loss_reason(ErrorKind::RealtimeDenied), None);
 }

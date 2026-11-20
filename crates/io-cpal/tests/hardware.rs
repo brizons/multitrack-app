@@ -76,6 +76,10 @@ fn lists_the_output_devices_with_their_channel_counts() {
     let devices = CpalOutput::new().devices().expect("the audio host answers");
     assert!(!devices.is_empty(), "this machine has an output device");
     assert!(devices.iter().all(|device| !device.name.is_empty()));
+    let mut ids: Vec<&str> = devices.iter().map(|device| device.id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), devices.len(), "no two devices share an id");
     assert!(devices.iter().filter(|device| device.is_default).count() <= 1);
     assert!(devices.iter().any(|device| device.output_channels >= 2));
 }
@@ -100,6 +104,16 @@ fn opens_the_default_device_at_the_songs_rate_and_reports_the_buffer_latency() {
         panic!("the device plays");
     };
     assert_eq!(info.sample_rate, RATE);
+    let default = session
+        .devices()
+        .expect("the audio host answers")
+        .into_iter()
+        .find(|device| device.is_default)
+        .expect("a default output");
+    assert_eq!(
+        info.device_id, default.id,
+        "the default device, pinned by id"
+    );
     assert!(info.channels >= 2);
     assert!((64..=1_024).contains(&info.buffer_frames));
     assert_eq!(

@@ -9,9 +9,9 @@ play-cli <SONG_DIR> [--device <NAME>] [--buffer <FRAMES>] [--list-devices]
 | Flag | Meaning |
 |------|---------|
 | `<SONG_DIR>` | Song folder: `song.json` plus the WAV stems it lists. The `default` arrangement plays. |
-| `--device <NAME>` | Output device, by the name `--list-devices` prints. Default: the system default output, pinned when the song opens. |
+| `--device <NAME>` | Output device, by the name or the id `--list-devices` prints; names match exactly, then ignoring case. A name two devices share is refused: use the id. Default: the system default output. Either way the device is pinned by its id when the song opens. |
 | `--buffer <FRAMES>` | Frames per audio buffer, 64 to 1024. Default: 256. The status line shows the resulting latency. |
-| `--list-devices` | List the output devices with their output channel counts, the default marked `*`, then exit. Cannot be combined with a song folder, `--device` or `--buffer` (exit code 2). |
+| `--list-devices` | List the output devices with their output channel counts and ids, the default marked `*`, then exit. Cannot be combined with a song folder, `--device` or `--buffer` (exit code 2). |
 
 The song plays in stereo on outputs 1 and 2 of the device.
 
@@ -37,9 +37,10 @@ Single keys, no Enter. Letters work in either case.
 
 ```console
 $ play-cli --list-devices
-* MacBook Pro Speakers (2 output channels)
-  USB Audio Interface (18 output channels)
-$ play-cli songs/example --device "USB Audio Interface" --buffer 128
+* MacBook Pro Speakers (2 output channels), id coreaudio:BuiltInSpeakerDevice
+  USB Audio Interface (18 output channels), id coreaudio:AppleUSBAudioEngine:Vendor:USB Audio Interface:1100000:1
+  USB Audio Interface (18 output channels), id coreaudio:AppleUSBAudioEngine:Vendor:USB Audio Interface:1200000:1
+$ play-cli songs/example --device "coreaudio:AppleUSBAudioEngine:Vendor:USB Audio Interface:1200000:1" --buffer 128
 "Example Song" (arrangement "default", 6 positions) on "USB Audio Interface": 48000 Hz, 128 frames per buffer, 2.7 ms latency
 space: play/pause, 1-9: queue a section, q: quit; play-cli --help lists every key
 PLAYING  | bar 12.3 | Chorus (3/6) | next: jump to Bridge in 4.2 s | timing: section end | fade: in | 48000 Hz, 128 frames, 2.7 ms on "USB Audio Interface"
@@ -49,7 +50,7 @@ The status line holds, separated by `|`: the transport (`STOPPED`, `LOADING`, `P
 
 ## Device lost
 
-Unplugging the device pauses playback; the status line says `NO DEVICE` with the reason, and play is refused until the device is back. Other keys still work. When the same device is plugged back in, play-cli opens it again within half a second, with the transport still paused: press space to go on.
+When the device's stream stops, playback pauses; the status line says `NO DEVICE` with the reason (unplugged, stream invalidated by the system, busy with another application, and so on), and play is refused until the device opens again. Other keys still work. play-cli tries to open the same device again every half second, found by its id, so an identical interface with the same name is never taken instead; the transport stays paused: press space to go on. When the device is there but refuses to open, for example because it came back at another sample rate, the status line says why instead (`cannot open it again: …`).
 
 To check it by hand: start a song on a USB interface or headphones, unplug them while it plays, wait, plug them back in, and press space.
 
@@ -58,5 +59,5 @@ To check it by hand: start a song on a USB interface or headphones, unplug them 
 | Code | When | Output |
 |------|------|--------|
 | 0 | Quit with `q` or Ctrl-C, or `--list-devices` listed the devices. | The device list on stdout for `--list-devices`. |
-| 1 | The song folder cannot be loaded or validated, the device cannot be opened (not found, not at the song's sample rate, buffer size refused), standard input is not a terminal, or the terminal fails. | Every error on its own stderr line, prefixed `error:`; package warnings prefixed `warning:`. |
+| 1 | The song folder cannot be loaded or validated, the device cannot be opened (not found, a name two devices share, not at the song's sample rate, buffer size refused), standard input is not a terminal, or the terminal fails. | Every error on its own stderr line, prefixed `error:`; package warnings prefixed `warning:`. |
 | 2 | Usage error, such as a missing `<SONG_DIR>` or `--buffer` outside 64–1024. | clap's message on stderr. |

@@ -186,6 +186,8 @@ pub struct Player {
     /// Counts every re-entry of a position, so hints follow playhead jumps.
     voice_epoch: u64,
     last_hint: Option<Hint>,
+    /// Commands taken from the queue so far.
+    applied: u64,
 }
 
 impl Player {
@@ -294,6 +296,7 @@ impl Player {
             underruns: 0,
             voice_epoch: 0,
             last_hint: None,
+            applied: 0,
         };
         player.update_hints();
         Ok((
@@ -311,6 +314,7 @@ impl Player {
     pub fn process(&mut self, out: &mut [f32]) {
         while let Ok(command) = self.commands.pop() {
             self.apply(command);
+            self.applied += 1;
         }
         self.update_hints();
         out.fill(0.0);
@@ -355,6 +359,15 @@ impl Player {
             },
             underruns: self.underruns,
         }
+    }
+
+    /// How many commands the player has taken from its [`Controller`]'s
+    /// queue and applied so far. A [`Status`] read after a call that returns
+    /// as many as the controller sent describes the state those commands
+    /// left, such as the playhead after [`Command::BackToStart`]. Real-time
+    /// safe.
+    pub fn applied_commands(&self) -> u64 {
+        self.applied
     }
 
     /// Whether every source can start playing from the playhead now without

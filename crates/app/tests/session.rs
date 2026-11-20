@@ -12,10 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use app::testing::{FAKE_DEVICE, FakeOutput, UNPLUGGED};
+use app::testing::{FAKE_DEVICE, FAKE_DEVICE_ID, FakeOutput};
 use app::{
-    Command, DeviceStatus, FadeState, JumpKind, JumpTiming, LoadError, OpenError, OutputError,
-    OutputRequest, RuntimeError, Session, SessionOptions, StreamInfo, TransportState,
+    Command, DeviceChoice, DeviceStatus, FadeState, JumpKind, JumpTiming, LoadError, LossReason,
+    OpenError, OutputError, OutputRequest, RuntimeError, Session, SessionOptions, Snapshot,
+    StreamInfo, TransportState,
 };
 use common::{
     BAR, POS_CHORUS, POS_OUTRO, RATE, bits, closed_gate, is_silent, offline, open, play_for, start,
@@ -340,6 +341,7 @@ fn the_device_opens_at_the_songs_sample_rate_or_the_session_says_why_not() {
         session.poll().device,
         DeviceStatus::Connected(StreamInfo {
             device: "Studio".to_owned(),
+            device_id: "fake:1".to_owned(),
             sample_rate: RATE,
             buffer_frames: 256,
             channels: 8
@@ -401,6 +403,177 @@ fn a_jump_waiting_for_its_audio_shows_as_the_last_error() {
 }
 
 #[test]
+fn the_waiting_jump_error_clears_once_the_jump_executes_or_is_cancelled() {
+    for cancel in [false, true] {
+        let dir = song();
+        let (gate, open_gate) = gate_from(6 * BAR);
+        let fake = FakeOutput::new();
+        let mut session = open(
+            dir.path(),
+            &fake,
+            SessionOptions {
+                disk_gate: Some(gate),
+                ..options(1_024)
+            },
+        );
+        start(&mut session, &fake, 1_024);
+        session
+            .send(Command::QueueJump {
+                position: POS_OUTRO,
+            })
+            .unwrap();
+        let (_, waiting) = play_for(&mut session, &fake, 1_024, 2 * BAR as usize + 1_024);
+        assert_eq!(waiting.position, 1, "the jump moved on to the verse's end");
+        assert!(matches!(
+            waiting.last_error,
+            Some(RuntimeError::JumpWaiting { deferrals: 1, .. })
+        ));
+
+        let done = if cancel {
+            session.send(Command::CancelJump).unwrap();
+            let (_, cancelled) = play_for(&mut session, &fake, 1_024, 1_024);
+            assert_eq!(cancelled.position, 1);
+            cancelled
+        } else {
+            open_gate.store(true, Ordering::SeqCst);
+            let (_, jumped) = play_for(&mut session, &fake, 1_024, 2 * BAR as usize);
+            assert_eq!(jumped.position, POS_OUTRO, "the jump executed");
+            jumped
+        };
+        assert_eq!(done.queued, None);
+        assert_eq!(done.last_error, None, "cancelled: {cancel}");
+    }
+}
+
+#[test]
+fn a_start_timeout_clears_once_play_starts() {
+    let dir = song();
+    let (gate, open_gate) = closed_gate();
+    let fake = FakeOutput::new();
+    let mut session = open(
+        dir.path(),
+        &fake,
+        SessionOptions {
+            disk_gate: Some(gate),
+            start_timeout: Duration::from_millis(50),
+            ..options(256)
+        },
+    );
+    session.send(Command::Play).unwrap();
+    fake.render(256).unwrap();
+    thread::sleep(Duration::from_millis(60));
+    let timed_out = session.poll();
+    assert_eq!(timed_out.transport, TransportState::Stopped);
+    assert!(matches!(
+        timed_out.last_error,
+        Some(RuntimeError::StartTimeout { .. })
+    ));
+
+    open_gate.store(true, Ordering::SeqCst);
+    let (_, playing) = start(&mut session, &fake, 256);
+
+    assert_eq!(playing.transport, TransportState::Playing);
+    assert_eq!(playing.last_error, None);
+}
+
+#[test]
+fn a_decode_failure_stays_after_a_clean_stretch_because_failed_blocks_never_decode_again() {
+    let dir = song();
+    let (gate, open_gate) = gate_from(2 * BAR);
+    let fake = FakeOutput::new();
+    let mut session = open(
+        dir.path(),
+        &fake,
+        SessionOptions {
+            disk_gate: Some(gate),
+            ..options(1_024)
+        },
+    );
+    // The drums lose everything from the verse on, after they were checked.
+    let drums = OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("stems/drums.wav"))
+        .unwrap();
+    drums.set_len(44 + 2 * 2 * BAR).unwrap();
+    open_gate.store(true, Ordering::SeqCst);
+    start(&mut session, &fake, 1_024);
+    let (_, failing) = play_for(&mut session, &fake, 1_024, 2 * BAR as usize + 8_192);
+    assert!(failing.decode_errors > 0 && failing.underruns > 0);
+    assert!(matches!(
+        failing.last_error,
+        Some(RuntimeError::DecodeFailed { .. })
+    ));
+
+    // Back in the intro, every block decodes and every read is served.
+    session.send(Command::BackToStart).unwrap();
+    // Two of the disk's 1 s read-ahead windows at 8 kHz, all of it clean.
+    let (_, clean) = play_for(&mut session, &fake, 1_024, 2 * 8_000);
+
+    assert_eq!(clean.position, 0);
+    assert_eq!(
+        clean.decode_errors, failing.decode_errors,
+        "nothing new failed"
+    );
+    assert!(
+        matches!(clean.last_error, Some(RuntimeError::DecodeFailed { .. })),
+        "the failed verse will play as silence again, so the error stays"
+    );
+}
+
+#[test]
+fn play_right_after_back_to_start_waits_for_a_report_about_the_new_playhead() {
+    let dir = song();
+    let fake = FakeOutput::new();
+    let mut session = open(dir.path(), &fake, options(256));
+    let monitor = session.disk_monitor();
+    start(&mut session, &fake, 256);
+    play_for(&mut session, &fake, 256, 3 * BAR as usize);
+    session.send(Command::Pause).unwrap();
+    let (_, paused) = play_for(&mut session, &fake, 256, 1_024);
+    assert_eq!(
+        (paused.transport, paused.position),
+        (TransportState::Paused, 1)
+    );
+
+    // Both arrive before the audio thread runs again: the last report is
+    // still about the verse.
+    session.send(Command::BackToStart).unwrap();
+    session.send(Command::Play).unwrap();
+    assert_eq!(session.poll().transport, TransportState::Starting);
+    let (out, moved) = step(&mut session, &fake, &monitor, 256);
+
+    assert!(
+        is_silent(&out),
+        "play is not sent on a report about the old playhead"
+    );
+    assert_eq!(moved.transport, TransportState::Starting);
+    assert_eq!((moved.position, moved.source_frame), (0, 0));
+    let (out, playing) = step(&mut session, &fake, &monitor, 256);
+    assert!(!is_silent(&out));
+    assert_eq!(playing.transport, TransportState::Playing);
+    assert_eq!(playing.source_frame, 256, "it plays from the start");
+    assert_eq!(playing.underruns, 0);
+}
+
+#[test]
+fn play_right_after_pause_while_playing_still_resumes_at_once() {
+    let dir = song();
+    let fake = FakeOutput::new();
+    let mut session = open(dir.path(), &fake, options(256));
+    let monitor = session.disk_monitor();
+    start(&mut session, &fake, 256);
+    let (_, playing) = play_for(&mut session, &fake, 256, 4_096);
+
+    session.send(Command::Pause).unwrap();
+    session.send(Command::Play).unwrap();
+    let (out, snapshot) = step(&mut session, &fake, &monitor, 256);
+
+    assert!(!is_silent(&out));
+    assert_eq!(snapshot.transport, TransportState::Playing);
+    assert_eq!(snapshot.source_frame, playing.source_frame + 256);
+}
+
+#[test]
 fn blocks_the_disk_cannot_decode_show_as_the_last_error() {
     let dir = song();
     let (gate, open_gate) = gate_from(BAR);
@@ -455,14 +628,15 @@ fn unplugging_the_device_pauses_with_a_clear_message_and_plugging_it_back_restor
     let (_, playing) = play_for(&mut session, &fake, 256, 4_096);
     assert_eq!(playing.transport, TransportState::Playing);
 
-    fake.unplug(FAKE_DEVICE);
+    fake.unplug(FAKE_DEVICE_ID);
     let lost = session.poll();
 
     assert_eq!(
         lost.device,
         DeviceStatus::Disconnected {
             device: FAKE_DEVICE.to_owned(),
-            reason: UNPLUGGED.to_owned()
+            reason: LossReason::Unplugged,
+            reopen_error: None,
         }
     );
     assert_eq!(lost.transport, TransportState::Paused);
@@ -470,14 +644,14 @@ fn unplugging_the_device_pauses_with_a_clear_message_and_plugging_it_back_restor
         (playing.source_frame..=playing.source_frame + DECLICK_FRAMES).contains(&lost.source_frame),
         "it paused where it was"
     );
-    let error = RuntimeError::DeviceDisconnected {
+    let error = RuntimeError::DeviceLost {
         device: FAKE_DEVICE.to_owned(),
-        reason: UNPLUGGED.to_owned(),
+        reason: LossReason::Unplugged,
     };
     assert_eq!(lost.last_error, Some(error.clone()));
     assert_eq!(
         error.to_string(),
-        "audio device \"Fake Output\" is disconnected (the device was unplugged); playback is paused until it is plugged back in"
+        "audio device \"Fake Output\" was unplugged; playback is paused until it is plugged back in"
     );
 
     // Play waits for the device; other commands apply at once.
@@ -493,20 +667,22 @@ fn unplugging_the_device_pauses_with_a_clear_message_and_plugging_it_back_restor
     assert!(matches!(waiting.device, DeviceStatus::Disconnected { .. }));
     assert_eq!(fake.opened().len(), 1, "the retry found no device");
 
-    fake.plug(FAKE_DEVICE);
+    fake.plug(FAKE_DEVICE_ID);
     let back = session.poll();
 
-    assert!(matches!(&back.device, DeviceStatus::Connected(info) if info.device == FAKE_DEVICE));
+    assert!(
+        matches!(&back.device, DeviceStatus::Connected(info) if info.device_id == FAKE_DEVICE_ID)
+    );
     assert_eq!(back.transport, TransportState::Paused, "it stays paused");
     assert_eq!(back.last_error, None);
     assert_eq!(
         fake.opened()[1],
         OutputRequest {
-            device: Some(FAKE_DEVICE.to_owned()),
+            device: Some(DeviceChoice::Id(FAKE_DEVICE_ID.to_owned())),
             sample_rate: RATE,
             buffer_frames: 256
         },
-        "the same device, by name"
+        "the same device, by id"
     );
     let (out, still) = play_for(&mut session, &fake, 256, 2_048);
     assert!(is_silent(&out), "nothing plays until play");
@@ -516,6 +692,198 @@ fn unplugging_the_device_pauses_with_a_clear_message_and_plugging_it_back_restor
     let (resumed, _) = start(&mut session, &fake, 256);
     assert!(!is_silent(&resumed));
     assert_eq!(session.poll().transport, TransportState::Playing);
+}
+
+#[test]
+fn a_device_that_comes_back_but_refuses_to_open_says_why_and_the_session_keeps_trying() {
+    let dir = song();
+    let fake = FakeOutput::new();
+    let mut session = open(
+        dir.path(),
+        &fake,
+        SessionOptions {
+            reconnect_interval: Duration::ZERO,
+            ..options(256)
+        },
+    );
+    start(&mut session, &fake, 256);
+    fake.unplug(FAKE_DEVICE_ID);
+    session.poll();
+
+    // It comes back set to 44.1 kHz only.
+    fake.set_rates(FAKE_DEVICE_ID, Some(&[44_100]));
+    fake.plug(FAKE_DEVICE_ID);
+    session.poll();
+    let refused = session.poll();
+
+    let reopen = OutputError::UnsupportedSampleRate {
+        device: FAKE_DEVICE.to_owned(),
+        requested: RATE,
+        supported: vec![(44_100, 44_100)],
+    };
+    assert_eq!(
+        refused.device,
+        DeviceStatus::Disconnected {
+            device: FAKE_DEVICE.to_owned(),
+            reason: LossReason::Unplugged,
+            reopen_error: Some(reopen.clone()),
+        }
+    );
+    let error = RuntimeError::DeviceReopenFailed {
+        device: FAKE_DEVICE.to_owned(),
+        error: reopen,
+    };
+    assert_eq!(refused.last_error, Some(error.clone()));
+    assert_eq!(
+        error.to_string(),
+        "audio device \"Fake Output\" cannot be opened again: audio device \"Fake Output\" cannot play at 8000 Hz, the song's sample rate (nothing resamples); it supports 44100 Hz; playback stays paused"
+    );
+    assert_eq!(session.send(Command::Play), Err(error));
+    assert_eq!(refused.transport, TransportState::Paused);
+
+    // Gone again: it reads as lost again, not as refused.
+    fake.unplug(FAKE_DEVICE_ID);
+    let gone = session.poll();
+    assert!(matches!(
+        gone.device,
+        DeviceStatus::Disconnected {
+            reopen_error: None,
+            ..
+        }
+    ));
+    assert!(matches!(
+        gone.last_error,
+        Some(RuntimeError::DeviceLost {
+            reason: LossReason::Unplugged,
+            ..
+        })
+    ));
+
+    // Set back to the song's rate, it opens and every device error clears.
+    fake.set_rates(FAKE_DEVICE_ID, None);
+    fake.plug(FAKE_DEVICE_ID);
+    let back = session.poll();
+    assert!(matches!(back.device, DeviceStatus::Connected(_)));
+    assert_eq!(back.last_error, None);
+    assert_eq!(back.transport, TransportState::Paused);
+}
+
+#[test]
+fn a_lost_device_is_found_again_by_its_id_never_by_a_name_another_device_shares() {
+    let dir = song();
+    let fake = FakeOutput::without_devices()
+        .with_device("Twin", 2, None)
+        .with_device("Twin", 2, None);
+    let mut session = open(
+        dir.path(),
+        &fake,
+        SessionOptions {
+            reconnect_interval: Duration::ZERO,
+            ..options(256)
+        },
+    );
+    start(&mut session, &fake, 256);
+    fake.unplug("fake:1");
+    session.poll();
+
+    let waiting = session.poll();
+    assert!(
+        matches!(waiting.device, DeviceStatus::Disconnected { .. }),
+        "the other interface with the same name is not taken: {:?}",
+        waiting.device
+    );
+    assert_eq!(fake.opened().len(), 1);
+
+    fake.plug("fake:1");
+    let back = session.poll();
+    assert!(matches!(&back.device, DeviceStatus::Connected(info) if info.device_id == "fake:1"));
+    assert_eq!(
+        fake.opened()[1].device,
+        Some(DeviceChoice::Id("fake:1".to_owned()))
+    );
+}
+
+#[test]
+fn a_device_is_chosen_by_id_or_by_a_name_only_one_device_has() {
+    let dir = song();
+    let twins = || {
+        FakeOutput::without_devices()
+            .with_device("Studio", 2, None)
+            .with_device("Twin", 2, None)
+            .with_device("Twin", 2, None)
+    };
+    let chosen = |device: &str| {
+        let fake = twins();
+        Session::open(
+            dir.path(),
+            Box::new(fake),
+            SessionOptions {
+                device: Some(device.to_owned()),
+                ..options(256)
+            },
+        )
+        .map(|mut session| match session.poll().device {
+            DeviceStatus::Connected(info) => info.device_id,
+            other => panic!("not connected: {other:?}"),
+        })
+    };
+
+    assert_eq!(chosen("fake:3").unwrap(), "fake:3");
+    assert_eq!(chosen("Studio").unwrap(), "fake:1");
+    assert_eq!(chosen("studio").unwrap(), "fake:1", "ASCII case is ignored");
+    let error = chosen("Twin").unwrap_err();
+    assert!(matches!(
+        &error,
+        OpenError::Output(OutputError::AmbiguousDevice { name, ids })
+            if name == "Twin" && ids == &["fake:2", "fake:3"]
+    ));
+    assert_eq!(
+        error.to_string(),
+        "2 audio output devices are named \"Twin\"; choose one by id: \"fake:2\", \"fake:3\""
+    );
+    let error = chosen("Nowhere").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "no audio output device has the name or id \"Nowhere\"; available: \"Studio\", \"Twin\", \"Twin\""
+    );
+}
+
+#[test]
+fn the_loss_message_names_why_the_stream_stopped() {
+    let dir = song();
+    for (reason, message) in [
+        (
+            LossReason::DeviceBusy,
+            "audio device \"Fake Output\" stopped: the device is busy with another application; playback is paused until the device opens again",
+        ),
+        (
+            LossReason::StreamInvalidated,
+            "audio device \"Fake Output\" stopped: the system invalidated the stream, for example because the device's sample rate changed; playback is paused until the device opens again",
+        ),
+    ] {
+        let fake = FakeOutput::new();
+        let mut session = open(dir.path(), &fake, options(256));
+        start(&mut session, &fake, 256);
+
+        fake.lose(FAKE_DEVICE_ID, reason);
+        let lost = session.poll();
+
+        assert_eq!(
+            lost.device,
+            DeviceStatus::Disconnected {
+                device: FAKE_DEVICE.to_owned(),
+                reason,
+                reopen_error: None,
+            }
+        );
+        assert_eq!(lost.transport, TransportState::Paused);
+        let error = RuntimeError::DeviceLost {
+            device: FAKE_DEVICE.to_owned(),
+            reason,
+        };
+        assert_eq!(lost.last_error, Some(error.clone()));
+        assert_eq!(error.to_string(), message);
+    }
 }
 
 #[test]
@@ -546,6 +914,7 @@ fn the_snapshot_reports_transport_playhead_section_queue_loop_fade_and_device() 
         fresh.device,
         DeviceStatus::Connected(StreamInfo {
             device: FAKE_DEVICE.to_owned(),
+            device_id: FAKE_DEVICE_ID.to_owned(),
             sample_rate: RATE,
             buffer_frames: 1_024,
             channels: 2
@@ -689,4 +1058,151 @@ fn opening_a_missing_folder_or_arrangement_fails_before_any_device_opens() {
     .err()
     .unwrap();
     assert!(matches!(error, OpenError::Output(OutputError::NoDevice)));
+}
+
+/// Opens a session on the arrangement `repeat` (intro, chorus, verse,
+/// chorus) whose drums lose the chorus and what follows after the session
+/// checked them; the verse stays whole.
+fn repeat_with_a_failing_chorus(
+    fake: &FakeOutput,
+    extra: SessionOptions,
+) -> (tempfile::TempDir, Session) {
+    let dir = song();
+    let json = std::fs::read_to_string(dir.path().join("song.json")).unwrap();
+    let mut package = domain::SongPackage::from_json(&json).unwrap();
+    package.arrangements.push(domain::Arrangement {
+        id: "repeat".to_owned(),
+        name: "repeat".to_owned(),
+        sections: ["intro", "chorus", "verse", "chorus"]
+            .iter()
+            .map(|section| (*section).to_owned())
+            .collect(),
+        infinite_loop: Vec::new(),
+    });
+    std::fs::write(dir.path().join("song.json"), package.to_json().unwrap()).unwrap();
+    let (gate, open_gate) = gate_from(BAR / 2);
+    let session = open(
+        dir.path(),
+        fake,
+        SessionOptions {
+            arrangement: "repeat".to_owned(),
+            disk_gate: Some(gate),
+            ..extra
+        },
+    );
+    // The chorus is source bars 4 to 6.
+    let drums = OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("stems/drums.wav"))
+        .unwrap();
+    drums.set_len(44 + 2 * 4 * BAR).unwrap();
+    open_gate.store(true, Ordering::SeqCst);
+    (dir, session)
+}
+
+/// Plays to the end of the arrangement, calling `each` after every buffer,
+/// and fails when a buffer adds underruns while the snapshot names no
+/// problem. Returns the underruns played.
+fn play_failing_song(
+    session: &mut Session,
+    fake: &FakeOutput,
+    mut each: impl FnMut(&Snapshot, &mut Session),
+) -> u64 {
+    let monitor = session.disk_monitor();
+    let mut underruns = 0;
+    loop {
+        let (_, snapshot) = step(session, fake, &monitor, 256);
+        if snapshot.transport == TransportState::Stopped {
+            break;
+        }
+        assert!(
+            snapshot.underruns == underruns || snapshot.last_error.is_some(),
+            "the drums play silence at frame {} (position {}) and the snapshot names no problem",
+            snapshot.output_frame,
+            snapshot.position
+        );
+        underruns = snapshot.underruns;
+        each(&snapshot, session);
+    }
+    underruns
+}
+
+#[test]
+fn a_failed_section_that_plays_again_after_a_clean_stretch_shows_the_decode_error_again() {
+    let fake = FakeOutput::new();
+    let (_dir, mut session) = repeat_with_a_failing_chorus(&fake, options(256));
+    start(&mut session, &fake, 256);
+
+    let underruns = play_failing_song(&mut session, &fake, |_, _| {});
+
+    assert!(underruns > 0, "the second chorus played its failed blocks");
+}
+
+#[test]
+fn cancelling_a_jump_that_waited_for_failed_audio_shows_the_decode_error_again() {
+    let fake = FakeOutput::new();
+    let (_dir, mut session) = repeat_with_a_failing_chorus(&fake, options(256));
+    start(&mut session, &fake, 256);
+    let mut queued = false;
+    let mut cancelled = false;
+    let mut after_cancel: Option<Option<RuntimeError>> = None;
+
+    // In the verse, queue a jump back to the first chorus: its audio failed,
+    // so the jump waits; cancel it once it does.
+    let underruns = play_failing_song(&mut session, &fake, |snapshot, session| {
+        if snapshot.position == 2 && !queued {
+            session.send(Command::QueueJump { position: 1 }).unwrap();
+            queued = true;
+        }
+        let waiting = matches!(snapshot.last_error, Some(RuntimeError::JumpWaiting { .. }));
+        if !cancelled && waiting {
+            session.send(Command::CancelJump).unwrap();
+            cancelled = true;
+        } else if cancelled && !waiting && after_cancel.is_none() {
+            after_cancel = Some(snapshot.last_error.clone());
+        }
+    });
+
+    assert!(cancelled, "the jump waited for the failed chorus");
+    let after_cancel = after_cancel.expect("the waiting jump ended");
+    assert!(
+        matches!(after_cancel, Some(RuntimeError::DecodeFailed { .. })),
+        "the decode failure is back once the jump is over: {after_cancel:?}"
+    );
+    assert!(underruns > 0, "the second chorus played its failed blocks");
+}
+
+#[test]
+fn a_device_that_plays_again_shows_an_earlier_decode_failure_again() {
+    let fake = FakeOutput::new();
+    let (_dir, mut session) = repeat_with_a_failing_chorus(
+        &fake,
+        SessionOptions {
+            reconnect_interval: Duration::ZERO,
+            ..options(256)
+        },
+    );
+    start(&mut session, &fake, 256);
+    let (_, failing) = play_for(&mut session, &fake, 256, 4 * BAR as usize);
+    assert!(matches!(
+        failing.last_error,
+        Some(RuntimeError::DecodeFailed { .. })
+    ));
+
+    fake.unplug(FAKE_DEVICE_ID);
+    let lost = session.poll();
+    assert!(matches!(
+        lost.last_error,
+        Some(RuntimeError::DeviceLost { .. })
+    ));
+    fake.plug(FAKE_DEVICE_ID);
+    let back = session.poll();
+
+    assert!(matches!(back.device, DeviceStatus::Connected(_)));
+    assert_eq!(
+        back.last_error,
+        Some(RuntimeError::DecodeFailed {
+            blocks: back.decode_errors
+        })
+    );
 }

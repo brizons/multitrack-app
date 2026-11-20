@@ -16,8 +16,8 @@ use rtrb::Consumer;
 
 use crate::error::{OpenError, RuntimeError};
 use crate::output::{
-    AudioOutput, DEFAULT_BUFFER_FRAMES, MAX_BUFFER_FRAMES, MIN_BUFFER_FRAMES, OutputRequest,
-    OutputStream, StreamHealth, StreamInfo,
+    AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceChoice, LossReason, MAX_BUFFER_FRAMES,
+    MIN_BUFFER_FRAMES, OutputError, OutputRequest, OutputStream, StreamHealth, StreamInfo,
 };
 use crate::renderer::{AudioRenderer, AudioState, Report};
 use crate::song::SongInfo;
@@ -30,8 +30,10 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct SessionOptions {
     /// Arrangement to play. Default: `default`.
     pub arrangement: String,
-    /// Output device name; `None` for the system default output. Default:
-    /// `None`.
+    /// Output device, by id or name as [`DeviceChoice::Named`] matches it;
+    /// `None` for the system default output. Whichever device opens, the
+    /// session comes back to that one device by its id when it is lost.
+    /// Default: `None`.
     pub device: Option<String>,
     /// Frames per audio callback, [`MIN_BUFFER_FRAMES`] to
     /// [`MAX_BUFFER_FRAMES`] (F8.5). Default: [`DEFAULT_BUFFER_FRAMES`].
@@ -72,7 +74,9 @@ pub enum Command {
     /// Starts or resumes playing. From stopped or paused, it first waits
     /// until the disk has the audio at the playhead (the snapshot says
     /// [`TransportState::Starting`]), at most
-    /// [`SessionOptions::start_timeout`].
+    /// [`SessionOptions::start_timeout`]; the playhead is where every
+    /// command sent before it left it, such as the start after
+    /// [`Command::BackToStart`].
     Play,
     /// Ramps out and holds the position.
     Pause,
@@ -154,12 +158,24 @@ pub struct FadeView {
 pub enum DeviceStatus {
     /// A device plays the session.
     Connected(StreamInfo),
-    /// The device was lost; the transport is paused until it is back.
+    /// The stream on the device was lost; the transport is paused, and the
+    /// session tries to open the device again every
+    /// [`SessionOptions::reconnect_interval`].
     Disconnected {
-        /// The device that played.
+        /// Name of the device that played.
         device: String,
-        /// Why it was lost.
-        reason: String,
+        /// Why the stream was lost.
+        reason: LossReason,
+        /// Why the last try to open it again failed, when the device is
+        /// there but refused, such as a device that came back at another
+        /// sample rate; `None` while the device is absent.
+        reopen_error: Option<OutputError>,
+    },
+    /// The output kept the player after its stream closed, so the session
+    /// cannot play any more ([`RuntimeError::PlayerLost`]).
+    PlayerLost {
+        /// Name of the device that played.
+        device: String,
     },
 }
 
@@ -195,7 +211,25 @@ pub struct Snapshot {
     pub underruns: u64,
     /// Blocks the disk thread could not decode.
     pub decode_errors: u64,
-    /// The most recent problem, until a newer one replaces it.
+    /// The most recent problem. A problem tied to a condition clears when
+    /// the condition ends, unless a newer problem replaced it first; it then
+    /// falls back to a decode failure seen earlier, if any (see below):
+    ///
+    /// - [`RuntimeError::JumpWaiting`]: when the jump executes, is cancelled
+    ///   or is replaced by one that has not waited.
+    /// - [`RuntimeError::StartTimeout`]: when play is sent again.
+    /// - [`RuntimeError::DeviceLost`] and [`RuntimeError::DeviceReopenFailed`]:
+    ///   when the device plays again; a reopen failure turns back into the
+    ///   loss when the device is absent again.
+    ///
+    /// Events stay until a newer problem replaces them: a refused command
+    /// ([`RuntimeError::QueueFull`], [`RuntimeError::UnknownPosition`]),
+    /// [`RuntimeError::PlayerLost`], which never ends, and
+    /// [`RuntimeError::DecodeFailed`]. A decode failure never ends either:
+    /// the disk does not decode a failed block again, so its audio plays as
+    /// silence whenever the arrangement reaches it, and the disk may report
+    /// it long before (prefetch heads are decoded early).
+    /// [`Self::decode_errors`] keeps counting failed blocks.
     pub last_error: Option<RuntimeError>,
 }
 
@@ -219,8 +253,9 @@ enum Link {
     /// back.
     Held {
         state: Box<AudioState>,
-        device: String,
-        reason: String,
+        reason: LossReason,
+        /// Why the last reopen failed, when the device was there.
+        reopen_error: Option<OutputError>,
         retry_at: Instant,
     },
     /// The output kept the player; nothing plays any more.
@@ -243,6 +278,8 @@ pub struct Session {
     song: SongInfo,
     output: Box<dyn AudioOutput>,
     request: OutputRequest,
+    /// Name of the device the session plays on.
+    device: String,
     controller: Controller,
     reports: triple_buffer::Output<Report>,
     monitor: DiskMonitor,
@@ -254,6 +291,9 @@ pub struct Session {
     last_error: Option<RuntimeError>,
     decode_errors_seen: u64,
     deferral_seen: Option<(usize, u32)>,
+    /// Commands the controller accepted; a report that has applied as many
+    /// describes the playhead they left.
+    sent: u64,
 }
 
 impl Session {
@@ -311,6 +351,7 @@ impl Session {
         let first = Report {
             status: player.status(),
             ready: false,
+            applied: 0,
         };
         let (input, reports) = triple_buffer::triple_buffer(&first);
         let mut state = Box::new(AudioState {
@@ -319,17 +360,18 @@ impl Session {
         });
         state.publish();
         let request = OutputRequest {
-            device: options.device.clone(),
+            device: options.device.clone().map(DeviceChoice::Named),
             sample_rate,
             buffer_frames,
         };
         let (renderer, home) = AudioRenderer::new(state);
         let (stream, request) = match output.open(&request, renderer) {
             Ok(stream) => {
-                // Come back to this very device when it is lost, not to
-                // whatever the default output is by then.
+                // Come back to this very device when it is lost, by its id:
+                // not to whatever the default output is by then, nor to
+                // another device with the same name.
                 let request = OutputRequest {
-                    device: Some(stream.info().device.clone()),
+                    device: Some(DeviceChoice::Id(stream.info().device_id.clone())),
                     ..request
                 };
                 (stream, request)
@@ -344,6 +386,7 @@ impl Session {
             song: info,
             output,
             request,
+            device: stream.info().device.clone(),
             controller,
             reports,
             monitor,
@@ -355,6 +398,7 @@ impl Session {
             last_error: None,
             decode_errors_seen: 0,
             deferral_seen: None,
+            sent: 0,
         })
     }
 
@@ -434,23 +478,23 @@ impl Session {
 
     /// Play from stopped or paused waits until the sources have the playhead
     /// ready, so the first buffer is never a silent underrun (advisory A4).
+    /// It decides on a report that describes the playhead every command
+    /// sent so far left; right after back to start, the last report may
+    /// still describe the old playhead, so play waits for the next one.
     fn play(&mut self) -> Result<(), RuntimeError> {
-        match &self.link {
-            Link::Held { device, reason, .. } => {
-                return Err(RuntimeError::DeviceDisconnected {
-                    device: device.clone(),
-                    reason: reason.clone(),
-                });
-            }
-            Link::Lost => return Err(RuntimeError::PlayerLost),
-            Link::Streaming { .. } => {}
+        if let Some(error) = self.device_error() {
+            return Err(error);
         }
+        if let Link::Lost = self.link {
+            return Err(RuntimeError::PlayerLost);
+        }
+        self.clear_error(|error| matches!(error, RuntimeError::StartTimeout { .. }));
         let report = *self.reports.read();
         let silent = matches!(
             report.status.transport,
             Transport::Stopped | Transport::Paused
         );
-        if silent && !report.ready {
+        if silent && !self.can_start(&report) {
             if !matches!(self.start, Some(Start::Waiting { .. })) {
                 self.start = Some(Start::Waiting {
                     deadline: Instant::now() + self.start_timeout,
@@ -472,7 +516,7 @@ impl Session {
             return;
         }
         if let Start::Waiting { deadline } = start {
-            if report.ready {
+            if self.can_start(report) {
                 self.start = Some(Start::Sent);
                 if let Err(error) = self.forward(live::Command::Play) {
                     self.start = None;
@@ -487,10 +531,39 @@ impl Session {
         }
     }
 
+    /// Whether `report` says the playhead is ready, and describes the
+    /// playhead every command sent so far left.
+    fn can_start(&self, report: &Report) -> bool {
+        report.ready && report.applied >= self.sent
+    }
+
+    /// Queues `command` for the player and counts it.
+    fn push(&mut self, command: live::Command) -> Result<(), SendError> {
+        self.controller.send(command)?;
+        self.sent += 1;
+        Ok(())
+    }
+
+    /// Clears the last error when `ended` says the condition behind it is
+    /// over, falling back to a decode failure that still stands.
+    fn clear_error(&mut self, ended: impl Fn(&RuntimeError) -> bool) {
+        if self.last_error.as_ref().is_some_and(ended) {
+            self.last_error = self.standing_error();
+        }
+    }
+
+    /// A problem that outlives any newer one: failed blocks are never
+    /// decoded again, so their audio stays silent for the session.
+    fn standing_error(&self) -> Option<RuntimeError> {
+        (self.decode_errors_seen > 0).then_some(RuntimeError::DecodeFailed {
+            blocks: self.decode_errors_seen,
+        })
+    }
+
     /// Sends `command` to the player. While the device is lost the control
     /// thread holds the player, so it applies the command at once.
     fn forward(&mut self, command: live::Command) -> Result<(), RuntimeError> {
-        self.controller.send(command).map_err(|error| match error {
+        self.push(command).map_err(|error| match error {
             SendError::Full(command) => RuntimeError::QueueFull {
                 command: format!("{command:?}"),
             },
@@ -527,11 +600,10 @@ impl Session {
 
     /// Takes the player back from the dead stream, pauses it at once, and
     /// holds it until the device is back (F8 acceptance).
-    fn device_lost(&mut self, reason: String, now: Instant) {
+    fn device_lost(&mut self, reason: LossReason, now: Instant) {
         let Link::Streaming { stream, home } = mem::replace(&mut self.link, Link::Lost) else {
             return;
         };
-        let device = stream.info().device.clone();
         drop(stream);
         self.start = None;
         let Some(mut state) = take_back(home) else {
@@ -539,16 +611,13 @@ impl Session {
             return;
         };
         self.pause_now(&mut state);
-        self.last_error = Some(RuntimeError::DeviceDisconnected {
-            device: device.clone(),
-            reason: reason.clone(),
-        });
         self.link = Link::Held {
             state,
-            device,
             reason,
+            reopen_error: None,
             retry_at: now + self.reconnect_interval,
         };
+        self.last_error = self.device_error();
     }
 
     /// Pauses the held player on the control thread: no device is calling
@@ -556,7 +625,7 @@ impl Session {
     /// a panic under way finishes the same way.
     fn pause_now(&mut self, state: &mut AudioState) {
         state.player.process(&mut []);
-        let _ = self.controller.send(live::Command::Pause);
+        let _ = self.push(live::Command::Pause);
         let max_frames = self.request.buffer_frames as usize;
         let mut scratch = vec![0.0f32; 2 * max_frames];
         let longest =
@@ -570,12 +639,38 @@ impl Session {
         state.publish();
     }
 
-    /// Opens the lost device again; the transport stays paused.
+    /// What keeps a held player from playing: the lost device, or why it
+    /// did not open again.
+    fn device_error(&self) -> Option<RuntimeError> {
+        let Link::Held {
+            reason,
+            reopen_error,
+            ..
+        } = &self.link
+        else {
+            return None;
+        };
+        let device = self.device.clone();
+        Some(match reopen_error {
+            Some(error) => RuntimeError::DeviceReopenFailed {
+                device,
+                error: error.clone(),
+            },
+            None => RuntimeError::DeviceLost {
+                device,
+                reason: *reason,
+            },
+        })
+    }
+
+    /// Opens the lost device again; the transport stays paused. A failed
+    /// try is reported only when its reason changes, so a newer problem is
+    /// not overwritten at every retry.
     fn reconnect(&mut self, now: Instant) {
         let Link::Held {
             state,
-            device,
             reason,
+            reopen_error,
             ..
         } = mem::replace(&mut self.link, Link::Lost)
         else {
@@ -584,36 +679,49 @@ impl Session {
         let (renderer, home) = AudioRenderer::new(state);
         match self.output.open(&self.request, renderer) {
             Ok(stream) => {
+                self.device = stream.info().device.clone();
                 self.link = Link::Streaming { stream, home };
-                if matches!(
-                    self.last_error,
-                    Some(RuntimeError::DeviceDisconnected { .. })
-                ) {
-                    self.last_error = None;
-                }
+                self.clear_error(|error| {
+                    matches!(
+                        error,
+                        RuntimeError::DeviceLost { .. } | RuntimeError::DeviceReopenFailed { .. }
+                    )
+                });
             }
-            Err(_) => match take_back(home) {
+            Err(error) => match take_back(home) {
                 Some(state) => {
+                    // An absent device is still lost for its first reason;
+                    // one that is there but refuses says why.
+                    let absent = matches!(
+                        error,
+                        OutputError::NoDevice | OutputError::DeviceNotFound { .. }
+                    );
+                    let changed = reopen_error.as_ref() != (!absent).then_some(&error);
                     self.link = Link::Held {
                         state,
-                        device,
                         reason,
+                        reopen_error: (!absent).then_some(error),
                         retry_at: now + self.reconnect_interval,
                     };
+                    if changed {
+                        self.last_error = self.device_error();
+                    }
                 }
                 None => self.last_error = Some(RuntimeError::PlayerLost),
             },
         }
     }
 
-    /// Records new decode failures and new deferrals of the queued jump.
+    /// Records new decode failures, and new deferrals of the queued jump
+    /// until the jump is over (see [`Snapshot::last_error`]).
     fn watch_disk(&mut self, report: &Report) {
+        let status = &report.status;
         let errors = self.monitor.decode_errors();
         if errors > self.decode_errors_seen {
             self.decode_errors_seen = errors;
             self.last_error = Some(RuntimeError::DecodeFailed { blocks: errors });
         }
-        match report.status.queued {
+        match status.queued {
             Some(queued) if queued.deferrals > 0 => {
                 let seen = (queued.target, queued.deferrals);
                 if self.deferral_seen != Some(seen) {
@@ -624,7 +732,10 @@ impl Session {
                     });
                 }
             }
-            _ => self.deferral_seen = None,
+            _ => {
+                self.deferral_seen = None;
+                self.clear_error(|error| matches!(error, RuntimeError::JumpWaiting { .. }));
+            }
         }
     }
 
@@ -643,13 +754,17 @@ impl Session {
         };
         let device = match &self.link {
             Link::Streaming { stream, .. } => DeviceStatus::Connected(stream.info().clone()),
-            Link::Held { device, reason, .. } => DeviceStatus::Disconnected {
-                device: device.clone(),
-                reason: reason.clone(),
+            Link::Held {
+                reason,
+                reopen_error,
+                ..
+            } => DeviceStatus::Disconnected {
+                device: self.device.clone(),
+                reason: *reason,
+                reopen_error: reopen_error.clone(),
             },
-            Link::Lost => DeviceStatus::Disconnected {
-                device: self.request.device.clone().unwrap_or_default(),
-                reason: RuntimeError::PlayerLost.to_string(),
+            Link::Lost => DeviceStatus::PlayerLost {
+                device: self.device.clone(),
             },
         };
         Snapshot {

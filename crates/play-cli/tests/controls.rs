@@ -3,8 +3,9 @@
 use std::time::Duration;
 
 use app::{
-    Command, DeviceInfo, DeviceStatus, FadeState, FadeView, JumpKind, JumpTiming, PositionInfo,
-    QueuedView, RuntimeError, Snapshot, SongInfo, StreamInfo, TransportState,
+    Command, DeviceInfo, DeviceStatus, FadeState, FadeView, JumpKind, JumpTiming, LossReason,
+    OutputError, PositionInfo, QueuedView, RuntimeError, Snapshot, SongInfo, StreamInfo,
+    TransportState,
 };
 use play_cli::{Action, action_for_key, device_list, status_line};
 
@@ -49,6 +50,7 @@ fn snapshot() -> Snapshot {
         },
         device: DeviceStatus::Connected(StreamInfo {
             device: "Speakers".to_owned(),
+            device_id: "host:speakers".to_owned(),
             sample_rate: 48_000,
             buffer_frames: 256,
             channels: 2,
@@ -186,38 +188,67 @@ fn the_status_line_shows_the_queue_loops_fade_progress_and_problems() {
         },
         device: DeviceStatus::Disconnected {
             device: "Interface".to_owned(),
-            reason: "the device was disconnected".to_owned(),
+            reason: LossReason::Unplugged,
+            reopen_error: None,
         },
         ..snapshot()
     };
     assert_eq!(
         status_line(&looping, &song()),
-        "PAUSED   | bar 3.2 | Verse 1 (2/3) | next: loop Verse 1 in 1.5 s | timing: section end | fade: out | NO DEVICE: \"Interface\" (the device was disconnected)"
+        "PAUSED   | bar 3.2 | Verse 1 (2/3) | next: loop Verse 1 in 1.5 s | timing: section end | fade: out | NO DEVICE: \"Interface\" (the device was unplugged)"
     );
 }
 
 #[test]
+fn the_status_line_says_why_a_lost_device_does_not_open_again() {
+    let busy = Snapshot {
+        transport: TransportState::Paused,
+        device: DeviceStatus::Disconnected {
+            device: "Interface".to_owned(),
+            reason: LossReason::DeviceBusy,
+            reopen_error: None,
+        },
+        ..snapshot()
+    };
+    assert!(
+        status_line(&busy, &song())
+            .ends_with("NO DEVICE: \"Interface\" (the device is busy with another application)")
+    );
+
+    let refused = Snapshot {
+        device: DeviceStatus::Disconnected {
+            device: "Interface".to_owned(),
+            reason: LossReason::Unplugged,
+            reopen_error: Some(OutputError::UnsupportedSampleRate {
+                device: "Interface".to_owned(),
+                requested: 48_000,
+                supported: vec![(44_100, 44_100)],
+            }),
+        },
+        ..busy
+    };
+    assert!(status_line(&refused, &song()).ends_with(
+        "NO DEVICE: \"Interface\" (cannot open it again: audio device \"Interface\" cannot play at 48000 Hz, the song's sample rate (nothing resamples); it supports 44100 Hz)"
+    ));
+}
+
+#[test]
 fn the_device_list_shows_each_device_with_its_output_channels_and_the_default() {
+    let device = |id: &str, name: &str, output_channels, is_default| DeviceInfo {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        output_channels,
+        is_default,
+    };
     let devices = [
-        DeviceInfo {
-            name: "Speakers".to_owned(),
-            output_channels: 2,
-            is_default: true,
-        },
-        DeviceInfo {
-            name: "Interface".to_owned(),
-            output_channels: 18,
-            is_default: false,
-        },
-        DeviceInfo {
-            name: "Meeting".to_owned(),
-            output_channels: 1,
-            is_default: false,
-        },
+        device("host:speakers", "Speakers", 2, true),
+        device("host:usb-1", "Interface", 18, false),
+        device("host:usb-2", "Interface", 18, false),
+        device("host:meeting", "Meeting", 1, false),
     ];
     assert_eq!(
         device_list(&devices),
-        "* Speakers (2 output channels)\n  Interface (18 output channels)\n  Meeting (1 output channel)\n"
+        "* Speakers (2 output channels), id host:speakers\n  Interface (18 output channels), id host:usb-1\n  Interface (18 output channels), id host:usb-2\n  Meeting (1 output channel), id host:meeting\n"
     );
     assert_eq!(device_list(&[]), "no audio output device found\n");
 }

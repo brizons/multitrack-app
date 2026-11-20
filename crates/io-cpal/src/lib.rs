@@ -6,8 +6,28 @@
 //! cannot run at it is an error; nothing resamples), with a fixed buffer of
 //! the size the session asks for (F8.5), stereo on outputs 1 and 2 of one
 //! device. A session that asks for the default output gets the device that
-//! is the default when it opens, pinned, so the stream never moves to
-//! another device on its own.
+//! is the default when it opens, pinned by its id, so the stream never moves
+//! to another device on its own.
+//!
+//! # Device identity
+//!
+//! A device's id ([`app::DeviceInfo::id`]) is `cpal`'s `DeviceId`, printed
+//! as `host:device`: the device UID on macOS (Core Audio), the endpoint id
+//! on Windows (WASAPI), the PCM name on Linux (ALSA). Core Audio and WASAPI
+//! give each device its own id, kept across unplugging and reboots, so two
+//! identical interfaces never share one and a lost device is found again
+//! only when that very device is back. ALSA names a card by the index or id
+//! the kernel gives it in plug order (`hw:CARD=Interface,DEV=0`, then
+//! `Interface_1` for a second identical card): two identical interfaces
+//! still have different ids, but they can swap them when both are plugged
+//! back in the other order. The system default output is pinned by its id
+//! too; when it is not among the listed devices, it is offered on its own,
+//! so a session can come back to it.
+//!
+//! Devices are read without `cpal`'s `Display`, which fails while a device
+//! disappears: a device whose id cannot be read is left out (it cannot be
+//! pinned, and it is going away), one whose name cannot be read is listed
+//! as [`UNNAMED`].
 //!
 //! The data callback obeys the real-time checklist: the stereo scratch buffer
 //! is allocated when the stream is built, and the callback only renders into
@@ -24,8 +44,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use app::{
-    AudioOutput, AudioRenderer, DeviceInfo, OutputError, OutputRequest, OutputStream, StreamHealth,
-    StreamInfo,
+    AudioOutput, AudioRenderer, DeviceChoice, DeviceInfo, LossReason, OutputError, OutputRequest,
+    OutputStream, StreamHealth, StreamInfo,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
@@ -52,64 +72,50 @@ impl CpalOutput {
         }
     }
 
-    /// The output devices, as `cpal` devices with their names.
-    fn output_devices(&self) -> Result<Vec<(String, cpal::Device)>, OutputError> {
-        let devices = self
+    /// The devices a session can choose, with their `cpal` devices.
+    fn scan(&self) -> Result<Vec<(Candidate, cpal::Device)>, OutputError> {
+        let listed = self
             .host
             .output_devices()
             .map_err(|error| OutputError::Host {
                 message: error.to_string(),
             })?;
-        Ok(devices.map(|device| (device.to_string(), device)).collect())
+        let default = self
+            .host
+            .default_output_device()
+            .map(|device| (probe(&device), device));
+        Ok(candidates(
+            listed.map(|device| (probe(&device), device)),
+            default,
+        ))
     }
+}
 
-    /// The device named `name`, or the default output pinned by its name
-    /// (the default device itself when no listed device has that name).
-    fn find(&self, name: Option<&str>) -> Result<(String, cpal::Device), OutputError> {
-        let mut devices = self.output_devices()?;
-        let mut default = None;
-        let wanted = match name {
-            Some(name) => name.to_owned(),
-            None => match self.host.default_output_device() {
-                Some(device) => default.insert(device).to_string(),
-                None => return Err(OutputError::NoDevice),
-            },
-        };
-        let index = devices
-            .iter()
-            .position(|(candidate, _)| *candidate == wanted)
-            .or_else(|| {
-                devices
-                    .iter()
-                    .position(|(candidate, _)| candidate.eq_ignore_ascii_case(&wanted))
-            });
-        match (index, default) {
-            (Some(index), _) => Ok(devices.swap_remove(index)),
-            (None, Some(device)) => Ok((wanted, device)),
-            (None, None) => Err(OutputError::DeviceNotFound {
-                name: wanted,
-                available: devices.into_iter().map(|(name, _)| name).collect(),
-            }),
-        }
+/// Reads a device's id and name without its `Display`, which fails while
+/// the device disappears.
+fn probe(device: &cpal::Device) -> Probe {
+    Probe {
+        id: device.id().ok().map(|id| id.to_string()),
+        name: device
+            .description()
+            .ok()
+            .map(|description| description.name().to_owned()),
     }
 }
 
 impl AudioOutput for CpalOutput {
     fn devices(&self) -> Result<Vec<DeviceInfo>, OutputError> {
-        let default = self
-            .host
-            .default_output_device()
-            .map(|device| device.to_string());
         Ok(self
-            .output_devices()?
+            .scan()?
             .into_iter()
-            .map(|(name, device)| DeviceInfo {
+            .map(|(candidate, device)| DeviceInfo {
                 output_channels: device
                     .supported_output_configs()
                     .map(|ranges| ranges.map(|range| range.channels()).max().unwrap_or(0))
                     .unwrap_or(0),
-                is_default: default.as_deref() == Some(name.as_str()),
-                name,
+                id: candidate.id,
+                name: candidate.name,
+                is_default: candidate.is_default,
             })
             .collect())
     }
@@ -119,7 +125,9 @@ impl AudioOutput for CpalOutput {
         request: &OutputRequest,
         renderer: AudioRenderer,
     ) -> Result<Box<dyn OutputStream>, OutputError> {
-        let (name, device) = self.find(request.device.as_deref())?;
+        let mut found = self.scan()?;
+        let index = select(&found, request.device.as_ref())?;
+        let (Candidate { id, name, .. }, device) = found.swap_remove(index);
         let device_error = |error: cpal::Error| OutputError::Device {
             device: name.clone(),
             message: error.to_string(),
@@ -151,6 +159,7 @@ impl AudioOutput for CpalOutput {
             _stream: stream,
             info: StreamInfo {
                 device: name.clone(),
+                device_id: id,
                 sample_rate: request.sample_rate,
                 buffer_frames,
                 channels: choice.channels,
@@ -181,12 +190,89 @@ where
             write_interleaved(data, channels, &mut stereo, |piece| renderer.render(piece));
         },
         move |error: cpal::Error| {
-            if let Some(code) = loss_code(error.kind()) {
-                health.store(code, Ordering::SeqCst);
+            if let Some(reason) = loss_reason(error.kind()) {
+                health.store(encode(reason), Ordering::SeqCst);
             }
         },
         None,
     )
+}
+
+/// Name listed for a device whose name cannot be read.
+pub const UNNAMED: &str = "(unnamed device)";
+
+/// What `cpal` said about one output device: its id and its name, each
+/// `None` when it could not be read, for example while the device
+/// disappears.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    /// The device's `DeviceId`, printed as `host:device`.
+    pub id: Option<String>,
+    /// The device's name.
+    pub name: Option<String>,
+}
+
+/// An output device a session can choose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    /// Its id ([`app::DeviceInfo::id`]).
+    pub id: String,
+    /// Its name, or [`UNNAMED`].
+    pub name: String,
+    /// Whether it is the system's default output.
+    pub is_default: bool,
+}
+
+/// The devices a session can choose, each with the `T` the caller attached
+/// to its probe (the `cpal` device): the `listed` output devices in order,
+/// the one with the `default` device's id marked as the default, and the
+/// default device itself at the end when no listed device has its id. A
+/// device whose id cannot be read is left out, as is a second device with
+/// an id already taken; one whose name cannot be read is named [`UNNAMED`].
+pub fn candidates<T>(
+    listed: impl IntoIterator<Item = (Probe, T)>,
+    default: Option<(Probe, T)>,
+) -> Vec<(Candidate, T)> {
+    let candidate = |id, name: Option<String>, is_default| Candidate {
+        id,
+        name: name.unwrap_or_else(|| UNNAMED.to_owned()),
+        is_default,
+    };
+    let mut found: Vec<(Candidate, T)> = Vec::new();
+    for (Probe { id, name }, device) in listed {
+        let Some(id) = id else { continue };
+        if found.iter().all(|(taken, _)| taken.id != id) {
+            found.push((candidate(id, name, false), device));
+        }
+    }
+    if let Some((Probe { id: Some(id), name }, device)) = default {
+        match found.iter_mut().find(|(listed, _)| listed.id == id) {
+            Some((listed, _)) => listed.is_default = true,
+            None => found.push((candidate(id, name, true), device)),
+        }
+    }
+    found
+}
+
+/// The index of the device `choice` means among `candidates`; the default
+/// output for `None`.
+pub fn select<T>(
+    candidates: &[(Candidate, T)],
+    choice: Option<&DeviceChoice>,
+) -> Result<usize, OutputError> {
+    match choice {
+        None => candidates
+            .iter()
+            .position(|(candidate, _)| candidate.is_default)
+            .ok_or(OutputError::NoDevice),
+        Some(choice) => {
+            let keys: Vec<(&str, &str)> = candidates
+                .iter()
+                .map(|(candidate, _)| (candidate.id.as_str(), candidate.name.as_str()))
+                .collect();
+            choice.find(&keys)
+        }
+    }
 }
 
 /// A playing `cpal` stream; dropping it stops the stream and drops the
@@ -203,11 +289,9 @@ impl OutputStream for CpalStream {
     }
 
     fn health(&self) -> StreamHealth {
-        match self.health.load(Ordering::SeqCst) {
-            RUNNING => StreamHealth::Running,
-            code => StreamHealth::Lost {
-                reason: LOSS_REASONS[usize::from(code) - 1].to_owned(),
-            },
+        match decode(self.health.load(Ordering::SeqCst)) {
+            None => StreamHealth::Running,
+            Some(reason) => StreamHealth::Lost { reason },
         }
     }
 }
@@ -354,30 +438,41 @@ pub fn write_interleaved<T>(
 /// A stream that still plays.
 const RUNNING: u8 = 0;
 
-/// Why a stream was lost, by `loss_code - 1`.
-const LOSS_REASONS: [&str; 6] = [
-    "the device was disconnected",
-    "the system invalidated the stream, for example because the device's sample rate changed",
-    "the system moved the stream to another device",
-    "the device is busy with another application",
-    "the audio system stopped",
-    "the audio system reported an error",
+/// Every loss reason, in the order the health atomic encodes them from 1.
+const LOSSES: [LossReason; 6] = [
+    LossReason::Unplugged,
+    LossReason::StreamInvalidated,
+    LossReason::DeviceChanged,
+    LossReason::DeviceBusy,
+    LossReason::HostStopped,
+    LossReason::Failed,
 ];
-
-fn loss_code(kind: ErrorKind) -> Option<u8> {
-    match kind {
-        ErrorKind::Xrun | ErrorKind::RealtimeDenied => None,
-        ErrorKind::DeviceNotAvailable => Some(1),
-        ErrorKind::StreamInvalidated => Some(2),
-        ErrorKind::DeviceChanged => Some(3),
-        ErrorKind::DeviceBusy => Some(4),
-        ErrorKind::HostUnavailable => Some(5),
-        _ => Some(6),
-    }
-}
 
 /// What a stream error means for the session: why the stream is lost, or
 /// `None` when it plays on (an xrun, or real-time priority refused).
-pub fn loss_reason(kind: ErrorKind) -> Option<String> {
-    loss_code(kind).map(|code| LOSS_REASONS[usize::from(code) - 1].to_owned())
+pub fn loss_reason(kind: ErrorKind) -> Option<LossReason> {
+    match kind {
+        ErrorKind::Xrun | ErrorKind::RealtimeDenied => None,
+        ErrorKind::DeviceNotAvailable => Some(LossReason::Unplugged),
+        ErrorKind::StreamInvalidated => Some(LossReason::StreamInvalidated),
+        ErrorKind::DeviceChanged => Some(LossReason::DeviceChanged),
+        ErrorKind::DeviceBusy => Some(LossReason::DeviceBusy),
+        ErrorKind::HostUnavailable => Some(LossReason::HostStopped),
+        _ => Some(LossReason::Failed),
+    }
+}
+
+/// The health atomic's value for a stream lost for `reason`.
+fn encode(reason: LossReason) -> u8 {
+    let index = LOSSES
+        .iter()
+        .position(|&loss| loss == reason)
+        .expect("`LOSSES` lists every reason");
+    index as u8 + 1
+}
+
+/// The loss reason the health atomic holds; `None` while the stream plays.
+fn decode(code: u8) -> Option<LossReason> {
+    code.checked_sub(1)
+        .and_then(|index| LOSSES.get(usize::from(index)).copied())
 }

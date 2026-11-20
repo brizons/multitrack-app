@@ -30,10 +30,20 @@
 //! - The seam crossfade of the player and of the disk stream come from one
 //!   option, and the window the disk keeps ahead of the playhead must cover
 //!   [`MAX_BUFFER_FRAMES`].
-//! - A lost device pauses the transport with a clear message; when it comes
-//!   back, the stream opens again with the transport still paused.
-//! - Decode failures and a queued jump waiting for its audio show in
-//!   [`Snapshot::last_error`].
+//! - The device that opens is pinned by its id ([`DeviceInfo::id`]): the
+//!   session only ever comes back to that device, never to the new default
+//!   output or to another device with the same name.
+//! - A lost device pauses the transport with a message that says why the
+//!   stream stopped; when it comes back, the stream opens again with the
+//!   transport still paused, and a device that is back but refuses to open
+//!   says why.
+//! - A queued jump waiting for its audio shows in [`Snapshot::last_error`]
+//!   until it is over; so do a play that gave up waiting for the disk and a
+//!   lost device. A decode failure stays until a newer problem replaces it,
+//!   and comes back when that problem clears, because the failed audio
+//!   plays as silence every time it comes round.
+//! - Play decides whether the disk is ready from a report that describes the
+//!   playhead every command sent before it left, never from an older one.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -49,8 +59,8 @@ pub use engine::live::{FadeState, JumpKind, JumpTiming};
 pub use error::{OpenError, RuntimeError};
 pub use library::{LoadError, SongProblem};
 pub use output::{
-    AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceInfo, MAX_BUFFER_FRAMES, MIN_BUFFER_FRAMES,
-    OutputError, OutputRequest, OutputStream, StreamHealth, StreamInfo,
+    AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceChoice, DeviceInfo, LossReason, MAX_BUFFER_FRAMES,
+    MIN_BUFFER_FRAMES, OutputError, OutputRequest, OutputStream, StreamHealth, StreamInfo,
 };
 pub use renderer::AudioRenderer;
 pub use session::{
