@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 
 use app::{Session, SessionOptions, Snapshot, SongInfo};
 use gpui::{
-    App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, PathPromptOptions, Render,
-    Subscription, Task, Window, prelude::*,
+    App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, PathPromptOptions,
+    PromptButton, PromptLevel, Render, Subscription, Task, Window, prelude::*,
 };
 use io_cpal::CpalOutput;
 use multitrack_desktop::action::{UiAction, command_for};
+use multitrack_desktop::ending::{EndRequest, Ending, end_request, ends};
 use multitrack_desktop::hold::PanicHold;
 use multitrack_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, is_panic_key};
 use multitrack_desktop::song::{open_in_place, stop_and_wait};
@@ -86,6 +87,8 @@ pub struct Perform {
     problems: Vec<String>,
     hold: PanicHold,
     keys: HeldKeys,
+    /// Whether the question before ending the show is on screen.
+    asking: bool,
     _poll: Task<()>,
     _quit: Subscription,
     _deactivated: Subscription,
@@ -123,6 +126,7 @@ impl Perform {
             problems: Vec::new(),
             hold: PanicHold::new(),
             keys: HeldKeys::new(),
+            asking: false,
             _poll: poll,
             _quit: quit,
             _deactivated: deactivated,
@@ -140,6 +144,59 @@ impl Perform {
         if let Some(loaded) = self.loaded.take() {
             close(loaded);
         }
+    }
+
+    /// Quits or closes the window: at once when nothing plays (the song,
+    /// if any, stops with its ramp first); while a song plays, only once
+    /// the person confirms ([`end_request`]). Returns whether it ended at
+    /// once, which lets the window close.
+    fn end_show(&mut self, ending: Ending, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let transport = self.loaded.as_mut().map(|loaded| {
+            loaded.snapshot = loaded.session.poll();
+            loaded.snapshot.transport
+        });
+        match end_request(transport, self.asking) {
+            EndRequest::EndNow => {
+                self.close_song();
+                if ending == Ending::Quit {
+                    cx.quit();
+                }
+                true
+            }
+            EndRequest::Ask => {
+                self.ask_before_ending(ending, window, cx);
+                false
+            }
+            EndRequest::Wait => false,
+        }
+    }
+
+    fn ask_before_ending(&mut self, ending: Ending, window: &mut Window, cx: &mut Context<Self>) {
+        let question = ending.question();
+        let [end, keep] = question.answers;
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            question.message,
+            Some(question.detail),
+            &[PromptButton::new(end), PromptButton::cancel(keep)],
+            cx,
+        );
+        self.asking = true;
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = answer.await.ok();
+            let _ = this.update_in(cx, |screen, window, cx| {
+                screen.asking = false;
+                if ends(answer) {
+                    screen.close_song();
+                    match ending {
+                        Ending::Quit => cx.quit(),
+                        Ending::CloseWindow => window.remove_window(),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Opens the song folder `dir` while the current song keeps playing;
@@ -265,8 +322,7 @@ impl Perform {
             Some(KeyAction::PanicDown) => Intent::PanicDown,
             Some(KeyAction::OpenSong) => Intent::OpenSong,
             Some(KeyAction::Quit) => {
-                self.close_song();
-                cx.quit();
+                self.end_show(Ending::Quit, window, cx);
                 return;
             }
             None => return,
@@ -322,11 +378,15 @@ pub fn open_window(song_dir: Option<PathBuf>, cx: &mut App) {
     };
     let opened = cx.open_window(options, |window, cx| {
         let screen = cx.new(|cx| Perform::new(song_dir, window, cx));
-        // Closing the window stops the song with its ramp first.
+        // Closing the window while a song plays asks first; otherwise the
+        // song stops with its ramp before the window closes.
         let closing = screen.downgrade();
-        window.on_window_should_close(cx, move |_, cx| {
-            let _ = closing.update(cx, |screen, _| screen.close_song());
-            true
+        window.on_window_should_close(cx, move |window, cx| {
+            closing
+                .update(cx, |screen, cx| {
+                    screen.end_show(Ending::CloseWindow, window, cx)
+                })
+                .unwrap_or(true)
         });
         screen
     });

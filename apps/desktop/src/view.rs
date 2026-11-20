@@ -8,6 +8,8 @@ use app::{
     SongInfo, TransportState,
 };
 
+use crate::action::is_playing;
+
 /// The family of a section, which picks its color on the song map and on
 /// its pad.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,10 +453,7 @@ fn transport_view(transport: TransportState) -> TransportView {
         TransportState::Stopping => "Stopping",
         TransportState::Panicking => "Panic",
     };
-    let playing = matches!(
-        transport,
-        TransportState::Playing | TransportState::Starting
-    );
+    let playing = is_playing(transport);
     TransportView {
         state: state.to_owned(),
         play_label: if playing { "Pause" } else { "Play" }.to_owned(),

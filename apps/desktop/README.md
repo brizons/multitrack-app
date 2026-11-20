@@ -32,6 +32,8 @@ The session is polled about 30 times a second on a timer that keeps running whil
 
 **Open song…** opens the new folder while the current song keeps playing; only once it opened does the current song stop and close. A folder that does not open, or a folder picker that fails, leaves the current song playing and shows why under the header until dismissed.
 
+Quitting or closing the window while a song plays or waits to start (`Loading…`) asks first: **Stop and quit** (Return on the Mac) or **Keep playing** (Escape). Stop, the transport control, stays immediate. With nothing playing, both quit at once. The app has no menu bar of its own; quitting from the Dock or when the system logs out cannot be asked about (gpui 0.2.2 cannot cancel it), so the song just stops with its ramp.
+
 Closing a song (opening another one, closing the window, quitting) stops it with the usual short ramp before the device closes. If the player refuses Stop because its command queue is full, Stop is sent again every 5 ms for up to 500 ms. A refusal, or a ramp that has not ended by then, is reported on stderr, and on screen when another song replaced it.
 
 ## Keys
@@ -51,10 +53,10 @@ The same single keys as `play-cli`; letters work in either case, and a key held 
 | `c`, Escape | Cancel the queued jump or loop. |
 | `x` (hold 1 s) | Panic: fade everything out in 0.5 s and stop. |
 | Cmd-O / Ctrl-O | Open a song folder. |
-| Cmd-Q / Ctrl-Q | Quit. A plain `q` does nothing, unlike `play-cli`, so a stray key on stage cannot end the show. |
+| Cmd-Q / Ctrl-Q | Quit; while a song plays, only after confirming. A plain `q` does nothing, unlike `play-cli`, so a stray key on stage cannot end the show. |
 
 ## Building
 
 On macOS, GPUI's `runtime_shaders` feature compiles the Metal shaders when the app starts, so the build needs no Metal Toolchain (Xcode 26 ships it as a separate download). The screen uses the system UI font, and Menlo, Consolas or DejaVu Sans Mono for times and keys; the canvas's Barlow and JetBrains Mono are not bundled.
 
-The view-model (`src/view.rs`, `src/action.rs`, `src/hold.rs`, `src/keys.rs`, `src/song.rs`) holds every decision the screen makes and is tested without a window (`cargo test -p multitrack-desktop`); the GPUI code (`src/screen.rs`, `src/ui.rs`) only draws it and dispatches.
+The view-model (`src/view.rs`, `src/action.rs`, `src/hold.rs`, `src/keys.rs`, `src/song.rs`, `src/ending.rs`) holds every decision the screen makes and is tested without a window (`cargo test -p multitrack-desktop`); the GPUI code (`src/screen.rs`, `src/ui.rs`) only draws it and dispatches.
