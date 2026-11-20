@@ -7,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_multitrack-desktop");
+const BIN: &str = env!("CARGO_BIN_EXE_openvamp");
 const EXIT_WITHIN: Duration = Duration::from_secs(10);
 
 struct Run {
@@ -24,7 +24,7 @@ fn read(pipe: Option<impl Read>) -> String {
     text
 }
 
-/// Runs `multitrack-desktop args`, which must exit by itself within
+/// Runs `openvamp args`, which must exit by itself within
 /// [`EXIT_WITHIN`].
 fn run(args: &[&str]) -> Run {
     let mut child: Child = Command::new(BIN)
@@ -42,7 +42,7 @@ fn run(args: &[&str]) -> Run {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("multitrack-desktop {args:?} was still running after {EXIT_WITHIN:?}");
+            panic!("openvamp {args:?} was still running after {EXIT_WITHIN:?}");
         }
         thread::sleep(Duration::from_millis(10));
     };
@@ -59,8 +59,7 @@ fn help_prints_the_usage_and_exits_0() {
         let out = run(&[flag]);
         assert_eq!(out.code, Some(0), "{flag}: {}", out.stderr);
         assert!(
-            out.stdout
-                .starts_with("usage: multitrack-desktop [SONG_DIR]"),
+            out.stdout.starts_with("usage: openvamp [SONG_DIR]"),
             "{flag}: {}",
             out.stdout
         );
@@ -77,7 +76,7 @@ fn an_unknown_option_is_named_and_exits_2() {
         "{}",
         out.stderr
     );
-    assert!(out.stderr.contains("usage: multitrack-desktop"));
+    assert!(out.stderr.contains("usage: openvamp"));
     assert_eq!(out.stdout, "");
 }
 
@@ -91,7 +90,7 @@ fn an_extra_argument_is_named_and_exits_2() {
         "{}",
         out.stderr
     );
-    assert!(out.stderr.contains("usage: multitrack-desktop"));
+    assert!(out.stderr.contains("usage: openvamp"));
     assert_eq!(out.stdout, "");
 
     let out = run(&["a", "b", "c d"]);

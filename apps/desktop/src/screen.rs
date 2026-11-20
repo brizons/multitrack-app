@@ -13,12 +13,12 @@ use gpui::{
     Task, Window, prelude::*,
 };
 use io_cpal::CpalOutput;
-use multitrack_desktop::action::{Intent, UiAction, command_for};
-use multitrack_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
-use multitrack_desktop::hold::PanicHold;
-use multitrack_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, is_panic_key};
-use multitrack_desktop::song::{Song, close, replace};
-use multitrack_desktop::view::{PerformView, open_error_lines};
+use openvamp_desktop::action::{Intent, UiAction, command_for};
+use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
+use openvamp_desktop::hold::PanicHold;
+use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, is_panic_key};
+use openvamp_desktop::song::{Song, close, replace};
+use openvamp_desktop::view::{PerformView, open_error_lines};
 
 use crate::ui;
 
@@ -88,7 +88,7 @@ impl Perform {
     }
 
     /// Stops the song with its ramp, sending a Stop the player refuses
-    /// again within [`multitrack_desktop::song::STOP_WAIT`], then closes
+    /// again within [`openvamp_desktop::song::STOP_WAIT`], then closes
     /// the session and its device; what went wrong goes to stderr.
     pub fn close_song(&mut self) {
         if let Some(song) = self.loaded.take()
@@ -356,7 +356,7 @@ pub fn open_window(song_dir: Option<PathBuf>, cx: &mut App) -> gpui::Result<()> 
     let options = gpui::WindowOptions {
         window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
         titlebar: Some(gpui::TitlebarOptions {
-            title: Some("Multitrack — Perform".into()),
+            title: Some("OpenVamp — Perform".into()),
             ..Default::default()
         }),
         window_min_size: Some(gpui::size(gpui::px(960.), gpui::px(640.))),

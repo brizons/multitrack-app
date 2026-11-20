@@ -13,8 +13,8 @@ use domain::{
     TimeSignaturePoint,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
-use multitrack_desktop::action::{UiAction, command_for};
-use multitrack_desktop::view::PerformView;
+use openvamp_desktop::action::{UiAction, command_for};
+use openvamp_desktop::view::PerformView;
 
 const RATE: u32 = 8_000;
 /// 120 bpm in 4/4: a bar is two seconds.

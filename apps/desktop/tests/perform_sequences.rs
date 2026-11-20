@@ -17,8 +17,8 @@ use domain::{
     TimeSignaturePoint,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
-use multitrack_desktop::action::{UiAction, command_for};
-use multitrack_desktop::view::{Level, PerformView, SectionKind};
+use openvamp_desktop::action::{UiAction, command_for};
+use openvamp_desktop::view::{Level, PerformView, SectionKind};
 
 const RATE: u32 = 8_000;
 const BAR: u64 = 2 * RATE as u64;

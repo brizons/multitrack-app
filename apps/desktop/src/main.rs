@@ -1,4 +1,4 @@
-//! `multitrack-desktop`: the desktop shell for Mac, Windows and Linux (S6).
+//! `openvamp`: the desktop shell for Mac, Windows and Linux (S6).
 //!
 //! Opens the Perform screen, with the song folder given on the command line
 //! when there is one, on the system's default audio output.
@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use gpui::Application;
 
 const USAGE: &str = "\
-usage: multitrack-desktop [SONG_DIR]
+usage: openvamp [SONG_DIR]
 
 Opens the Perform screen. SONG_DIR is a song folder: song.json and the WAV
 stems it lists; without it, use \"Open song…\" (Cmd/Ctrl-O). The song plays

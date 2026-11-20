@@ -17,10 +17,10 @@ use domain::{
     TimeSignaturePoint,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
-use multitrack_desktop::ending::{Dialog, EndRequest, Ending, end_request};
-use multitrack_desktop::hold::{PANIC_HOLD, PanicHold};
-use multitrack_desktop::keys::{HeldKeys, KeyAction, KeyPlatform, KeyPress, Mods};
-use multitrack_desktop::song::{Closing, Replaced, Song, replace, stop_and_wait};
+use openvamp_desktop::ending::{Dialog, EndRequest, Ending, end_request};
+use openvamp_desktop::hold::{PANIC_HOLD, PanicHold};
+use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPlatform, KeyPress, Mods};
+use openvamp_desktop::song::{Closing, Replaced, Song, replace, stop_and_wait};
 
 const FRAMES: usize = 256;
 
