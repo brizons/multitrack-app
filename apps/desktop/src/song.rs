@@ -1,0 +1,108 @@
+//! Opening and closing a song while the show runs (S8): a new song opens
+//! before the current one closes, so a pick that cannot open leaves the
+//! current song loaded and playing; closing always ramps down, sending a
+//! refused Stop again, and says what went wrong.
+
+use std::time::Duration;
+
+use app::{Command, RuntimeError, Session, TransportState};
+
+/// How long closing waits for the player to take Stop and end its ramp
+/// before the device closes.
+pub const STOP_WAIT: Duration = Duration::from_millis(500);
+
+/// How often closing sends a refused Stop again and polls for the end of
+/// the ramp.
+pub const STOP_POLL: Duration = Duration::from_millis(5);
+
+/// Opens a song in place of `current`. `open` runs first; only when it
+/// succeeds does its song replace `current`, and the song it replaced
+/// comes back for the caller to stop ([`stop_and_wait`]). When `open`
+/// fails, `current` is untouched, still loaded and playing, and the error
+/// comes back.
+pub fn open_in_place<T, E>(
+    current: &mut Option<T>,
+    open: impl FnOnce() -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    let opened = open()?;
+    Ok(current.replace(opened))
+}
+
+/// How closing a song went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Closing {
+    /// The transport stopped with its ramp. `refused` holds the last
+    /// reason the player refused Stop before it took it, if it did.
+    Stopped {
+        /// The last refusal before the player took Stop.
+        refused: Option<RuntimeError>,
+    },
+    /// The player took Stop, but the ramp had not ended after
+    /// [`STOP_WAIT`].
+    RampUnfinished {
+        /// The last refusal before the player took Stop.
+        refused: Option<RuntimeError>,
+    },
+    /// The player refused Stop for the whole of [`STOP_WAIT`], so the song
+    /// closes without its ramp.
+    Refused(RuntimeError),
+}
+
+impl Closing {
+    /// What went wrong, in one line; `None` when the player took the first
+    /// Stop and the ramp ended.
+    pub fn problem(&self) -> Option<String> {
+        let wait = STOP_WAIT.as_millis();
+        match self {
+            Self::Stopped { refused: None } => None,
+            Self::Stopped {
+                refused: Some(reason),
+            } => Some(format!(
+                "the player refused Stop at first ({reason}); it took it on a later try and stopped with its ramp"
+            )),
+            Self::RampUnfinished { refused } => {
+                let mut problem = format!(
+                    "the stop ramp had not ended after {wait} ms; the song closed before it ended"
+                );
+                if let Some(reason) = refused {
+                    problem.push_str(&format!(" (Stop was refused at first: {reason})"));
+                }
+                Some(problem)
+            }
+            Self::Refused(reason) => Some(format!(
+                "the player refused Stop for {wait} ms ({reason}); the song closed without its ramp"
+            )),
+        }
+    }
+}
+
+/// Sends Stop and waits for the ramp, at most [`STOP_WAIT`]. A refused
+/// Stop (the command queue is full because the audio thread has not taken
+/// the last commands yet) is sent again every [`STOP_POLL`] until the
+/// player takes it; once taken, the session is polled every [`STOP_POLL`]
+/// until the transport is stopped. `sleep` waits between tries
+/// (`std::thread::sleep` in the app). The caller then drops the session,
+/// which closes the device, and reports [`Closing::problem`].
+pub fn stop_and_wait(session: &mut Session, mut sleep: impl FnMut(Duration)) -> Closing {
+    let tries = STOP_WAIT.as_millis() / STOP_POLL.as_millis();
+    let mut refused = None;
+    let mut taken = false;
+    for attempt in 0..=tries {
+        if !taken {
+            match session.send(Command::Stop) {
+                Ok(()) => taken = true,
+                Err(reason) => refused = Some(reason),
+            }
+        }
+        if taken && session.poll().transport == TransportState::Stopped {
+            return Closing::Stopped { refused };
+        }
+        if attempt < tries {
+            sleep(STOP_POLL);
+        }
+    }
+    match refused {
+        Some(reason) if !taken => Closing::Refused(reason),
+        refused => Closing::RampUnfinished { refused },
+    }
+}

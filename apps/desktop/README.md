@@ -28,7 +28,11 @@ $ cargo run -p multitrack-desktop -- /tmp/demo-song
 
 **Panic** fires only after the button, or the X key, is held for one second; the fill shows the hold. A click or a tap never fires it.
 
-The session is polled about 30 times a second on a timer that keeps running while the window is hidden, since a waiting play starts only through polling. Closing the window or quitting stops the song with the usual short ramp before the device closes.
+The session is polled about 30 times a second on a timer that keeps running while the window is hidden, since a waiting play starts only through polling.
+
+**Open song…** opens the new folder while the current song keeps playing; only once it opened does the current song stop and close. A folder that does not open, or a folder picker that fails, leaves the current song playing and shows why under the header until dismissed.
+
+Closing a song (opening another one, closing the window, quitting) stops it with the usual short ramp before the device closes. If the player refuses Stop because its command queue is full, Stop is sent again every 5 ms for up to 500 ms. A refusal, or a ramp that has not ended by then, is reported on stderr, and on screen when another song replaced it.
 
 ## Keys
 
@@ -53,4 +57,4 @@ The same single keys as `play-cli`; letters work in either case, and a key held 
 
 On macOS, GPUI's `runtime_shaders` feature compiles the Metal shaders when the app starts, so the build needs no Metal Toolchain (Xcode 26 ships it as a separate download). The screen uses the system UI font, and Menlo, Consolas or DejaVu Sans Mono for times and keys; the canvas's Barlow and JetBrains Mono are not bundled.
 
-The view-model (`src/view.rs`, `src/action.rs`, `src/hold.rs`, `src/keys.rs`) holds every decision the screen makes and is tested without a window (`cargo test -p multitrack-desktop`); the GPUI code (`src/screen.rs`, `src/ui.rs`) only draws it and dispatches.
+The view-model (`src/view.rs`, `src/action.rs`, `src/hold.rs`, `src/keys.rs`, `src/song.rs`) holds every decision the screen makes and is tested without a window (`cargo test -p multitrack-desktop`); the GPUI code (`src/screen.rs`, `src/ui.rs`) only draws it and dispatches.

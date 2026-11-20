@@ -48,8 +48,13 @@ pub fn root(focus: &FocusHandle, cx: &mut Context<Perform>) -> Div {
         .text_size(px(15.))
 }
 
-/// The screen with a song open.
-pub fn perform(view: &PerformView, hold: f32, cx: &mut Context<Perform>) -> impl IntoElement {
+/// The screen with a song open, and the `problems` that did not stop it.
+pub fn perform(
+    view: &PerformView,
+    hold: f32,
+    problems: &[String],
+    cx: &mut Context<Perform>,
+) -> impl IntoElement {
     div()
         .flex_1()
         .min_h_0()
@@ -57,8 +62,45 @@ pub fn perform(view: &PerformView, hold: f32, cx: &mut Context<Perform>) -> impl
         .flex_col()
         .gap(px(12.))
         .child(header(view, hold, cx))
+        .when(!problems.is_empty(), |screen| {
+            screen.child(problem_banner(problems, cx))
+        })
         .child(now_playing(view, cx))
         .child(status(&view.status))
+}
+
+/// Problems that did not stop the song playing, such as a pick that did
+/// not open, with a button that hides them.
+fn problem_banner(problems: &[String], cx: &mut Context<Perform>) -> impl IntoElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .px(px(14.))
+        .py(px(10.))
+        .bg(theme::danger_bg())
+        .border_1()
+        .border_color(theme::danger())
+        .rounded(px(14.))
+        .text_size(px(13.))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .text_color(theme::danger_text())
+                .children(problems.iter().map(|line| div().child(line.clone()))),
+        )
+        .child(
+            square_button("dismiss-problems", cx, Intent::DismissProblems).child(icon(
+                "close",
+                theme::danger_text(),
+                18.,
+            )),
+        )
 }
 
 /// The screen with no song: why, and the way to open one.
