@@ -1,10 +1,15 @@
-//! Offline renderer for the multitrack player.
+//! Offline renderer and live player for the multitrack player.
 //!
 //! [`render_offline`] plays a [`RenderPlan`] compiled by the `domain` crate
 //! against in-memory stems and returns interleaved stereo `f32` audio. The
 //! crate does no I/O: the library layer decodes the stems and writes the
 //! result. Rendering is deterministic: the same plan, stems, and settings give
 //! bit-identical output on every run.
+//!
+//! [`live::Player`] plays the same song in real time, buffer by buffer, and
+//! takes live commands (jumps, loops, fade, panic) from a
+//! [`live::Controller`]. With no live command it produces the same samples as
+//! [`render_offline`] for the compiled plan.
 //!
 //! Guide cues ([`domain::CueEvent`]) are not rendered yet: no voice samples
 //! exist, so the plan's cues are ignored. A `guide` stem plays as plain audio.
@@ -21,6 +26,7 @@ use domain::{ClickLevel, RenderPlan, StemRole};
 use crate::click::ClickBursts;
 
 mod click;
+pub mod live;
 mod mix;
 
 /// Default click levels, in the order Downbeat, Beat, HalfBeat, QuarterBeat:
@@ -98,7 +104,7 @@ impl ClickSettings {
 }
 
 /// Position of `level` in [`ClickSettings::levels`].
-fn level_index(level: ClickLevel) -> usize {
+pub(crate) fn level_index(level: ClickLevel) -> usize {
     match level {
         ClickLevel::Downbeat => 0,
         ClickLevel::Beat => 1,
@@ -226,7 +232,7 @@ pub fn render_offline(
     Ok(output)
 }
 
-fn check_stems(stems: &[StemAudio]) -> Result<(), RenderError> {
+pub(crate) fn check_stems(stems: &[StemAudio]) -> Result<(), RenderError> {
     for stem in stems {
         if !(1..=2).contains(&stem.channels) {
             return Err(RenderError::UnsupportedChannels {

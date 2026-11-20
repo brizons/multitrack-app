@@ -39,7 +39,7 @@ Requirements quote `docs/mvp-spec.md` and `docs/architecture.md` verbatim. Items
 
 ### S6 — First shell (`apps/…`)
 - The Perform screen from the design canvas, reduced to: song map with playhead and queued-jump marker, section pads with Now/Next, transport, fade, hold-to-panic, jump timing toggle, loop and infinite.
-- **Decision needed:** which shell goes first. Recommendation: `apps/desktop` (Tauri + React) — it reuses the team's React skills, runs on the development Mac, and the desktop `cpal` backends are the most mature, so it validates the engine with the least platform risk. Alternative: `apps/apple` (SwiftUI), closer to the main live-use device (iPad) but adds UniFFI and audio-session work up front.
+- **Decided (L3):** the first shell is `apps/desktop` (Tauri 2 + React), developed and run on the development Mac; it ships for Windows and Linux.
 
 Out of scope: setlists and transitions, mixer UI, routing matrix, MIDI, guide-voice playback, pads, key and tempo change, the other two shells.
 
@@ -47,14 +47,19 @@ Out of scope: setlists and transitions, mixer UI, routing matrix, MIDI, guide-vo
 
 | ID | Specs | Route | Status | Commit |
 |----|-------|-------|--------|--------|
-| T1 | S1 | delegated (context backstop) | pending | — |
-| T2 | S2, S3 | delegated (context backstop) | pending | — |
-| T3 | S4, S5 | delegated (context backstop) | pending | — |
-| T4 | S6 | delegated (context backstop) | blocked on the shell decision | — |
+| T1 | S2 (+ public domain helpers for bar and click queries in source time) | delegated (context backstop) | done (verified, review approved); defer rule moved to T2 | 64638b4, 1e35bd3 |
+| T2 | S3 + S2 defer-the-jump criterion + T1 review and verifier advisories | delegated (context backstop) | in progress | — |
+| T3 | S1, S4, S5 | delegated (context backstop) | pending | — |
+| T4 | S6 | delegated (context backstop) | pending | — |
 
-Route evidence: the parent session is past the ~150k-token context backstop. T1 and T2 share the snapshot and command types, so they run sequentially; T3 needs T2's engine. Forecast: ~2,500 authored lines. Risk forecast: item 4 (concurrency: audio thread, disk thread, lock-free queues) for T2 and T3, item 5 (new crates `cpal`, `rtrb`) for T3 — each gets an independent verifier and the native review.
+Route evidence: the parent session is past the ~150k-token context backstop. Order: the live transport first (highest risk, testable offline with in-memory sources), then streaming behind the same source interface, then the `app` API with real threads, `cpal` and `play-cli`, then the shell. Each task needs the previous one, so they run sequentially. Forecast: ~2,500 authored lines. Risk forecast: item 4 (concurrency: audio thread, disk thread, lock-free queues) for T2 and T3, item 5 (new crates `cpal`, `rtrb`) for T3 — each gets an independent verifier and the native review.
 
 ## Log
 
 - **L1** (2026-10-30, user, verbatim): "Native per platform"
 - **L2** (2026-10-30): Decision 1 recorded in docs/architecture.md: Rust core + SwiftUI (iPhone, iPad, Mac) + Compose (Android) + Tauri with React (Windows, Linux); `uniffi` 0.32.2 (MPL-2.0) for Swift and Kotlin, `tauri` 2.12.5 (Apache-2.0 OR MIT). Implementation of this feature waits for the user's go; the shell order (S6) is the only open product decision, and it is needed only before T4.
+- **L3** (2026-10-30, user, verbatim): "Desktop first (Tauri)"
+- **L4** (2026-10-30): branch `feat/live-playback` created from `feat/core-render-pipeline` (cc2235a). Tasks reordered: T1 live transport (S2), T2 streaming (S3), T3 `app` API + `cpal` + `play-cli` (S1, S4, S5), T4 desktop shell (S6).
+- **L5** (2026-10-30): T1 delivered as 64638b4 (domain `BeatGrid`: `clicks_in`, `next_bar_line`, `bar_and_beat`; `compile` now uses it, output unchanged) and 1e35bd3 (`engine::live`: `Player::process`, `Controller` over `rtrb` 0.4.1, `StemSource` + `MemorySource`, `Status`). 125 tests; parent re-ran the suite. Live output equals `render_offline` bit-exactly with no commands, for buffer sizes 1/7/64/256/1024. Writer decisions to confirm: a queued jump overrides and switches off infinite; next bar = first bar line at or after the next frame, else section end; live loop always waits for the section end; pause/stop/resume/click ramp over 256 frames; stop, end of panic and end of arrangement reset to position 0; fade is linear, 3 s default, track stems only; click on/off affects only the generated click (a recorded click stem keeps playing — product call); back to start while playing crossfades; up to 8 overlapping tails; output rate must equal the song rate. Open for T2: `StemSource` needs a readiness query and a prefetch hint for the defer-the-jump rule. Risk: item 5 (`rtrb`), item 4 (SPSC queue is the cross-thread channel), item 3 checked (shared `compile` and mixing code refactored with unchanged output).
+- **L6** (2026-10-30): independent verifier on 1e35bd3 vs 1bd8d23 — no blockers; S2 passes everything built (bit-exact vs `render_offline` across sizes 1–4096 and tempo/meter changes; jumps, next bar, loop, infinite, fade scope, panic, click grid; zero allocations; `compile` and `render-cli` output byte-identical to the baseline). Open: A1 the "move the jump to the next boundary when the target is not buffered" criterion is not built (needs a readiness query on `StemSource`) — moved to T2; A2 the player walks the arrangement and copies compile's seam rule instead of recompiling a plan — share one helper and update Decision 2 wording; A3 two seams on the same frame cancel the first fade-in (audible bump); A4 a live loop clears infinite when it executes — it should not; A5 click off with a recorded click stem changes nothing (product call pending with the user); A6 fade duration 0 gives an unsmoothed step — enforce a minimum; A7 a ninth overlapping tail is dropped abruptly; A9 song and device rates must match (T3). `rtrb` 0.4.1: MIT OR Apache-2.0, no dependencies, no build script. Verifier scratch removed by the parent.
+- **L7** (2026-10-30): user granted the native review of 98242e3..(T1 docs) with lenses risk, resilience, readability, reliability; approved and acknowledged (authority burned). Advisories folded into T2: fade duration needs a minimum (R4-001, R3-002, A6); a live loop must not clear infinite (R2-002, R3-001, A4); one shared seam rule that honours `seam_crossfade` (R2-003, A2); named click-burst limit (R2-001) and panic duration constant (R2-004); a distinct source-time click type (R2-005); the status must say when the click toggle has no generated click to act on (R3-003; muting a recorded click stem is the user's pending product call A5); the double-seam bump (A3). R2-006 fixed in core-render-pipeline.md L12.

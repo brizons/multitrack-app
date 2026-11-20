@@ -13,6 +13,10 @@ pub struct SongSpec {
     pub rate: u32,
     pub length: u64,
     pub bpm: f64,
+    /// Tempo map as (at, bpm); empty means `bpm` from sample 0.
+    pub tempo: Vec<(u64, f64)>,
+    /// Time-signature map as (at, numerator, denominator); empty means 4/4.
+    pub meters: Vec<(u64, u32, u32)>,
     pub sections: Vec<(&'static str, SectionType, u64)>,
     pub arrangements: Vec<(&'static str, Vec<&'static str>)>,
     pub stems: Vec<(&'static str, StemRole)>,
@@ -31,6 +35,8 @@ impl SongSpec {
             rate,
             length,
             bpm: 120.0,
+            tempo: Vec::new(),
+            meters: Vec::new(),
             sections,
             arrangements: vec![("default", ids)],
             stems,
@@ -39,6 +45,16 @@ impl SongSpec {
 
     pub fn bpm(mut self, bpm: f64) -> Self {
         self.bpm = bpm;
+        self
+    }
+
+    pub fn tempo(mut self, tempo: &[(u64, f64)]) -> Self {
+        self.tempo = tempo.to_vec();
+        self
+    }
+
+    pub fn meters(mut self, meters: &[(u64, u32, u32)]) -> Self {
+        self.meters = meters.to_vec();
         self
     }
 
@@ -55,15 +71,33 @@ impl SongSpec {
             artist: None,
             sample_rate: self.rate,
             key: None,
-            tempo_map: vec![TempoPoint {
-                at: 0,
-                bpm: self.bpm,
-            }],
-            time_signature_map: vec![TimeSignaturePoint {
-                at: 0,
-                numerator: 4,
-                denominator: 4,
-            }],
+            tempo_map: if self.tempo.is_empty() {
+                vec![TempoPoint {
+                    at: 0,
+                    bpm: self.bpm,
+                }]
+            } else {
+                self.tempo
+                    .iter()
+                    .map(|&(at, bpm)| TempoPoint { at, bpm })
+                    .collect()
+            },
+            time_signature_map: if self.meters.is_empty() {
+                vec![TimeSignaturePoint {
+                    at: 0,
+                    numerator: 4,
+                    denominator: 4,
+                }]
+            } else {
+                self.meters
+                    .iter()
+                    .map(|&(at, numerator, denominator)| TimeSignaturePoint {
+                        at,
+                        numerator,
+                        denominator,
+                    })
+                    .collect()
+            },
             stems: self
                 .stems
                 .iter()
