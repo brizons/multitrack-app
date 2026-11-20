@@ -122,9 +122,16 @@ fn usage_errors_exit_with_code_2() {
 fn a_missing_song_folder_exits_with_code_1() {
     let output = play_cli(&["/nonexistent"]);
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        stderr(&output),
-        "error: cannot read /nonexistent/song.json: No such file or directory (os error 2)\n"
+    // The path separator and the OS error text differ by platform.
+    let expected = format!(
+        "error: cannot read {}: ",
+        Path::new("/nonexistent").join("song.json").display()
+    );
+    let stderr = stderr(&output);
+    assert!(stderr.starts_with(&expected), "{stderr}");
+    assert!(
+        stderr.ends_with(")\n") && stderr.lines().count() == 1,
+        "{stderr}"
     );
     assert!(stdout(&output).is_empty());
 }

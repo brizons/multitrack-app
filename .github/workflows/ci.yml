@@ -68,4 +68,5 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
-        run: cargo test --workspace --locked
+        # Report every failing test binary in one run, not only the first.
+        run: cargo test --workspace --locked --no-fail-fast
