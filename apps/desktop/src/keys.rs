@@ -3,6 +3,10 @@
 
 use crate::action::UiAction;
 
+/// The panic key: held for [`crate::hold::PANIC_HOLD`], it fires panic; its
+/// release ends the hold. Letters work in either case.
+pub const PANIC_KEY: &str = "x";
+
 /// Whether the platform's secondary modifier (the one in "Open…" and
 /// "Quit") is Command (macOS) rather than Control.
 pub const SECONDARY_IS_PLATFORM: bool = cfg!(target_os = "macos");
@@ -36,8 +40,9 @@ pub struct KeyPress<'a> {
 pub enum KeyAction {
     /// The control this key stands for.
     Ui(UiAction),
-    /// The panic key went down; panic fires only if it is held for
-    /// [`crate::hold::PANIC_HOLD`] (see [`is_panic_key`] for its release).
+    /// The panic key ([`PANIC_KEY`]) went down; panic fires only if it is
+    /// held for [`crate::hold::PANIC_HOLD`] (see [`is_panic_key`] for its
+    /// release).
     PanicDown,
     /// Open a song folder (secondary modifier + O).
     OpenSong,
@@ -81,7 +86,7 @@ pub fn key_down(press: &KeyPress<'_>) -> Option<KeyAction> {
         "i" => ui(UiAction::ToggleInfinite),
         "f" => ui(UiAction::ToggleFade),
         "c" | "escape" => ui(UiAction::CancelJump),
-        "x" => Some(KeyAction::PanicDown),
+        PANIC_KEY => Some(KeyAction::PanicDown),
         digit => match digit.as_bytes() {
             &[byte @ b'1'..=b'9'] => ui(UiAction::QueueSection(usize::from(byte - b'1'))),
             _ => None,
@@ -91,5 +96,57 @@ pub fn key_down(press: &KeyPress<'_>) -> Option<KeyAction> {
 
 /// Whether `key` is the panic key, whose release ends a hold.
 pub fn is_panic_key(key: &str) -> bool {
-    key.eq_ignore_ascii_case("x")
+    key.eq_ignore_ascii_case(PANIC_KEY)
+}
+
+/// The keys that are down, so a held key acts once: its repeats are
+/// ignored until it is released. gpui 0.2.2 marks a repeat as held on
+/// macOS and Windows but reports every repeat on X11 as a fresh press, so
+/// the screen keeps track itself, on every platform.
+#[derive(Debug, Clone, Default)]
+pub struct HeldKeys {
+    /// Lowercase names of the plain keys that acted and are still down.
+    down: Vec<String>,
+}
+
+impl HeldKeys {
+    /// No key down.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What `press` asks for when it goes down, as [`key_down`] maps it, or
+    /// `None` for a repeat: `repeat` is the platform's own repeat flag, and
+    /// a plain key that acted counts as down until [`Self::release`]. Two
+    /// kinds of key rely on other rules instead, so that a release the
+    /// window never saw cannot swallow their next press: the panic key
+    /// (every press reaches [`crate::hold::PanicHold`], which ignores a
+    /// press while held), and keys held with a modifier (macOS drops the
+    /// release of a key let go while Command is down).
+    pub fn press(&mut self, press: &KeyPress<'_>, repeat: bool) -> Option<KeyAction> {
+        if repeat {
+            return None;
+        }
+        let action = key_down(press)?;
+        let tracked = press.mods == Mods::default() && action != KeyAction::PanicDown;
+        if tracked {
+            let key = press.key.to_ascii_lowercase();
+            if self.down.contains(&key) {
+                return None;
+            }
+            self.down.push(key);
+        }
+        Some(action)
+    }
+
+    /// `key` went up.
+    pub fn release(&mut self, key: &str) {
+        self.down.retain(|down| !down.eq_ignore_ascii_case(key));
+    }
+
+    /// Forgets every key: the window lost focus, so their releases may
+    /// never arrive.
+    pub fn forget_all(&mut self) {
+        self.down.clear();
+    }
 }

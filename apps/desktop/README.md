@@ -26,7 +26,7 @@ $ cargo run -p multitrack-desktop -- /tmp/demo-song
 | Pads | One per arrangement position, marked **Now** and **Next**: a pad queues a jump to its position; the queued pad, pressed again, cancels it. |
 | Status | The device and its stream (rate, buffer, latency) or why there is none; underruns; the last problem, in the `app` API's words; the song package's warnings; the keys. |
 
-**Panic** fires only after the button, or the X key, is held for one second; the fill shows the hold. A click or a tap never fires it.
+**Panic** fires only after the button, or the X key, is held for one second; the fill shows the hold. A click or a tap never fires it, and neither does a hold whose release the window cannot see: when the window loses focus during the hold (Cmd-Tab, a system dialog, the folder picker), the hold ends without panic.
 
 The session is polled about 30 times a second on a timer that keeps running while the window is hidden, since a waiting play starts only through polling.
 
@@ -36,7 +36,7 @@ Closing a song (opening another one, closing the window, quitting) stops it with
 
 ## Keys
 
-The same single keys as `play-cli`; letters work in either case, and a key held with Ctrl, Alt or Cmd does nothing (except Open and Quit).
+The same single keys as `play-cli`; letters work in either case, and a key held with Ctrl, Alt or Cmd does nothing (except Open and Quit). A key held down acts once: its repeats are ignored until it is released, on every platform (on X11, gpui reports each repeat as a new press, so the screen tracks the keys that are down itself).
 
 | Key | Does |
 |-----|------|

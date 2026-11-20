@@ -14,7 +14,7 @@ use gpui::{
 use io_cpal::CpalOutput;
 use multitrack_desktop::action::{UiAction, command_for};
 use multitrack_desktop::hold::PanicHold;
-use multitrack_desktop::keys::{KeyAction, KeyPress, Mods, is_panic_key, key_down};
+use multitrack_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, is_panic_key};
 use multitrack_desktop::song::{open_in_place, stop_and_wait};
 use multitrack_desktop::view::{PerformView, open_error_lines};
 
@@ -85,8 +85,11 @@ pub struct Perform {
     /// song that was playing goes on), or how the song it replaced closed.
     problems: Vec<String>,
     hold: PanicHold,
+    keys: HeldKeys,
     _poll: Task<()>,
     _quit: Subscription,
+    _deactivated: Subscription,
+    _blurred: Subscription,
 }
 
 impl Perform {
@@ -106,13 +109,24 @@ impl Perform {
             screen.close_song();
             async {}
         });
+        // A release that happens while the window is inactive, or while
+        // something else has the focus, never reaches the screen.
+        let deactivated = cx.observe_window_activation(window, |screen, window, cx| {
+            if !window.is_window_active() {
+                screen.focus_lost(cx);
+            }
+        });
+        let blurred = cx.on_blur(&focus, window, |screen, _, cx| screen.focus_lost(cx));
         let mut screen = Self {
             focus,
             loaded: None,
             problems: Vec::new(),
             hold: PanicHold::new(),
+            keys: HeldKeys::new(),
             _poll: poll,
             _quit: quit,
+            _deactivated: deactivated,
+            _blurred: blurred,
         };
         if let Some(dir) = song_dir {
             screen.open_song(&dir);
@@ -150,14 +164,23 @@ impl Perform {
         }
     }
 
+    /// The window lost focus (Cmd-Tab, a system dialog, the folder
+    /// picker): a panic hold ends without panic, and every key counts as
+    /// up, since their releases go elsewhere.
+    fn focus_lost(&mut self, cx: &mut Context<Self>) {
+        self.hold.cancel();
+        self.keys.forget_all();
+        cx.notify();
+    }
+
     /// One turn of the timer: moves the session on and fires a panic hold
     /// that is complete.
     fn tick(&mut self, cx: &mut Context<Self>) {
-        let held = self.hold.is_held();
+        let counting = self.hold.is_counting();
         let fires = self.hold.tick(Instant::now());
         let Some(loaded) = &mut self.loaded else {
             // Nothing moves without a song, except a hold's fill.
-            if held {
+            if counting {
                 cx.notify();
             }
             return;
@@ -225,11 +248,6 @@ impl Perform {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // A held key repeats; only its first press acts, so a held space
-        // does not toggle play over and over.
-        if event.is_held {
-            return;
-        }
         let modifiers = &event.keystroke.modifiers;
         let press = KeyPress {
             key: &event.keystroke.key,
@@ -240,7 +258,9 @@ impl Perform {
                 function: modifiers.function,
             },
         };
-        let intent = match key_down(&press) {
+        // A held key repeats; only its first press acts, so a held space
+        // does not toggle play over and over.
+        let intent = match self.keys.press(&press, event.is_held) {
             Some(KeyAction::Ui(action)) => Intent::Ui(action),
             Some(KeyAction::PanicDown) => Intent::PanicDown,
             Some(KeyAction::OpenSong) => Intent::OpenSong,
@@ -256,6 +276,7 @@ impl Perform {
     }
 
     fn key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.keys.release(&event.keystroke.key);
         if is_panic_key(&event.keystroke.key) {
             self.handle(Intent::PanicUp, window, cx);
         }
@@ -275,13 +296,8 @@ impl Render for Perform {
         let body = match &self.loaded {
             Some(loaded) => {
                 let view = PerformView::new(&loaded.snapshot, &loaded.song);
-                ui::perform(
-                    &view,
-                    self.hold.progress(Instant::now()),
-                    &self.problems,
-                    cx,
-                )
-                .into_any_element()
+                ui::perform(&view, self.hold.fill(Instant::now()), &self.problems, cx)
+                    .into_any_element()
             }
             None => ui::no_song(&self.problems, cx).into_any_element(),
         };
