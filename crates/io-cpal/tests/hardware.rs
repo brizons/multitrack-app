@@ -12,7 +12,10 @@
 use std::fs;
 use std::path::Path;
 
-use app::{AudioOutput, DeviceStatus, Session, SessionOptions, TransportState};
+use app::{
+    AudioOutput, DeviceStatus, OutputCheck, OutputError, OutputRequest, Session, SessionOptions,
+    TransportState,
+};
 use domain::{
     Arrangement, SectionMarker, SectionType, SongPackage, Stem, StemRole, TempoPoint,
     TimeSignaturePoint,
@@ -121,4 +124,20 @@ fn opens_the_default_device_at_the_songs_rate_and_reports_the_buffer_latency() {
         f64::from(info.buffer_frames) / f64::from(RATE)
     );
     assert_eq!(snapshot.transport, TransportState::Stopped);
+}
+
+#[test]
+#[ignore = "needs an audio output device that runs at 48 kHz"]
+fn checks_the_default_device_at_the_songs_rate_without_a_stream() {
+    let output = CpalOutput::new();
+    let request = |sample_rate| OutputRequest {
+        device: None,
+        sample_rate,
+        buffer_frames: 256,
+    };
+    assert_eq!(output.check(&request(RATE)), OutputCheck::Fits);
+    assert!(matches!(
+        output.check(&request(1)),
+        OutputCheck::Refused(OutputError::UnsupportedSampleRate { requested: 1, .. })
+    ));
 }

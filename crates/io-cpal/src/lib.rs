@@ -9,6 +9,15 @@
 //! is the default when it opens, pinned by its id, so the stream never moves
 //! to another device on its own.
 //!
+//! Opening and [checking](app::AudioOutput::check) a request take the same
+//! steps before a stream is built ([`plan`]): find the device, read the
+//! configurations it supports, pick one. So a check refuses exactly what
+//! opening would refuse at that point, and never builds a stream. What
+//! cannot be read (the device list, or the configurations of a device that
+//! is busy, which on ALSA are read by opening its PCM for a moment) makes a
+//! check [`OutputCheck::Unknown`]: the caller goes ahead and opening
+//! decides.
+//!
 //! # Device identity
 //!
 //! A device's id ([`app::DeviceInfo::id`]) is `cpal`'s `DeviceId`, printed
@@ -44,8 +53,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use app::{
-    AudioOutput, AudioRenderer, DeviceChoice, DeviceInfo, LossReason, OutputError, OutputRequest,
-    OutputStream, StreamHealth, StreamInfo,
+    AudioOutput, AudioRenderer, DeviceChoice, DeviceInfo, LossReason, OutputCheck, OutputError,
+    OutputRequest, OutputStream, StreamHealth, StreamInfo,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
@@ -120,23 +129,28 @@ impl AudioOutput for CpalOutput {
             .collect())
     }
 
+    /// The steps opening takes before it builds a stream ([`plan`]): the
+    /// device, its configurations and the one to open. A device list or
+    /// configurations that cannot be read, such as a busy ALSA device's,
+    /// make it [`OutputCheck::Unknown`], never a refusal.
+    fn check(&self, request: &OutputRequest) -> OutputCheck {
+        check_outcome(&plan(self.scan(), request, read_configs))
+    }
+
     fn open(
         &mut self,
         request: &OutputRequest,
         renderer: AudioRenderer,
     ) -> Result<Box<dyn OutputStream>, OutputError> {
-        let mut found = self.scan()?;
-        let index = select(&found, request.device.as_ref())?;
-        let (Candidate { id, name, .. }, device) = found.swap_remove(index);
+        let Plan {
+            candidate: Candidate { id, name, .. },
+            device,
+            choice,
+        } = open_outcome(plan(self.scan(), request, read_configs))?;
         let device_error = |error: cpal::Error| OutputError::Device {
             device: name.clone(),
             message: error.to_string(),
         };
-        let ranges: Vec<SupportedStreamConfigRange> = device
-            .supported_output_configs()
-            .map_err(device_error)?
-            .collect();
-        let choice = choose_config(&name, &ranges, request.sample_rate, request.buffer_frames)?;
         let config = cpal::StreamConfig {
             channels: choice.channels,
             sample_rate: request.sample_rate,
@@ -273,6 +287,90 @@ pub fn select<T>(
             choice.find(&keys)
         }
     }
+}
+
+/// The device and the configuration [`CpalOutput`] builds a stream with.
+#[derive(Debug)]
+pub struct Plan<T> {
+    /// The device the request means.
+    pub candidate: Candidate,
+    /// What the caller attached to it: the `cpal` device.
+    pub device: T,
+    /// The configuration to open.
+    pub choice: StreamChoice,
+}
+
+/// Why [`plan`] found nothing to build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unplanned {
+    /// Opening refuses the request: no device it means, or nothing the
+    /// device supports fits it. A check refuses it too.
+    Refused(OutputError),
+    /// The device list or the device's configurations could not be read
+    /// (the audio system did not answer, or the device was busy: on ALSA,
+    /// reading them opens the PCM for a moment). Opening fails with this
+    /// error; a check cannot tell, and lets opening decide.
+    Unreadable(OutputError),
+}
+
+/// What [`CpalOutput`] does before it builds a stream, for both opening
+/// and checking: the device `request` means among `found` (the device scan,
+/// or why it failed; see [`select`]), the configurations it supports, which
+/// `configs` reads only for that device, and the one to open
+/// ([`choose_config`]). It never builds a stream.
+pub fn plan<T>(
+    found: Result<Vec<(Candidate, T)>, OutputError>,
+    request: &OutputRequest,
+    configs: impl FnOnce(&T) -> Result<Vec<SupportedStreamConfigRange>, String>,
+) -> Result<Plan<T>, Unplanned> {
+    let mut found = found.map_err(Unplanned::Unreadable)?;
+    let index = select(&found, request.device.as_ref()).map_err(Unplanned::Refused)?;
+    let (candidate, device) = found.swap_remove(index);
+    let ranges = configs(&device).map_err(|message| {
+        Unplanned::Unreadable(OutputError::Device {
+            device: candidate.name.clone(),
+            message,
+        })
+    })?;
+    let choice = choose_config(
+        &candidate.name,
+        &ranges,
+        request.sample_rate,
+        request.buffer_frames,
+    )
+    .map_err(Unplanned::Refused)?;
+    Ok(Plan {
+        candidate,
+        device,
+        choice,
+    })
+}
+
+/// What a check says about `plan`: it fits, it is refused for the reason
+/// opening would give, or, when something could not be read, it cannot
+/// tell.
+pub fn check_outcome<T>(plan: &Result<Plan<T>, Unplanned>) -> OutputCheck {
+    match plan {
+        Ok(_) => OutputCheck::Fits,
+        Err(Unplanned::Refused(error)) => OutputCheck::Refused(error.clone()),
+        Err(Unplanned::Unreadable(error)) => OutputCheck::Unknown(error.to_string()),
+    }
+}
+
+/// What opening does with `plan`: builds from it, or fails with its error.
+pub fn open_outcome<T>(plan: Result<Plan<T>, Unplanned>) -> Result<Plan<T>, OutputError> {
+    plan.map_err(|unplanned| match unplanned {
+        Unplanned::Refused(error) | Unplanned::Unreadable(error) => error,
+    })
+}
+
+/// Reads the configurations `device` supports; on ALSA this opens its PCM
+/// for a moment.
+fn read_configs(device: &cpal::Device) -> Result<Vec<SupportedStreamConfigRange>, String> {
+    device
+        .supported_output_configs()
+        .map(Iterator::collect)
+        .map_err(|error| error.to_string())
 }
 
 /// A playing `cpal` stream; dropping it stops the stream and drops the
