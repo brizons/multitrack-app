@@ -110,7 +110,9 @@ pub fn command_for(action: UiAction, snapshot: &Snapshot, song: &SongInfo) -> Op
 
 /// The setlist command `action` sends while a setlist plays: previous, next
 /// and a strip tile move through the setlist; every other control acts on
-/// the current item, as [`command_for`] maps it for a single song.
+/// the current item, as [`command_for`] maps it for a single song. The
+/// current item's own tile sends nothing: selecting it would stop it, which
+/// a stray tap on stage must not do (back to start does that on purpose).
 pub fn setlist_command_for(
     action: UiAction,
     snapshot: &SetlistSnapshot,
@@ -119,6 +121,7 @@ pub fn setlist_command_for(
     Some(match action {
         UiAction::PreviousSong => SetlistCommand::Previous,
         UiAction::NextSong => SetlistCommand::Next,
+        UiAction::SelectItem(item) if item == snapshot.setlist.current => return None,
         UiAction::SelectItem(item) => SetlistCommand::Select(item),
         action => SetlistCommand::Item(command_for(action, &snapshot.song, song)?),
     })

@@ -5,7 +5,7 @@
 //! opens only once the old show has closed it.
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use app::{
@@ -39,8 +39,15 @@ pub enum Source {
 impl Source {
     /// The setlist file at `path`: its library is the folder holding the
     /// [`SETLISTS_FOLDER`] it is in (the folder's name may be in any case).
-    /// `None` when `path` is not inside such a folder.
+    /// A relative path counts from the current folder, and `.` and `..`
+    /// are resolved by name, without following symlinks, as `play-cli`
+    /// does. `None` when `path` is not inside such a folder.
     pub fn setlist_file(path: &Path) -> Option<Self> {
+        // A path ending in `..` names a folder, never a setlist file.
+        if path.ends_with(Component::ParentDir.as_os_str()) {
+            return None;
+        }
+        let path = resolve_dots(&std::path::absolute(path).ok()?);
         let folder = path.parent()?;
         if !folder.file_name().is_some_and(is_setlists_folder) {
             return None;
@@ -328,6 +335,18 @@ impl Show {
         }
     }
 
+    /// The setlist file `from` of the library folder `library` moved to
+    /// `to` (renamed, or moved to its name's file): a setlist playing from
+    /// it now names the new file.
+    pub fn follow_move(&mut self, library: &Path, from: &str, to: &str) {
+        if let Self::Setlist(setlist) = self
+            && same_folder(&setlist.library, library)
+            && setlist.file == from
+        {
+            setlist.file = to.to_owned();
+        }
+    }
+
     /// Where it was opened from, to open it again.
     pub fn source(&self) -> Source {
         match self {
@@ -463,6 +482,34 @@ fn failure(source: &Source, error: OpenError) -> OpenFailure {
         Source::Song(_) => OpenFailure::Song(error),
         Source::Setlist { .. } => OpenFailure::Setlist(SetlistOpenError::Open(error)),
     }
+}
+
+/// Whether `a` and `b` name one folder: the same path, or the same folder
+/// once symlinks and dots are resolved.
+pub fn same_folder(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// `path` (absolute) with `.` dropped and each `..` taking off the name
+/// before it; `..` at the root stays at the root.
+fn resolve_dots(path: &Path) -> PathBuf {
+    let mut resolved = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if resolved.parent().is_some() {
+                    resolved.pop();
+                }
+            }
+            other => resolved.push(other.as_os_str()),
+        }
+    }
+    resolved
 }
 
 /// Whether `name` is the setlists folder's name, in any case.

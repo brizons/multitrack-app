@@ -120,9 +120,13 @@ fn range_labels(item: &SongItem, arrangement: &ArrangementEntry) -> Option<Strin
 /// "positions 2–3", "from position 2", "to position 3".
 fn range_numbers(item: &SongItem) -> String {
     match (item.start_position, item.end_position) {
-        (Some(start), Some(end)) => format!("positions {}–{}", start + 1, end + 1),
-        (Some(start), None) => format!("from position {}", start + 1),
-        (None, Some(end)) => format!("to position {}", end + 1),
+        (Some(start), Some(end)) => format!(
+            "positions {}–{}",
+            start.saturating_add(1),
+            end.saturating_add(1)
+        ),
+        (Some(start), None) => format!("from position {}", start.saturating_add(1)),
+        (None, Some(end)) => format!("to position {}", end.saturating_add(1)),
         (None, None) => String::new(),
     }
 }

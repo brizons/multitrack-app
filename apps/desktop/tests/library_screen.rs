@@ -762,3 +762,135 @@ fn a_setlist_saved_whose_place_cannot_be_stored_is_listed_with_a_warning() {
     page.act(LibraryAction::DismissNotice);
     assert_eq!(page.view(None).warning, None);
 }
+
+#[test]
+fn adding_a_song_with_no_setlist_in_the_editor_changes_nothing() {
+    let dir = library();
+    let mut page = LibraryPage::open(dir.path(), None).unwrap();
+    assert!(page.editor().is_none());
+    page.act(LibraryAction::AddSong(0));
+    assert!(page.editor().is_none());
+    assert!(!dir.path().join("Setlists").exists());
+    page.act(LibraryAction::AddClick);
+    assert!(page.editor().is_none());
+    assert!(!dir.path().join("Setlists").exists());
+}
+
+#[test]
+fn values_a_file_can_hold_never_crash_the_view_and_show_the_domain_problem() {
+    let dir = library();
+    let file = save(
+        dir.path(),
+        "Sunday",
+        vec![
+            SetlistItem::Click(ClickItem {
+                bars: Some(4),
+                ..ClickItem::new(
+                    0.0,
+                    TimeSignature {
+                        numerator: 4,
+                        denominator: 4,
+                    },
+                )
+            }),
+            SetlistItem::Song(SongItem {
+                start_position: Some(usize::MAX),
+                end_position: Some(usize::MAX),
+                ..SongItem::new("Songs/Amazing.song")
+            }),
+            SetlistItem::Click(ClickItem {
+                bars: Some(u32::MAX),
+                ..ClickItem::new(
+                    1.0,
+                    TimeSignature {
+                        numerator: u32::MAX,
+                        denominator: 4,
+                    },
+                )
+            }),
+        ],
+    );
+
+    let mut page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
+    page.act(LibraryAction::SelectRow(1));
+
+    let editor = page.view(None).editor.unwrap();
+    assert_eq!(editor.rows[0].length, "—");
+    assert_eq!(
+        editor.rows[0].problems,
+        ["item 1 (click-only) has bpm 0; bpm must be from 1 to 999"]
+    );
+    assert_eq!(editor.rows[1].length, "—");
+    assert!(!editor.rows[1].problems.is_empty());
+    assert!(
+        editor.summary.starts_with("3 items · at least "),
+        "{}",
+        editor.summary
+    );
+    page.act(LibraryAction::SelectRow(2));
+    page.view(None);
+}
+
+#[test]
+fn renaming_reports_the_move_so_perform_can_follow_it() {
+    let dir = library();
+    let file = save(dir.path(), "Sunday", Vec::new());
+    let mut page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
+    assert_eq!(page.take_moves(), Vec::<(String, String)>::new());
+
+    page.act(LibraryAction::RenameSetlist);
+    rename_to(&mut page, "Zed");
+
+    assert_eq!(
+        page.take_moves(),
+        [(
+            "Sunday.setlist.json".to_owned(),
+            "Zed.setlist.json".to_owned()
+        )]
+    );
+    assert_eq!(page.take_moves(), Vec::<(String, String)>::new());
+    assert!(page.view(Some("Zed.setlist.json")).setlists[0].playing);
+
+    // A file named by hand moves on its first change, and says so.
+    let mut setlist = Setlist::new("Evening");
+    setlist.items = vec![SetlistItem::Click(ClickItem::new(
+        100.0,
+        TimeSignature {
+            numerator: 4,
+            denominator: 4,
+        },
+    ))];
+    fs::write(
+        dir.path().join("Setlists/by hand.setlist.json"),
+        setlist.to_json().unwrap(),
+    )
+    .unwrap();
+    let mut page = LibraryPage::open(dir.path(), Some("by hand.setlist.json")).unwrap();
+    page.act(LibraryAction::Transition(0, Transition::Stay));
+    assert_eq!(
+        page.take_moves(),
+        [(
+            "by hand.setlist.json".to_owned(),
+            "Evening.setlist.json".to_owned()
+        )]
+    );
+}
+
+#[test]
+fn the_library_screen_opens_the_playing_setlists_library_only_when_none_is_open() {
+    use openvamp_desktop::library_page::library_to_open;
+
+    let playing = (Path::new("/music/Library"), "Sunday.setlist.json");
+    assert_eq!(
+        library_to_open(None, Some(playing)),
+        Some((
+            Path::new("/music/Library").to_owned(),
+            "Sunday.setlist.json".to_owned()
+        ))
+    );
+    assert_eq!(
+        library_to_open(Some(Path::new("/music/Other")), Some(playing)),
+        None
+    );
+    assert_eq!(library_to_open(None, None), None);
+}

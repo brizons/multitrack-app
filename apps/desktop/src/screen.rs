@@ -19,8 +19,8 @@ use openvamp_desktop::action::{Intent, Page, UiAction};
 use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
-use openvamp_desktop::library_page::LibraryPage;
-use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
+use openvamp_desktop::library_page::{LibraryPage, library_to_open};
+use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace, same_folder};
 use openvamp_desktop::view::PerformView;
 
 use crate::{library_ui, ui};
@@ -267,6 +267,7 @@ impl Perform {
                 if let Some(library) = &mut self.library {
                     library.act(action);
                 }
+                self.follow_library_moves();
             }
             Intent::PerformSetlist => self.perform_setlist(),
             Intent::DismissProblems => self.problems.clear(),
@@ -332,15 +333,33 @@ impl Perform {
     /// is open yet.
     fn show_page(&mut self, page: Page) {
         self.page = page;
-        if page == Page::Library
-            && let Some(Show::Setlist(setlist)) = &self.loaded
-            && self
-                .library
-                .as_ref()
-                .is_none_or(|library| library.root() != setlist.library)
-        {
-            let (root, file) = (setlist.library.clone(), setlist.file.clone());
+        if page != Page::Library {
+            return;
+        }
+        let playing = match &self.loaded {
+            Some(Show::Setlist(setlist)) => {
+                Some((setlist.library.as_path(), setlist.file.as_str()))
+            }
+            _ => None,
+        };
+        let open = self.library.as_ref().map(LibraryPage::root);
+        if let Some((root, file)) = library_to_open(open, playing) {
             self.open_library(&root, Some(&file));
+        }
+    }
+
+    /// Lets the setlist on Perform follow its file when the Library screen
+    /// moved it (a rename, or a file named by hand moved on its first
+    /// change), so it opens again from where it now is and stays marked.
+    fn follow_library_moves(&mut self) {
+        let Some(library) = &mut self.library else {
+            return;
+        };
+        let root = library.root().to_owned();
+        for (from, to) in library.take_moves() {
+            if let Some(show) = &mut self.loaded {
+                show.follow_move(&root, &from, &to);
+            }
         }
     }
 
@@ -380,7 +399,7 @@ impl Perform {
     fn playing_file(&self) -> Option<&str> {
         let library = self.library.as_ref()?;
         match &self.loaded {
-            Some(Show::Setlist(setlist)) if setlist.library == library.root() => {
+            Some(Show::Setlist(setlist)) if same_folder(&setlist.library, library.root()) => {
                 Some(setlist.file.as_str())
             }
             _ => None,
@@ -400,6 +419,7 @@ impl Perform {
                 if let Some(library) = &mut self.library {
                     library.type_key(key);
                 }
+                self.follow_library_moves();
             }
             Typed::Paste => {
                 let text = cx.read_from_clipboard().and_then(|item| item.text());

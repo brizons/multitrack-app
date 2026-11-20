@@ -301,3 +301,45 @@ fn a_setlist_with_nothing_to_play_leaves_the_song_playing_and_says_why() {
         "the song still plays"
     );
 }
+
+#[test]
+fn a_playing_setlist_follows_its_file_when_it_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path();
+    write_song(&library.join("One.song"), "First", 8_000);
+    let source = save_setlist(library, "Sunday", vec![song("One.song")]);
+    let fake = FakeOutput::new();
+    let mut current = None;
+    replace(
+        &mut current,
+        &source,
+        &SessionOptions::default(),
+        output(&fake),
+        |_| {},
+    )
+    .unwrap();
+    let show = current.as_mut().unwrap();
+
+    show.follow_move(library, "Sunday.setlist.json", "Zed.setlist.json");
+    assert_eq!(
+        show.source(),
+        Source::Setlist {
+            library: library.to_owned(),
+            file: "Zed.setlist.json".to_owned(),
+        }
+    );
+    // A move in another library, or of another file, changes nothing.
+    show.follow_move(
+        Path::new("/elsewhere"),
+        "Zed.setlist.json",
+        "Other.setlist.json",
+    );
+    show.follow_move(library, "Other.setlist.json", "Third.setlist.json");
+    assert_eq!(
+        show.source(),
+        Source::Setlist {
+            library: library.to_owned(),
+            file: "Zed.setlist.json".to_owned(),
+        }
+    );
+}

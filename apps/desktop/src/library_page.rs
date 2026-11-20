@@ -109,6 +109,8 @@ pub struct LibraryPage {
     typing: Option<Field>,
     notice: Option<String>,
     warning: Option<String>,
+    /// The editor's file moves not yet taken ([`Self::take_moves`]).
+    moves: Vec<(String, String)>,
 }
 
 impl LibraryPage {
@@ -139,6 +141,7 @@ impl LibraryPage {
             typing: None,
             notice: None,
             warning: None,
+            moves: Vec::new(),
         };
         let file = file
             .map(str::to_owned)
@@ -147,6 +150,12 @@ impl LibraryPage {
             page.select(&file);
         }
         Ok(page)
+    }
+
+    /// The setlist files the editor moved since the last call, as (from,
+    /// to): a rename, or a file named by hand moved on its first change.
+    pub fn take_moves(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.moves)
     }
 
     /// The library folder.
@@ -221,15 +230,17 @@ impl LibraryPage {
                     Some(row)
                 };
             }
+            // With no setlist in the editor there is nothing to add to.
+            A::AddSong(_) | A::AddClick if self.editor.is_none() => {}
             A::AddSong(row) => {
                 if let Some(song) = self.found_songs().get(row).map(|s| s.song.clone()) {
                     self.edit(Edit::AddSong(song))?;
-                    self.row = Some(self.items().len() - 1);
+                    self.row = self.items().len().checked_sub(1);
                 }
             }
             A::AddClick => {
                 self.edit(Edit::AddClick)?;
-                self.row = Some(self.items().len() - 1);
+                self.row = self.items().len().checked_sub(1);
             }
             A::Remove(index) => {
                 self.edit(Edit::Remove(index))?;
@@ -366,7 +377,10 @@ impl LibraryPage {
         if name == editor.setlist().name {
             return;
         }
-        match editor.rename(name) {
+        let from = editor.file().to_owned();
+        let renamed = editor.rename(name);
+        self.moved(from);
+        match renamed {
             Ok(warning) => {
                 self.warn(warning);
                 if let Err(error) = self.shelf.refresh() {
@@ -389,9 +403,21 @@ impl LibraryPage {
         let Some(editor) = &mut self.editor else {
             return Ok(());
         };
-        let warning = editor.apply(edit).map_err(|error| error.to_string())?;
-        self.warn(warning);
+        let from = editor.file().to_owned();
+        let applied = editor.apply(edit);
+        self.moved(from);
+        self.warn(applied.map_err(|error| error.to_string())?);
         self.shelf.refresh().map_err(|error| error.to_string())
+    }
+
+    /// Records that the editor's setlist moved from the file `from`, when
+    /// it did.
+    fn moved(&mut self, from: String) {
+        if let Some(to) = self.selected_file().map(str::to_owned)
+            && to != from
+        {
+            self.moves.push((from, to));
+        }
     }
 
     /// Shows `warning`, when there is one, until dismissed or replaced.
@@ -543,7 +569,12 @@ impl LibraryPage {
                 .iter()
                 .map(|item| self.seconds(item))
                 .collect();
-            let total = clock(lengths.iter().flatten().sum());
+            let total = clock(
+                lengths
+                    .iter()
+                    .flatten()
+                    .fold(0, |total: u64, seconds| total.saturating_add(*seconds)),
+            );
             let open = lengths.iter().any(Option::is_none);
             let at_least = if open { "at least " } else { "" };
             format!("{} · {at_least}{total}", plural(rows.len(), "item"))
@@ -610,16 +641,20 @@ impl LibraryPage {
                     .iter()
                     .find(|a| a.id == song.arrangement)?;
                 let bounds = bounds(song, entry)?;
-                let frames: u64 = arrangement
+                let frames = arrangement
                     .positions
                     .get(bounds.start..=bounds.end)?
                     .iter()
-                    .map(|p| p.length_frames)
-                    .sum();
+                    .fold(0, |total: u64, p| total.saturating_add(p.length_frames));
                 Some(frames / u64::from(entry.sample_rate.max(1)))
             }
+            // A tempo the setlist rules refuse has no length; the domain's
+            // problem shows instead.
+            SetlistItem::Click(click) if !(MIN_BPM..=MAX_BPM).contains(&click.bpm) => None,
             SetlistItem::Click(click) => {
                 let beats = f64::from(click.bars?) * f64::from(click.time_signature.numerator);
+                // At most u32::MAX² beats at 1 BPM: finite, and `as`
+                // saturates whatever is left over.
                 Some((beats * 60.0 / click.bpm) as u64)
             }
         }
@@ -667,10 +702,10 @@ fn song_details(song: &SongItem, entry: Option<&SongEntry>) -> SongDetails {
     let bounds = entry.and_then(|entry| bounds(song, entry));
     let label = |position: Option<usize>, edge: &str| match (position, arrangement) {
         (Some(position), Some(arrangement)) => arrangement.positions.get(position).map_or_else(
-            || format!("{} · not in the arrangement", position + 1),
+            || format!("{} · not in the arrangement", position.saturating_add(1)),
             |p| format!("{} · {}", position + 1, p.label),
         ),
-        (Some(position), None) => format!("position {}", position + 1),
+        (Some(position), None) => format!("position {}", position.saturating_add(1)),
         (None, _) => edge.to_owned(),
     };
     let start = bounds.as_ref().map(|b| b.start).or(song.start_position);
@@ -752,6 +787,19 @@ fn item_of(problem: &SetlistValidationError) -> Option<usize> {
         | E::InvalidClickNumerator { item }
         | E::InvalidClickDenominator { item, .. }
         | E::ZeroClickBars { item } => Some(*item),
+    }
+}
+
+/// The library folder (and setlist) the Library screen opens on when it
+/// is shown: the library of the setlist `playing` on Perform, with that
+/// setlist in the editor, but only when no library is `open` yet.
+pub fn library_to_open(
+    open: Option<&Path>,
+    playing: Option<(&Path, &str)>,
+) -> Option<(PathBuf, String)> {
+    match (open, playing) {
+        (None, Some((library, file))) => Some((library.to_owned(), file.to_owned())),
+        _ => None,
     }
 }
 

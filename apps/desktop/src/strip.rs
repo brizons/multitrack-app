@@ -23,8 +23,11 @@ pub enum ItemState {
 /// The chip after an item that says how it leads to the next one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionChip {
-    /// The transition.
+    /// The transition the item leads to the next one with.
     pub transition: Transition,
+    /// The transition the setlist holds for the item; an AutoLink or
+    /// Crossfade into a song at another rate plays as Cue next.
+    pub written: Transition,
     /// Short name: "Cue", "Stay", "Auto", "X-fade".
     pub short: &'static str,
     /// What it is, such as "Transition: AutoLink".
@@ -128,14 +131,7 @@ impl SetlistView {
                     loading: is_next && !state.next_ready,
                     warning,
                     playable: item.is_playable(),
-                    transition: (index < last).then(|| {
-                        let transition = item.item.transition();
-                        TransitionChip {
-                            transition,
-                            short: transition_short(transition),
-                            label: format!("Transition: {}", transition_name(transition)),
-                        }
-                    }),
+                    transition: (index < last).then(|| chip(info, index)),
                 }
             })
             .collect();
@@ -163,10 +159,77 @@ impl SetlistView {
     }
 }
 
+/// An AutoLink or Crossfade the session plays as Cue next, because the next
+/// playable item runs at another rate than the device while item `index`
+/// plays (nothing resamples, so the device reopens between them): the
+/// next item, its rate and the device's.
+struct Fallback {
+    next: usize,
+    next_rate: u32,
+    rate: u32,
+}
+
+/// The fallback of item `index`'s transition, if it has one.
+fn fallback(info: &SetlistInfo, index: usize) -> Option<Fallback> {
+    if !matches!(
+        info.items.get(index)?.item.transition(),
+        Transition::AutoLink | Transition::Crossfade
+    ) {
+        return None;
+    }
+    let next = (index + 1..info.items.len()).find(|&next| info.items[next].is_playable())?;
+    let (rate, next_rate) = (device_rate(info, index), device_rate(info, next));
+    (rate != next_rate).then_some(Fallback {
+        next,
+        next_rate,
+        rate,
+    })
+}
+
+/// The rate the device runs at while item `index` plays: a song's own; a
+/// click-only tile plays at the rate of the last playable song before it,
+/// or the setlist's when there is none.
+fn device_rate(info: &SetlistInfo, index: usize) -> u32 {
+    info.items[..=index.min(info.items.len().saturating_sub(1))]
+        .iter()
+        .rev()
+        .filter(|item| item.is_playable())
+        .find_map(|item| match item.item {
+            SetlistItem::Song(_) => item.sample_rate,
+            SetlistItem::Click(_) => None,
+        })
+        .unwrap_or(info.sample_rate)
+}
+
+/// The chip after item `index`: its transition as it plays.
+fn chip(info: &SetlistInfo, index: usize) -> TransitionChip {
+    let written = info.items[index].item.transition();
+    match fallback(info, index) {
+        Some(fallback) => TransitionChip {
+            transition: Transition::CueNext,
+            written,
+            short: transition_short(Transition::CueNext),
+            label: format!(
+                "Transition: {}, played as Cue next: item {} runs at {} Hz and the device at {} Hz",
+                transition_name(written),
+                fallback.next + 1,
+                fallback.next_rate,
+                fallback.rate
+            ),
+        },
+        None => TransitionChip {
+            transition: written,
+            written,
+            short: transition_short(written),
+            label: format!("Transition: {}", transition_name(written)),
+        },
+    }
+}
+
 /// The setlist's problems, one line each, in this order: why each item
-/// that cannot play cannot, each song at another sample rate, the last
-/// setlist problem, the control refused, and the device held for the
-/// current item's rate.
+/// that cannot play cannot, each song at another sample rate, each link
+/// that plays as Cue next because of it, the last setlist problem, the
+/// control refused, and the device held for the current item's rate.
 fn problems(
     info: &SetlistInfo,
     snapshot: &SetlistSnapshot,
@@ -194,6 +257,19 @@ fn problems(
             info.items[index].sample_rate.unwrap_or_default(),
             info.sample_rate
         ));
+    }
+    for index in 0..info.items.len() {
+        if let Some(fallback) = fallback(info, index) {
+            lines.push(format!(
+                "Item {} leads into item {} with Cue next, not {}: item {} runs at {} Hz and the device at {} Hz",
+                name(index),
+                name(fallback.next),
+                transition_name(info.items[index].item.transition()),
+                fallback.next + 1,
+                fallback.next_rate,
+                fallback.rate
+            ));
+        }
     }
     if let Some(problem) = &snapshot.setlist.problem {
         lines.push(problem.to_string());

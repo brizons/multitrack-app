@@ -181,6 +181,7 @@ fn snapshot() -> SetlistSnapshot {
 fn chip(transition: Transition, short: &'static str, name: &str) -> Option<TransitionChip> {
     Some(TransitionChip {
         transition,
+        written: transition,
         short,
         label: format!("Transition: {name}"),
     })
@@ -559,4 +560,91 @@ fn a_picked_setlist_must_be_a_setlist_file_in_a_setlists_folder() {
         )
     );
     assert!(Source::picked_setlist(Path::new("/tmp/Sunday.setlist.json")).is_err());
+}
+
+#[test]
+fn a_setlist_path_relative_to_the_current_folder_names_a_library_that_opens() {
+    let Source::Setlist { library, file } =
+        Source::for_path(Path::new("Setlists/Sunday.setlist.json")).unwrap()
+    else {
+        panic!("a setlist")
+    };
+    assert_eq!(file, "Sunday.setlist.json");
+    assert_eq!(
+        std::fs::canonicalize(&library).unwrap(),
+        std::fs::canonicalize(".").unwrap()
+    );
+}
+
+#[test]
+fn dots_in_a_setlist_path_are_resolved_by_name() {
+    let library = Path::new("/music/Library");
+    for path in [
+        "/music/Library/./Setlists/Sunday.setlist.json",
+        "/music/Library/Other/../Setlists/Sunday.setlist.json",
+        "/music/Library/Setlists/../Setlists/./Sunday.setlist.json",
+    ] {
+        assert_eq!(
+            Source::setlist_file(Path::new(path)),
+            Some(Source::Setlist {
+                library: library.to_owned(),
+                file: "Sunday.setlist.json".to_owned(),
+            }),
+            "{path}"
+        );
+    }
+    assert_eq!(
+        Source::setlist_file(Path::new("/music/Library/Setlists/..")),
+        None
+    );
+}
+
+#[test]
+fn clicking_the_current_tile_does_nothing() {
+    let snapshot = snapshot();
+    let song = song_info();
+    assert_eq!(
+        setlist_command_for(UiAction::SelectItem(1), &snapshot, &song),
+        None,
+        "item 2 is the current one"
+    );
+    assert_eq!(
+        setlist_command_for(UiAction::SelectItem(0), &snapshot, &song),
+        Some(SetlistCommand::Select(0))
+    );
+}
+
+#[test]
+fn a_link_into_a_song_at_another_rate_shows_as_the_cue_next_it_plays_as() {
+    let mut info = info();
+    // The click tile plays at the rate of the song before it (48 kHz);
+    // Rivers Rise runs at 44.1 kHz.
+    let SetlistItem::Click(click) = &mut info.items[3].item else {
+        panic!("a click tile");
+    };
+    click.transition = Transition::AutoLink;
+
+    let view = SetlistView::new(&info, &snapshot(), &catalog(), None);
+
+    assert_eq!(
+        view.items[3].transition,
+        Some(TransitionChip {
+            transition: Transition::CueNext,
+            written: Transition::AutoLink,
+            short: "Cue",
+            label: "Transition: AutoLink, played as Cue next: item 5 runs at 44100 Hz and the device at 48000 Hz".to_owned(),
+        })
+    );
+    assert!(
+        view.problems.contains(
+            &"Item 4 \"Click\" leads into item 5 \"Rivers Rise\" with Cue next, not AutoLink: item 5 runs at 44100 Hz and the device at 48000 Hz".to_owned()
+        ),
+        "{:?}",
+        view.problems
+    );
+    // A link between items at one rate is as written.
+    assert_eq!(
+        view.items[0].transition.as_ref().unwrap().transition,
+        Transition::AutoLink
+    );
 }
