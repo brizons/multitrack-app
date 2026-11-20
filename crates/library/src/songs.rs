@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use domain::{SectionType, Song};
+use domain::Song;
 
 use crate::{
     Library, LoadError, MANIFEST_FILE, OpenFileError, SETLISTS_FOLDER, SetlistError,
@@ -66,7 +66,8 @@ pub struct PositionEntry {
     /// Section id, as in the song package.
     pub section_id: String,
     /// The section type and its number, such as "Verse 2" or "Pre-chorus",
-    /// in the words the live player's song description uses.
+    /// as [`domain::SectionType::label`] words it, like the live player's
+    /// song description.
     pub label: String,
     /// Frames in the section.
     pub length_frames: u64,
@@ -289,7 +290,7 @@ fn entry(path: &str, song: &Song) -> SongEntry {
                 .filter_map(|id| song.section(id))
                 .map(|section| PositionEntry {
                     section_id: section.id.clone(),
-                    label: section_label(section.section_type, section.number),
+                    label: section.section_type.label(section.number),
                     length_frames: section.length(),
                 })
                 .collect(),
@@ -306,32 +307,6 @@ fn entry(path: &str, song: &Song) -> SongEntry {
         stems: song.stems().len(),
         length_frames: song.length(),
         arrangements,
-    }
-}
-
-/// "Verse 2", "Pre-chorus", "Count-off": the words the live player's song
-/// description (`app::SongInfo`) uses.
-fn section_label(section_type: SectionType, number: Option<u32>) -> String {
-    let name = match section_type {
-        SectionType::CountOff => "Count-off",
-        SectionType::Intro => "Intro",
-        SectionType::Verse => "Verse",
-        SectionType::PreChorus => "Pre-chorus",
-        SectionType::Chorus => "Chorus",
-        SectionType::PostChorus => "Post-chorus",
-        SectionType::Bridge => "Bridge",
-        SectionType::Instrumental => "Instrumental",
-        SectionType::Interlude => "Interlude",
-        SectionType::Tag => "Tag",
-        SectionType::Vamp => "Vamp",
-        SectionType::Turnaround => "Turnaround",
-        SectionType::Breakdown => "Breakdown",
-        SectionType::Outro => "Outro",
-        SectionType::Ending => "Ending",
-    };
-    match number {
-        Some(number) => format!("{name} {number}"),
-        None => name.to_owned(),
     }
 }
 
