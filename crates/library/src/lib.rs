@@ -7,7 +7,9 @@
 //! [`write_wav_stereo_f32`] writes a rendered mix. A [`Library`] keeps the
 //! setlists of a library folder as `*.setlist.json` files in its
 //! [`SETLISTS_FOLDER`]: it lists, loads, saves, renames and duplicates them,
-//! never leaving a half-written file or overwriting another setlist.
+//! never leaving a half-written file or overwriting another setlist, and
+//! keeps the order of the list in its [`SETLIST_ORDER_FILE`]
+//! ([`Library::move_setlist`]).
 //! [`Library::setlist_songs`] reads the songs a setlist names, so
 //! [`domain::Setlist::validate`] can report the ones the library lacks while
 //! the rest of the setlist stays usable. [`Library::list_songs`] lists every
@@ -32,6 +34,7 @@ use engine::StemAudio;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use thiserror::Error;
 
+mod setlist_order;
 mod setlist_songs;
 mod setlists;
 mod songs;
@@ -39,8 +42,9 @@ mod stream;
 
 pub use setlist_songs::{SetlistSongs, SongUnavailable};
 pub use setlists::{
-    Library, MAX_SETLIST_FILE_BYTES, SETLIST_EXTENSION, SETLISTS_FOLDER, SetlistEntry,
-    SetlistError, SetlistListing, UnreadableSetlist,
+    Library, MAX_SETLIST_FILE_BYTES, SETLIST_EXTENSION, SETLIST_ORDER_FILE,
+    SETLIST_ORDER_FORMAT_VERSION, SETLISTS_FOLDER, SetlistEntry, SetlistError, SetlistListing,
+    UnreadableSetlist,
 };
 pub use songs::{ArrangementEntry, PositionEntry, SongEntry, SongListing, UnreadableSong};
 pub use stream::{DiskMonitor, Gate, StreamCapacity, StreamConfig, StreamingSong, open_streaming};
