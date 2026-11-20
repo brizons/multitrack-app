@@ -15,7 +15,7 @@ use library::{DiskMonitor, Library, SetlistError, SetlistSongs};
 use thiserror::Error;
 
 use crate::error::{OpenError, RuntimeError};
-use crate::item::Item;
+use crate::item::{Item, ItemError};
 use crate::output::{AudioOutput, OutputCheck};
 use crate::session::{Command, PreparedSong, Session, SessionOptions, Snapshot, check_buffer};
 use crate::song::SongInfo;
@@ -166,6 +166,17 @@ pub enum SetlistProblem {
         /// Index of the item.
         item: usize,
     },
+    /// The setlist could not move on to item `item` when the current one
+    /// ended, though the item itself is ready: the audio thread or the
+    /// device refused the change, such as a full command queue. The current
+    /// item stays selected, stopped; selecting the item again retries.
+    #[error("item {} could not follow on: {error}", .item + 1)]
+    Transition {
+        /// Index of the item that should have followed.
+        item: usize,
+        /// What refused it.
+        error: SetlistCommandError,
+    },
 }
 
 /// Why a setlist did not open.
@@ -186,10 +197,20 @@ pub enum SetlistOpenError {
     /// The first playable item or the device could not be opened.
     #[error(transparent)]
     Open(#[from] OpenError),
+    /// The first playable item could not be built although its folder
+    /// opened: its song changed after the setlist was checked and no longer
+    /// has the item's start and end positions.
+    #[error("item {} could not be prepared: {error}", .item + 1)]
+    FirstItem {
+        /// Index of the item.
+        item: usize,
+        /// Why.
+        error: String,
+    },
 }
 
 /// Why [`SetlistSession::send`] refused a command; nothing changed.
-#[derive(Debug, Clone, PartialEq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SetlistCommandError {
     /// The current item refused the command, as a single-song session
     /// would.
@@ -240,14 +261,14 @@ enum Plan {
 
 /// Why an item could not be built.
 enum BuildError {
-    Open(OpenError),
+    Item(ItemError),
     Click,
 }
 
 impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Open(error) => error.fmt(f),
+            Self::Item(error) => error.fmt(f),
             Self::Click => f.write_str("the click-only tile breaks the setlist rules"),
         }
     }
@@ -357,6 +378,14 @@ impl PreparedSetlist {
 /// why ([`RuntimeError::DeviceReopenFailed`]) and the session keeps trying;
 /// selecting an item at a rate the device takes brings it back.
 ///
+/// A song whose arrangement changed after the setlist was checked, so it
+/// no longer has the item's start and end positions, is refused for that
+/// item ([`SetlistProblem::Prepare`]) rather than played whole. When the
+/// audio thread refuses a change (its command queue is full), the setlist
+/// keeps describing what it plays: the selection stays where it was, and an
+/// item it had cued stays cued and followed; a transition refused that way
+/// reads as [`SetlistProblem::Transition`].
+///
 /// A song item with a fade-out fades its stems out over its last
 /// [`domain::SONG_FADE_OUT_SECONDS`], silent on its last frame; click and
 /// guide play on to its end, as with the Fade control (F6.4).
@@ -450,11 +479,11 @@ impl SetlistSession {
         };
         let item = match build(plans[first].as_ref(), sample_rate, &options) {
             Ok(item) => item,
-            Err(BuildError::Open(error)) => return Err(error.into()),
-            Err(BuildError::Click) => {
-                return Err(SetlistOpenError::NothingPlayable {
-                    name: info.name,
-                    problems: info.items.into_iter().map(|item| item.problems).collect(),
+            Err(BuildError::Item(ItemError::Open(error))) => return Err(error.into()),
+            Err(error) => {
+                return Err(SetlistOpenError::FirstItem {
+                    item: first,
+                    error: error.to_string(),
                 });
             }
         };
@@ -506,16 +535,23 @@ impl SetlistSession {
             .map_or(self.current, |pending| pending.index);
         let item = match command {
             SetlistCommand::Item(command) => {
+                // The last transport command wins, also for the item the
+                // device is about to reopen for.
                 match command {
-                    Command::Play => self.halted = false,
-                    Command::Pause | Command::Stop | Command::Panic => self.halted = true,
+                    Command::Play => {
+                        self.halted = false;
+                        // Play starts the item the device reopens for, not
+                        // the one ramping out.
+                        if self.reopen.is_some() {
+                            self.play_after_reopen = true;
+                            return Ok(());
+                        }
+                    }
+                    Command::Pause | Command::Stop | Command::Panic => {
+                        self.halted = true;
+                        self.play_after_reopen = false;
+                    }
                     _ => {}
-                }
-                // The device is about to reopen for the item selected: play
-                // starts that one, not the item ramping out.
-                if self.reopen.is_some() && command == Command::Play {
-                    self.play_after_reopen = true;
-                    return Ok(());
                 }
                 return Ok(self.session.send(command)?);
             }
@@ -649,13 +685,18 @@ impl SetlistSession {
             self.session.send(Command::Stop)?;
             return Ok(());
         }
-        if let Some(staged) = self.cued.take_if(|staged| staged.index == target) {
+        // The cued record goes only once the deck took the message: a
+        // refused one leaves the item cued there, and the setlist must still
+        // follow its hand-over.
+        if let Some(staged) = self.cued.as_ref().filter(|staged| staged.index == target) {
             self.session
-                .select_cued(staged.info, staged.monitor, staged.tag)?;
+                .select_cued(staged.info.clone(), staged.monitor.clone(), staged.tag)?;
+            self.cued = None;
             self.current = target;
         } else {
-            if self.cued.take().is_some() {
+            if self.cued.is_some() {
                 self.session.uncue()?;
+                self.cued = None;
             }
             let mut pending = match self.pending.take() {
                 Some(pending) if pending.index == target => pending,
@@ -698,13 +739,15 @@ impl SetlistSession {
         if self.failed.is_some_and(|failed| Some(failed) != want) {
             self.failed = None;
         }
+        // A refused uncue keeps the record, so the setlist still follows
+        // that item and cues no second one; the next poll tries again.
         if self
             .cued
             .as_ref()
             .is_some_and(|staged| Some(staged.index) != want)
+            && self.session.uncue().is_ok()
         {
             self.cued = None;
-            let _ = self.session.uncue();
         }
         if let Some(pending) = &self.pending
             && (Some(pending.index) != want
@@ -943,20 +986,19 @@ fn build(plan: Option<&Plan>, rate: u32, options: &SessionOptions) -> Result<Ite
             positions,
             fade_out,
             ..
-        }) => Item::open_song(folder, arrangement, *positions, *fade_out, options)
-            .map_err(BuildError::Open),
+        }) => Item::open_item(folder, arrangement, *positions, *fade_out, options)
+            .map_err(BuildError::Item),
         Some(Plan::Click(click)) => Item::click(click, rate, options).ok_or(BuildError::Click),
         None => Err(BuildError::Click),
     }
 }
 
-/// A command error as a setlist problem about item `index`.
+/// A failure to prepare item `index`, or to move on to it, as a setlist
+/// problem: a preparation that failed reads as one, anything else (the
+/// audio thread or the device refusing) as a refused transition.
 fn problem(index: usize, error: SetlistCommandError) -> SetlistProblem {
     match error {
         SetlistCommandError::Prepare { item, error } => SetlistProblem::Prepare { item, error },
-        error => SetlistProblem::Prepare {
-            item: index,
-            error: error.to_string(),
-        },
+        error => SetlistProblem::Transition { item: index, error },
     }
 }

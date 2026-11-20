@@ -443,7 +443,7 @@ impl Session {
     /// [`PreparedSong::start`].
     pub fn prepare(song_dir: &Path, options: SessionOptions) -> Result<PreparedSong, OpenError> {
         check_buffer(options.buffer_frames)?;
-        let item = Item::open_song(song_dir, &options.arrangement, None, false, &options)?;
+        let item = Item::open_song(song_dir, &options.arrangement, &options)?;
         Ok(PreparedSong::new(item, 0, &options))
     }
 
@@ -981,13 +981,29 @@ impl Session {
         Ok(())
     }
 
-    /// Plays `item` as `tag` at its own sample rate: closes the stream
-    /// (the current item has stopped), makes `item` current, and opens the
-    /// same device again at the new rate. A device that refuses is held as
-    /// a lost one, so the session keeps trying and says why
+    /// Plays `item` as `tag` at its own sample rate: makes `item` current,
+    /// closes the stream (the current item has stopped), and opens the same
+    /// device again at the new rate. A device that refuses is held as a lost
+    /// one, so the session keeps trying and says why
     /// ([`RuntimeError::DeviceReopenFailed`]); choosing an item at a rate
     /// the device takes brings it back.
+    ///
+    /// The item goes to the deck first: when the deck refuses it (its queue
+    /// is full), nothing else changes, so the session keeps describing and
+    /// playing the item it had at the rate it had, and the refusal is
+    /// returned and kept as [`Snapshot::last_error`].
     pub(crate) fn reopen_with(&mut self, item: Item, tag: u64) -> Result<(), RuntimeError> {
+        let Item {
+            info,
+            player,
+            monitor,
+            ..
+        } = item;
+        let rate = info.sample_rate;
+        // Should the audio thread take it before the stream closes, the
+        // item waits there stopped: silent, whatever the rate.
+        let sent = self.deck.select(player, tag);
+        self.count(sent.is_ok(), "Select")?;
         let state = match mem::replace(&mut self.link, Link::Lost) {
             Link::Streaming { stream, home } => {
                 drop(stream);
@@ -1000,16 +1016,6 @@ impl Session {
             self.last_error = Some(RuntimeError::PlayerLost);
             return Err(RuntimeError::PlayerLost);
         };
-        let rate = item.info.sample_rate;
-        let Item {
-            info,
-            player,
-            monitor,
-            ..
-        } = item;
-        if self.deck.select(player, tag).is_ok() {
-            self.sent += 1;
-        }
         state.deck.process(&mut []);
         state.publish();
         self.bind(info, monitor, tag);

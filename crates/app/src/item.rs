@@ -1,6 +1,7 @@
 //! What a session plays: one song, or one setlist item, with its player
 //! built and its start buffering, ready to hand to the audio thread.
 
+use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -26,42 +27,57 @@ pub(crate) struct Item {
 
 impl Item {
     /// Opens the song folder `dir` for streaming and builds the player for
-    /// `arrangement`, cut to positions `first..=last` when `positions` is
-    /// given (clamped to the arrangement, which the setlist was checked
-    /// against). With `end_fade`, the track stems fade out over the last
-    /// [`SONG_FADE_OUT_SECONDS`] (F5.3). The player starts buffering at once.
+    /// the whole `arrangement`: a single-song session's song. The player
+    /// starts buffering at once.
     pub(crate) fn open_song(
+        dir: &Path,
+        arrangement: &str,
+        options: &SessionOptions,
+    ) -> Result<Self, OpenError> {
+        Self::from_stream(stream(dir, options)?, arrangement, false, options)
+    }
+
+    /// Opens a setlist song item: the song folder `dir`, its `arrangement`
+    /// cut to positions `first..=last` when `positions` is given, and with
+    /// `end_fade` the track stems fading out over the last
+    /// [`SONG_FADE_OUT_SECONDS`] (F5.3). The setlist checked the positions
+    /// against the song when it opened; when the song changed since and no
+    /// longer has them, the item is refused ([`ItemError::Range`]) rather
+    /// than played whole or cut somewhere else.
+    pub(crate) fn open_item(
         dir: &Path,
         arrangement: &str,
         positions: Option<(usize, usize)>,
         end_fade: bool,
         options: &SessionOptions,
+    ) -> Result<Self, ItemError> {
+        let mut streaming = stream(dir, options)?;
+        if let Some(range) = positions {
+            streaming.song = excerpt(streaming.song, arrangement, range)?;
+        }
+        Ok(Self::from_stream(
+            streaming,
+            arrangement,
+            end_fade,
+            options,
+        )?)
+    }
+
+    /// Builds the player for `arrangement` of the streamed song.
+    fn from_stream(
+        streaming: StreamingSong,
+        arrangement: &str,
+        end_fade: bool,
+        options: &SessionOptions,
     ) -> Result<Self, OpenError> {
-        // One value feeds both configurations, so the stream always keeps
-        // what the player's seams read (advisory A3).
-        let stream_config = StreamConfig {
-            seam_crossfade: options.seam_crossfade,
-            gate: options.disk_gate.clone(),
-            ..StreamConfig::default()
-        };
         let StreamingSong {
             song,
             warnings,
             sources,
             monitor,
-            capacity,
-        } = open_streaming(dir, &stream_config)?;
+            ..
+        } = streaming;
         let sample_rate = song.sample_rate();
-        if capacity.ahead_frames < u64::from(MAX_BUFFER_FRAMES) {
-            return Err(OpenError::RateTooLow {
-                sample_rate,
-                ahead_frames: capacity.ahead_frames,
-            });
-        }
-        let song = match positions {
-            Some(range) => excerpt(song, arrangement, range),
-            None => song,
-        };
         let (mut player, controller) = Player::new(
             &song,
             arrangement,
@@ -137,17 +153,82 @@ fn config(sample_rate: u32, options: &SessionOptions) -> PlayerConfig {
     }
 }
 
-/// `song` cut to positions `first..=last` of `arrangement`, clamped to it;
-/// the song unchanged when it has no such arrangement, for
-/// [`Player::new`] to report.
-fn excerpt(song: Song, arrangement: &str, (first, last): (usize, usize)) -> Song {
+/// Why a setlist item could not be built.
+#[derive(Debug)]
+pub(crate) enum ItemError {
+    /// The song folder, its stream, or its player.
+    Open(OpenError),
+    /// The song's arrangement no longer has the item's positions: the song
+    /// changed after the setlist was checked.
+    Range {
+        arrangement: String,
+        first: usize,
+        last: usize,
+        positions: usize,
+    },
+}
+
+impl From<OpenError> for ItemError {
+    fn from(error: OpenError) -> Self {
+        Self::Open(error)
+    }
+}
+
+impl fmt::Display for ItemError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(error) => error.fmt(f),
+            Self::Range {
+                arrangement,
+                first,
+                last,
+                positions,
+            } => write!(
+                f,
+                "arrangement \"{arrangement}\" now has {positions} positions counted from 0, so positions {first} to {last} cannot play; the song changed after the setlist was checked"
+            ),
+        }
+    }
+}
+
+/// Opens the song folder `dir` for streaming. One value feeds the player's
+/// and the stream's seam crossfade, so the stream always keeps what the
+/// player's seams read (advisory A3).
+fn stream(dir: &Path, options: &SessionOptions) -> Result<StreamingSong, OpenError> {
+    let stream_config = StreamConfig {
+        seam_crossfade: options.seam_crossfade,
+        gate: options.disk_gate.clone(),
+        ..StreamConfig::default()
+    };
+    let streaming = open_streaming(dir, &stream_config)?;
+    if streaming.capacity.ahead_frames < u64::from(MAX_BUFFER_FRAMES) {
+        return Err(OpenError::RateTooLow {
+            sample_rate: streaming.song.sample_rate(),
+            ahead_frames: streaming.capacity.ahead_frames,
+        });
+    }
+    Ok(streaming)
+}
+
+/// `song` cut to positions `first..=last` of `arrangement`. A song without
+/// that arrangement is left whole, for [`Player::new`] to report; a range
+/// the arrangement does not hold is refused.
+fn excerpt(
+    song: Song,
+    arrangement: &str,
+    (first, last): (usize, usize),
+) -> Result<Song, ItemError> {
     let Some(positions) = song
         .arrangement(arrangement)
         .map(|arrangement| arrangement.sections.len())
     else {
-        return song;
+        return Ok(song);
     };
-    let last = last.min(positions.saturating_sub(1));
-    song.excerpt(arrangement, first.min(last), last)
-        .unwrap_or(song)
+    song.excerpt(arrangement, first, last)
+        .ok_or_else(|| ItemError::Range {
+            arrangement: arrangement.to_owned(),
+            first,
+            last,
+            positions,
+        })
 }
