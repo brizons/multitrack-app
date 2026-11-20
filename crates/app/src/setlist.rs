@@ -1233,6 +1233,31 @@ mod tests {
     }
 
     #[test]
+    fn an_output_error_from_the_first_item_is_its_own_problem_and_the_search_goes_on() {
+        let (mut plans, mut items) = click_plans(2);
+        let mut tries = 0;
+
+        let first = first_buildable(&mut plans, &mut items, |_, _| {
+            tries += 1;
+            match tries {
+                1 => Err(open_error(OpenError::Output(
+                    crate::output::OutputError::NoDevice,
+                ))),
+                _ => Ok(()),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(first.map(|(index, ..)| index), Some(1));
+        assert_eq!(
+            items[0].problems,
+            ["no audio output device is available"],
+            "recorded as item 1's problem"
+        );
+        assert!(plans[0].is_none());
+    }
+
+    #[test]
     fn no_item_that_builds_is_none() {
         let (mut plans, mut items) = click_plans(2);
         let first = first_buildable(&mut plans, &mut items, |_, _| {
