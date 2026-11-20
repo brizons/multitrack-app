@@ -18,8 +18,8 @@ use crate::song::SongInfo;
 pub(crate) struct Item {
     pub(crate) info: SongInfo,
     pub(crate) player: Player,
-    /// The player's own queue: commands sent here before the player is
-    /// handed over apply when it first plays.
+    /// The player's own queue, for settings applied before the player is
+    /// handed over ([`Self::carry`]).
     pub(crate) controller: Controller,
     pub(crate) monitor: DiskMonitor,
 }
@@ -112,14 +112,20 @@ impl Item {
     }
 
     /// Carries the operator's jump timing and fade duration over to this
-    /// item, so a setting does not flip back when the next item starts.
+    /// item, so a setting does not flip back when the next item starts. They
+    /// apply here, on the control thread, before the player is handed over:
+    /// a setting the operator sends later reaches the player afterwards and
+    /// wins, instead of being undone by this one on the player's first
+    /// buffer.
     pub(crate) fn carry(&mut self, timing: JumpTiming, fade: Duration) {
         let frames = (fade.as_secs_f64() * f64::from(self.info.sample_rate)).round() as u64;
-        // A fresh queue has room for both.
+        // The queue holds only what this method sends: there is room.
         let _ = self.controller.send(live::Command::SetJumpTiming(timing));
         let _ = self
             .controller
             .send(live::Command::SetFadeDuration { frames });
+        // Takes both in without rendering anything.
+        self.player.process(&mut []);
     }
 }
 

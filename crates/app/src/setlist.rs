@@ -311,6 +311,7 @@ impl PreparedSetlist {
             pending: None,
             reopen: None,
             play_after_reopen: false,
+            halted: false,
             failed: None,
             blend_from: None,
             finished_seen: 0,
@@ -383,6 +384,10 @@ pub struct SetlistSession {
     /// the device reopens.
     reopen: Option<Pending>,
     play_after_reopen: bool,
+    /// Whether the operator's last transport command for the current item
+    /// was a pause, stop or panic: an item that ends then is not followed
+    /// by a late AutoLink or Crossfade.
+    halted: bool,
     /// The next item, when preparing it failed; tried again once selected.
     failed: Option<usize>,
     /// The item a crossfade under way fades out.
@@ -501,6 +506,11 @@ impl SetlistSession {
             .map_or(self.current, |pending| pending.index);
         let item = match command {
             SetlistCommand::Item(command) => {
+                match command {
+                    Command::Play => self.halted = false,
+                    Command::Pause | Command::Stop | Command::Panic => self.halted = true,
+                    _ => {}
+                }
                 // The device is about to reopen for the item selected: play
                 // starts that one, not the item ramping out.
                 if self.reopen.is_some() && command == Command::Play {
@@ -602,7 +612,10 @@ impl SetlistSession {
     /// The current item played to its end: its transition decides what
     /// comes next. An AutoLink or Crossfade the deck did not hand over had
     /// nothing cued: the next item runs at another rate (Cue next instead),
-    /// or was not buffered in time (it starts as soon as it is).
+    /// or was not buffered in time (it starts as soon as it is, unless the
+    /// operator paused, stopped or panicked since the item last started).
+    /// The deck counts only an end reached while playing, so an operator's
+    /// stop whose ramp runs past the end never gets here.
     fn after_end(&mut self) {
         let Some(next) = self.next_playable(self.current) else {
             return;
@@ -611,7 +624,7 @@ impl SetlistSession {
             Transition::Stay => return,
             Transition::CueNext => false,
             Transition::AutoLink | Transition::Crossfade => {
-                self.rate_of(next) == self.session.sample_rate()
+                !self.halted && self.rate_of(next) == self.session.sample_rate()
             }
         };
         match self.select(next, late) {

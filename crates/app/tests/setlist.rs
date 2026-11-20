@@ -655,3 +655,175 @@ fn a_setlist_with_nothing_playable_does_not_open() {
     ));
     assert!(fake.opened().is_empty());
 }
+
+fn shelf_ab(transition: Transition) -> (Shelf, FakeOutput, SetlistSession) {
+    let shelf = Shelf::new();
+    shelf
+        .song("Songs/A.song", RATE, 0)
+        .song("Songs/B.song", RATE, 10);
+    let fake = FakeOutput::new();
+    let session = shelf.open(
+        vec![
+            song("Songs/A.song", transition),
+            song("Songs/B.song", Transition::CueNext),
+        ],
+        &fake,
+    );
+    (shelf, fake, session)
+}
+
+/// the jump timing and fade duration the operator sets while the next
+/// item is cued must hold when that item starts.
+#[test]
+fn operator_settings_sent_while_the_next_item_is_cued_hold_when_it_starts() {
+    use engine::live::JumpTiming;
+    use std::time::Duration;
+    let (shelf, fake, mut session) = shelf_ab(Transition::AutoLink);
+    let a = shelf.offline("Songs/A.song");
+    wait_next(&mut session);
+    assert!(session.poll().setlist.next_ready, "B is cued");
+    session
+        .send(SetlistCommand::Item(Command::SetJumpTiming(
+            JumpTiming::NextBar,
+        )))
+        .unwrap();
+    session
+        .send(SetlistCommand::Item(Command::SetFadeDuration(
+            Duration::from_millis(500),
+        )))
+        .unwrap();
+    let (_, during) = step(&mut session, &fake);
+    assert_eq!(during.song.jump_timing, JumpTiming::NextBar, "A takes it");
+    let (_, snapshot) = play(&mut session, &fake, a.len() / 2 + 2_000);
+    assert_eq!(snapshot.setlist.current, 1, "B followed on");
+    assert_eq!(snapshot.song.transport, TransportState::Playing);
+    // B's fade: toggle it and count the frames to silence of the tracks.
+    session
+        .send(SetlistCommand::Item(Command::ToggleFade))
+        .unwrap();
+    let mut frames = 0;
+    let mut last = session.poll();
+    while last.song.fade.level > 0.0 && frames < 100_000 {
+        let (out, snapshot) = step(&mut session, &fake);
+        frames += out.len() / 2;
+        last = snapshot;
+    }
+    assert_eq!(
+        (snapshot.song.jump_timing, frames <= 4_000 + BUFFER),
+        (JumpTiming::NextBar, true),
+        "B started with jump timing {:?} and faded in {frames} frames (0.5 s is 4 000); \
+         the snapshot said {:?}",
+        snapshot.song.jump_timing,
+        snapshot.song.fade.duration
+    );
+}
+
+/// a panic in the last half second of an item that AutoLinks must not
+/// start the next item.
+#[test]
+fn a_panic_in_the_last_half_second_does_not_start_the_next_item() {
+    let (shelf, fake, mut session) = shelf_ab(Transition::AutoLink);
+    let a = shelf.offline("Songs/A.song");
+    wait_next(&mut session);
+    let la = a.len() / 2;
+    let (_, _) = play(&mut session, &fake, la - 2_048);
+    session.send(SetlistCommand::Item(Command::Panic)).unwrap();
+    let mut after = Vec::new();
+    let mut last = session.poll();
+    while after.len() < 2 * 16_000 {
+        let (out, snapshot) = step(&mut session, &fake);
+        after.extend_from_slice(&out);
+        last = snapshot;
+    }
+    let loud = after[2 * 6_000..].iter().filter(|s| s.abs() > 0.0).count();
+    assert_eq!(
+        (last.song.transport, loud),
+        (TransportState::Stopped, 0),
+        "after the panic: item {} {:?}, {loud} non-zero samples",
+        last.setlist.current,
+        last.song.transport
+    );
+}
+
+/// A pause whose ramp runs past an AutoLink item's end stops there; the
+/// next item does not start.
+#[test]
+fn a_pause_right_before_the_end_does_not_start_the_next_item() {
+    let (shelf, fake, mut session) = shelf_ab(Transition::AutoLink);
+    let a = shelf.offline("Songs/A.song");
+    wait_next(&mut session);
+    let la = a.len() / 2;
+    play(&mut session, &fake, la - 128);
+    session.send(SetlistCommand::Item(Command::Pause)).unwrap();
+    let mut after = Vec::new();
+    let mut last = session.poll();
+    while after.len() < 2 * 8_000 {
+        let (out, snapshot) = step(&mut session, &fake);
+        after.extend_from_slice(&out);
+        last = snapshot;
+    }
+    let loud = after[2 * 1_000..].iter().filter(|s| s.abs() > 0.0).count();
+    assert_eq!(
+        (last.setlist.current, loud),
+        (0, 0),
+        "after the pause: item {} {:?}, {loud} non-zero samples",
+        last.setlist.current,
+        last.song.transport
+    );
+}
+
+/// The late path: the next item was not buffered when an AutoLink item
+/// ended, and the operator stopped before the session saw the end. The
+/// next item is selected (Cue next) but does not start.
+#[test]
+fn an_operator_stop_before_a_late_autolink_is_seen_keeps_the_next_item_stopped() {
+    let shelf = Shelf::new();
+    shelf
+        .song("Songs/A.song", RATE, 0)
+        .song("Songs/B.song", RATE, 10);
+    let la = shelf.offline("Songs/A.song").len() / 2;
+    let (gate, open) = common::closed_gate();
+    open.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut setlist = Setlist::new("Late");
+    setlist.items = vec![
+        song("Songs/A.song", Transition::AutoLink),
+        song("Songs/B.song", Transition::CueNext),
+    ];
+    let entry = shelf.library.save_setlist(&setlist).unwrap();
+    let fake = FakeOutput::new();
+    let mut session = SetlistSession::open(
+        &shelf.library,
+        &entry.file,
+        Box::new(fake.clone()),
+        SessionOptions {
+            disk_gate: Some(gate),
+            ..options()
+        },
+    )
+    .unwrap();
+    wait_disks(&session);
+    // A is buffered; B's audio is held back from now on.
+    open.store(false, std::sync::atomic::Ordering::SeqCst);
+    let snapshot = session.poll();
+    assert!(!snapshot.setlist.next_ready, "B is not buffered");
+
+    start(&mut session, &fake);
+    // No poll from here on until the operator stops: the session has not
+    // seen A end.
+    let mut frames = BUFFER;
+    while frames < la + 1_000 {
+        wait_disks(&session);
+        fake.render(BUFFER).expect("a stream plays");
+        frames += BUFFER;
+    }
+    session.send(SetlistCommand::Item(Command::Stop)).unwrap();
+    let snapshot = session.poll();
+    assert_eq!(snapshot.setlist.current, 1, "B is selected");
+    open.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut after = Vec::new();
+    for _ in 0..40 {
+        after.extend(step(&mut session, &fake).0);
+    }
+    assert!(after.iter().all(|&s| s == 0.0), "B does not start");
+    assert_eq!(session.poll().song.transport, TransportState::Stopped);
+}
