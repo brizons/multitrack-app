@@ -1,0 +1,16 @@
+[package]
+name = "io-cpal"
+description = "Audio output adapter: implements the app's AudioOutput port on real devices with cpal."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+app.workspace = true
+cpal.workspace = true
+
+[dev-dependencies]
+domain.workspace = true
+hound.workspace = true
+tempfile.workspace = true

@@ -357,6 +357,22 @@ impl Player {
         }
     }
 
+    /// Whether every source can start playing from the playhead now without
+    /// running dry: [`StemSource::is_ready`] for the rest of the current
+    /// position, the question a queued jump asks for its target. Real-time
+    /// safe; a streaming source also takes in the blocks that arrived. The
+    /// control side asks it (through whatever thread owns the player) while
+    /// the transport is stopped or paused, so a start from a cold stream
+    /// does not play a silent first buffer.
+    pub fn playhead_ready(&mut self) -> bool {
+        let at = self.source_frame();
+        let entry = self.entries[self.voice.position];
+        let frames = entry.len - self.voice.offset;
+        self.stems
+            .iter_mut()
+            .all(|stem| stem.source.is_ready(at, frames))
+    }
+
     fn apply(&mut self, command: Command) {
         use Transport::*;
         match command {
