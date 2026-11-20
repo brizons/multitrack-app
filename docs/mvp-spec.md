@@ -1,4 +1,4 @@
-# MVP Spec — Open-Source Live Multitrack Player
+# MVP Spec — OpenVamp
 
 An open-source, offline-first app that plays a band's backing stems live — with click, spoken guide cues, section navigation, and multi-output routing — on every major platform. It targets the same job as MultiTracks.com Playback, which ships only on Apple platforms, while using the user's own audio and an open song format.
 
@@ -269,7 +269,7 @@ Shells: the SwiftUI app covers iPadOS and iPhone; the Compose app covers Android
 - [ ] **Reference hardware** — one low-end device per Tier 1 platform for the performance targets.
 - [ ] **Platform tiers** — confirm the table above.
 - [ ] **Lossy import** — transcode to FLAC (exact, larger) or decode lossy files directly (smaller, harder seeking).
-- [ ] **Project name.**
+- [x] **Project name** — OpenVamp, decided 2026-11-19 ("open" for open source, "vamp" for the section a band repeats); logo files in [brand/](brand/).
 
 ## Next step
 

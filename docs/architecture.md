@@ -1,4 +1,4 @@
-# Architecture Proposal — Open-Source Live Multitrack Player
+# Architecture — OpenVamp
 
 **Decision:** a Rust audio engine built as a hexagonal core, shared by one UI per platform family: SwiftUI for iPhone and iPad, Jetpack Compose for Android, and GPUI (Rust) for Mac, Windows and Linux. The default build uses only permissive or weak-copyleft dependencies, so the app can ship on every store, including the Apple App Store. This document supports the [MVP spec](mvp-spec.md).
 
