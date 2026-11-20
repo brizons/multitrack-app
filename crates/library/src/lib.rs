@@ -10,7 +10,8 @@
 //! never leaving a half-written file or overwriting another setlist.
 //! [`Library::setlist_songs`] reads the songs a setlist names, so
 //! [`domain::Setlist::validate`] can report the ones the library lacks while
-//! the rest of the setlist stays usable.
+//! the rest of the setlist stays usable. [`Library::list_songs`] lists every
+//! song folder in the library, from the manifest and stem headers only.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -33,6 +34,7 @@ use thiserror::Error;
 
 mod setlist_songs;
 mod setlists;
+mod songs;
 mod stream;
 
 pub use setlist_songs::{SetlistSongs, SongUnavailable};
@@ -40,6 +42,7 @@ pub use setlists::{
     Library, MAX_SETLIST_FILE_BYTES, SETLIST_EXTENSION, SETLISTS_FOLDER, SetlistEntry,
     SetlistError, SetlistListing, UnreadableSetlist,
 };
+pub use songs::{ArrangementEntry, PositionEntry, SongEntry, SongListing, UnreadableSong};
 pub use stream::{DiskMonitor, Gate, StreamCapacity, StreamConfig, StreamingSong, open_streaming};
 
 /// Name of the manifest inside a song folder.
