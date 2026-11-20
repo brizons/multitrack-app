@@ -12,8 +12,8 @@ use gpui::{
     PromptButton, PromptLevel, Render, Subscription, Task, Window, prelude::*,
 };
 use io_cpal::CpalOutput;
-use multitrack_desktop::action::{UiAction, command_for};
-use multitrack_desktop::ending::{EndRequest, Ending, end_request, ends};
+use multitrack_desktop::action::{Intent, UiAction, command_for};
+use multitrack_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
 use multitrack_desktop::hold::PanicHold;
 use multitrack_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, is_panic_key};
 use multitrack_desktop::song::{Song, close, replace};
@@ -25,21 +25,6 @@ use crate::ui;
 /// keeps running while the window is hidden, since a waiting play starts
 /// only through `Session::poll` (L16).
 const POLL_EVERY: Duration = Duration::from_millis(33);
-
-/// What the presentational code asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Intent {
-    /// A control of the Perform screen.
-    Ui(UiAction),
-    /// The panic button or key went down.
-    PanicDown,
-    /// The panic button or key went up.
-    PanicUp,
-    /// "Open song…".
-    OpenSong,
-    /// Hides the problems shown above a playing song.
-    DismissProblems,
-}
 
 /// The Perform screen.
 pub struct Perform {
@@ -138,13 +123,19 @@ impl Perform {
     }
 
     fn ask_before_ending(&mut self, ending: Ending, window: &mut Window, cx: &mut Context<Self>) {
-        let question = ending.question();
-        let [end, keep] = question.answers;
+        let question = ending.question(Dialog::HERE);
+        let buttons = question.answers.map(|answer| {
+            if answer.keeps_playing {
+                PromptButton::cancel(answer.label)
+            } else {
+                PromptButton::new(answer.label)
+            }
+        });
         let answer = window.prompt(
             PromptLevel::Warning,
             question.message,
             Some(question.detail),
-            &[PromptButton::new(end), PromptButton::cancel(keep)],
+            &buttons,
             cx,
         );
         self.asking = true;
@@ -152,7 +143,7 @@ impl Perform {
             let answer = answer.await.ok();
             let _ = this.update_in(cx, |screen, window, cx| {
                 screen.asking = false;
-                if ends(answer) {
+                if question.ends(answer) {
                     screen.close_song();
                     match ending {
                         Ending::Quit => cx.quit(),
@@ -222,8 +213,13 @@ impl Perform {
         cx.notify();
     }
 
-    /// Carries out what the presentational code or a key asks for.
+    /// Carries out what the presentational code or a key asks for; while
+    /// the question before ending the show is open, the controls do
+    /// nothing ([`control_acts`]).
     pub fn handle(&mut self, intent: Intent, window: &mut Window, cx: &mut Context<Self>) {
+        if !control_acts(intent, self.asking) {
+            return;
+        }
         let now = Instant::now();
         match intent {
             Intent::Ui(action) => {
@@ -334,6 +330,7 @@ impl Render for Perform {
             .on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(Self::key_up))
             .child(body)
+            .when(self.asking, |root| root.child(ui::shield()))
     }
 }
 

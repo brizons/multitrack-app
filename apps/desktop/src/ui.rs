@@ -12,7 +12,9 @@ use multitrack_desktop::view::{
     FadeButton, Level, NextCard, NowCard, Pad, PerformView, SongMap, StatusView, TransportView,
 };
 
-use crate::screen::{Intent, Perform};
+use multitrack_desktop::action::Intent;
+
+use crate::screen::Perform;
 use crate::theme;
 
 /// The keys, as the status area lists them.
@@ -46,6 +48,13 @@ pub fn root(focus: &FocusHandle, cx: &mut Context<Perform>) -> Div {
         .bg(theme::bg())
         .text_color(theme::text())
         .text_size(px(15.))
+}
+
+/// Covers the whole screen while the question before ending the show is
+/// open: gpui's in-window question (Linux) lets clicks through, and this
+/// keeps them from the controls beneath it.
+pub fn shield() -> impl IntoElement {
+    div().absolute().top_0().left_0().size_full().occlude()
 }
 
 /// The screen with a song open, and the `problems` that did not stop it.

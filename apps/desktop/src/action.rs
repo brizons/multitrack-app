@@ -32,6 +32,21 @@ pub enum UiAction {
     Panic,
 }
 
+/// What the screen's controls and keys ask the screen for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// A control of the Perform screen.
+    Ui(UiAction),
+    /// The panic button or key went down.
+    PanicDown,
+    /// The panic button or key went up.
+    PanicUp,
+    /// "Open song…".
+    OpenSong,
+    /// Hides the problems shown above a playing song.
+    DismissProblems,
+}
+
 /// The command `action` sends, given the session's state; `None` when it
 /// sends nothing, such as a pad past the end of the arrangement.
 pub fn command_for(action: UiAction, snapshot: &Snapshot, song: &SongInfo) -> Option<Command> {
