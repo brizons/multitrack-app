@@ -1,0 +1,5 @@
+[toolchain]
+# The compiler and lints every build and CI run use; upgrade on purpose.
+channel = "1.93.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
