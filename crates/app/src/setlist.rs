@@ -197,9 +197,11 @@ pub enum SetlistOpenError {
         /// Why each item cannot play, in item order.
         problems: Vec<Vec<String>>,
     },
-    /// The buffer size is refused, or the device could not be opened. An
-    /// item that does not build is not this error: it is reported with the
-    /// items that cannot play, and the setlist opens at the next one.
+    /// The buffer size is refused, the device could not be opened, or
+    /// building the first item met an error every item would meet (the
+    /// disk thread could not start, say). An item that does not build for a
+    /// reason of its own is not this error: it is reported with the items
+    /// that cannot play, and the setlist opens at the next one.
     #[error(transparent)]
     Open(#[from] OpenError),
 }
@@ -457,24 +459,14 @@ impl SetlistSession {
             .enumerate()
             .map(|(index, item)| plan_item(library, &songs, &errors, index, item))
             .unzip();
-        // The first item that builds starts the setlist; one that passed the
-        // check but does not build (its song does not stream, say) is
-        // reported like any item that cannot play, and the next one is tried.
-        let (first, item, sample_rate) = loop {
-            let sample_rate = device_rate(&plans);
-            let Some(first) = plans.iter().position(Option::is_some) else {
-                return Err(SetlistOpenError::NothingPlayable {
-                    name: setlist.name,
-                    problems: items.into_iter().map(|item| item.problems).collect(),
-                });
-            };
-            match build(plans[first].as_ref(), sample_rate, &options) {
-                Ok(item) => break (first, item, sample_rate),
-                Err(error) => {
-                    items[first].problems.push(error.to_string());
-                    plans[first] = None;
-                }
-            }
+        let built = first_buildable(&mut plans, &mut items, |plan, rate| {
+            build(plan, rate, &options)
+        })?;
+        let Some((first, item, sample_rate)) = built else {
+            return Err(SetlistOpenError::NothingPlayable {
+                name: setlist.name,
+                problems: items.into_iter().map(|item| item.problems).collect(),
+            });
         };
         let info = SetlistInfo {
             name: setlist.name,
@@ -885,6 +877,49 @@ fn device_rate(plans: &[Option<Plan>]) -> u32 {
         .unwrap_or(CLICK_ONLY_SAMPLE_RATE)
 }
 
+/// The first item that builds (`build` builds it at a device rate), the
+/// item built, and the rate the device opens at. One that passed the check
+/// but does not build for a reason of its own (its song does not stream,
+/// say) is reported like any item that cannot play, and the next one is
+/// tried. An open error every item would meet the same way (the buffer
+/// size, the disk thread) ends the search with that error, as one setlist
+/// problem rather than the same reason for every item. `None` when no item
+/// builds.
+fn first_buildable<T>(
+    plans: &mut [Option<Plan>],
+    items: &mut [ItemInfo],
+    mut build: impl FnMut(Option<&Plan>, u32) -> Result<T, BuildError>,
+) -> Result<Option<(usize, T, u32)>, OpenError> {
+    loop {
+        let sample_rate = device_rate(plans);
+        let Some(first) = plans.iter().position(Option::is_some) else {
+            return Ok(None);
+        };
+        match build(plans[first].as_ref(), sample_rate) {
+            Ok(item) => return Ok(Some((first, item, sample_rate))),
+            Err(BuildError::Item(ItemError::Open(error))) if is_session_wide(&error) => {
+                return Err(error);
+            }
+            Err(error) => {
+                items[first].problems.push(error.to_string());
+                plans[first] = None;
+            }
+        }
+    }
+}
+
+/// Whether `error`, from building one item, would stop every item the same
+/// way: it comes from the session's settings or the system, not the item.
+fn is_session_wide(error: &OpenError) -> bool {
+    matches!(
+        error,
+        OpenError::BufferSize { .. }
+            | OpenError::Output(_)
+            | OpenError::Load(library::LoadError::DiskThread { .. })
+            | OpenError::Live(engine::live::LiveError::ZeroBufferSize)
+    )
+}
+
 /// What `item` (at `index`) is, whether it can play, and how to build it.
 fn plan_item(
     library: &Library,
@@ -1010,5 +1045,100 @@ fn problem(index: usize, error: SetlistCommandError) -> SetlistProblem {
     match error {
         SetlistCommandError::Prepare { item, error } => SetlistProblem::Prepare { item, error },
         error => SetlistProblem::Transition { item: index, error },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use domain::TimeSignature;
+    use engine::live::LiveError;
+
+    use super::*;
+
+    fn click_plans(count: usize) -> (Vec<Option<Plan>>, Vec<ItemInfo>) {
+        let click = ClickItem::new(
+            120.0,
+            TimeSignature {
+                numerator: 4,
+                denominator: 4,
+            },
+        );
+        let plans = (0..count).map(|_| Some(Plan::Click(click))).collect();
+        let items = (0..count)
+            .map(|_| ItemInfo {
+                item: SetlistItem::Click(click),
+                sample_rate: None,
+                problems: Vec::new(),
+            })
+            .collect();
+        (plans, items)
+    }
+
+    fn open_error(error: OpenError) -> BuildError {
+        BuildError::Item(ItemError::Open(error))
+    }
+
+    #[test]
+    fn an_item_that_does_not_build_for_its_own_reason_is_skipped_and_reported() {
+        let (mut plans, mut items) = click_plans(3);
+        let mut tries = 0;
+
+        let first = first_buildable(&mut plans, &mut items, |_, _| {
+            tries += 1;
+            match tries {
+                1 => Err(open_error(OpenError::RateTooLow {
+                    sample_rate: 1_000,
+                    ahead_frames: 1_000,
+                })),
+                _ => Ok(tries),
+            }
+        })
+        .unwrap();
+
+        let (index, built, _) = first.expect("item 2 builds");
+        assert_eq!((index, built), (1, 2));
+        assert_eq!(items[0].problems.len(), 1, "{:?}", items[0].problems);
+        assert!(items[0].problems[0].contains("too low to stream"));
+        assert!(plans[0].is_none());
+        assert!(items[1].problems.is_empty() && items[2].problems.is_empty());
+    }
+
+    #[test]
+    fn an_open_error_every_item_would_meet_ends_the_search_with_it() {
+        for error in [
+            OpenError::BufferSize { frames: 3 },
+            OpenError::Live(LiveError::ZeroBufferSize),
+            OpenError::Load(library::LoadError::DiskThread {
+                source: std::io::Error::other("no threads left"),
+            }),
+        ] {
+            let (mut plans, mut items) = click_plans(3);
+            let message = error.to_string();
+            let mut error = Some(error);
+            let mut tries = 0;
+
+            let result = first_buildable(&mut plans, &mut items, |_, _| {
+                tries += 1;
+                match error.take() {
+                    Some(error) => Err::<(), _>(open_error(error)),
+                    None => Ok(()),
+                }
+            });
+
+            assert_eq!(result.err().map(|e| e.to_string()), Some(message));
+            assert_eq!(tries, 1, "no other item is tried");
+            assert!(items.iter().all(|item| item.problems.is_empty()));
+        }
+    }
+
+    #[test]
+    fn no_item_that_builds_is_none() {
+        let (mut plans, mut items) = click_plans(2);
+        let first = first_buildable(&mut plans, &mut items, |_, _| {
+            Err::<(), _>(BuildError::Click)
+        })
+        .unwrap();
+        assert!(first.is_none());
+        assert!(items.iter().all(|item| item.problems.len() == 1));
     }
 }
