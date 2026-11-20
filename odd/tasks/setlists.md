@@ -40,7 +40,7 @@ Out of scope: mixer, routing matrix, MIDI, guide-voice playback, pads, key and t
 
 | ID | Specs | Route | Status | Commit |
 |----|-------|-------|--------|--------|
-| T1 | S1 | delegated (context backstop) | in progress | — |
+| T1 | S1 | delegated (context backstop) | built (L2), native review pending | 594bacd, 6c47f66 |
 | T2 | S2 | delegated (context backstop) | pending | — |
 | T3 | S3 | delegated (context backstop) | pending | — |
 | T4 | S4 | delegated (context backstop) | pending | — |
@@ -50,3 +50,4 @@ Route evidence: the parent session is long and past the ~150k-token backstop. Or
 ## Log
 
 - **L1** (2026-11-19, user, verbatim): "mergea los PRs en orden y arranca con lo que sigue". The parent merged PRs #1–#10 into `main` in order (merge commits, `main` at fe8c742; CI green on Linux, macOS and Windows before the merge) and started this feature, the next one in docs/architecture.md "Next step" and the MVP spec (F5).
+- **L2** (2026-11-19): T1 delivered by one delegated writer as 594bacd (`refactor(domain)`: stem-path, BPM and time-signature checks shared as `pub(crate)` helpers, pinned by a regression test of the package's exact errors) and 6c47f66 (`feat(domain)`: `Setlist`, `SetlistItem::{Song, Click}`, `SongItem`, `ClickItem`, `TimeSignature`, `Transition`, `PositionBound`, `SongOutline`/`ArrangementOutline` and the `SongLookup` trait, `SetlistFileError`, `SetlistValidationError`, `SetlistEditError`; JSON format v1 with `formatVersion`, camelCase fields, `type: "song" | "click"`, transitions `cueNext`/`stay`/`autoLink`/`crossfade`; editing: rename, duplicate, insert, remove, move, set arrangement, set start/end, set fade-out, set transition, each with an out-of-range error). 24 setlist tests (RED on `todo!()` stubs, then GREEN); 311 tests pass, 5 ignored; fmt, clippy and docs clean; the parent re-ran the suite (311 passed). Writer decisions: start and end points are **arrangement positions** (section indexes, both inclusive), because `compile` and the live player only enter a position at its first sample; a click tile uses a new position-free `TimeSignature` (same validation as `TimeSignaturePoint`); a blank setlist name is rejected (S2 needs names for files); `CueNext` is the default transition; changing an item's arrangement clears its start and end. Constants `SONG_FADE_OUT_SECONDS` and `CROSSFADE_SECONDS` = 5.
