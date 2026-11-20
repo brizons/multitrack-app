@@ -11,8 +11,10 @@ use domain::{
 };
 use library::{
     Library, MAX_SETLIST_FILE_BYTES, SETLISTS_FOLDER, SetlistEntry, SetlistError, SetlistListing,
-    UnreadableSetlist,
 };
+// Only the unix-only symlink and FIFO tests list unreadable setlists.
+#[cfg(unix)]
+use library::UnreadableSetlist;
 use tempfile::TempDir;
 
 fn new_library() -> (TempDir, Library) {
