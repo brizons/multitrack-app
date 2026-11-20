@@ -502,3 +502,42 @@ fn the_operators_settings_reach_the_cued_item_and_nothing_else_does() {
         "B took the 1 000-frame fade"
     );
 }
+
+#[test]
+fn selecting_during_a_crossfade_ramps_both_items_out_at_the_levels_they_had() {
+    let (a, b) = (steady(PEAK, 0.0), steady(PEAK, 0.0));
+    let c = song_b();
+    let expected_c = offline(&c.0, &c.1);
+    let (mut deck, mut control) = deck_of(&a, 64);
+    control
+        .cue(
+            player(&b.0, b.1.clone(), 64),
+            2,
+            Handoff::Crossfade { frames: BLEND },
+        )
+        .unwrap();
+    control.send(Command::Play).unwrap();
+    run(&mut deck, 64, (a.0.length() - BLEND / 2) as usize);
+    assert!(deck.status().blend.is_some(), "half way through the blend");
+
+    control.select(player(&c.0, c.1.clone(), 64), 3).unwrap();
+    let ramp = run(&mut deck, 64, 1_000);
+    // The two levels still sum to the full one; the stop ramp's first step
+    // takes 1/256 off it.
+    let first = f64::from(left(&ramp, 0));
+    let step = f64::from(PEAK) * (1.0 - 1.0 / DECLICK_FRAMES as f64);
+    assert!((first - step).abs() < 1e-5, "no jump in level: {first}");
+    assert!(
+        (0..1_000).all(|frame| left(&ramp, frame).abs() <= PEAK * (1.0 + 1e-6)),
+        "the two ramps never add up"
+    );
+    let last = (0..1_000).rev().find(|&f| left(&ramp, f) != 0.0).unwrap();
+    assert!(last < DECLICK_FRAMES, "both ramp out within the declick");
+    let status = deck.status();
+    assert_eq!((status.item, status.blend, status.leaving), (3, None, 0));
+    assert!(control.returned().is_some() && control.returned().is_some());
+
+    control.send(Command::Play).unwrap();
+    let played = run(&mut deck, 64, expected_c.len() / 2);
+    assert_eq!(bits(&played), bits(&expected_c), "C plays from its start");
+}
