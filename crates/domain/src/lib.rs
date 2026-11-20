@@ -35,4 +35,4 @@ pub use setlist::{
     SONG_FADE_OUT_SECONDS, Setlist, SetlistEditError, SetlistFileError, SetlistItem,
     SetlistValidationError, SongItem, SongLookup, SongOutline, TimeSignature, Transition,
 };
-pub use song::{Section, Song};
+pub use song::{CLICK_SECTION_ID, Section, Song};
