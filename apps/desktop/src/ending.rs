@@ -52,7 +52,8 @@ pub struct Question {
     pub detail: &'static str,
     /// The answers in the order the dialog lists them: [`END_ANSWER`]
     /// first, so it is the one Return picks on the Mac, and
-    /// [`KEEP_ANSWER`] second, as the dialog's cancel answer (Escape).
+    /// [`KEEP_ANSWER`] second, as the dialog's cancel answer (Escape on
+    /// the Mac and Windows).
     pub answers: [&'static str; 2],
 }
 

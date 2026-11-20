@@ -32,7 +32,7 @@ The session is polled about 30 times a second on a timer that keeps running whil
 
 **Open song…** opens the new folder while the current song keeps playing; only once it opened does the current song stop and close. A folder that does not open, or a folder picker that fails, leaves the current song playing and shows why under the header until dismissed.
 
-Quitting or closing the window while a song plays or waits to start (`Loading…`) asks first: **Stop and quit** (Return on the Mac) or **Keep playing** (Escape). Stop, the transport control, stays immediate. With nothing playing, both quit at once. The app sets no menus of its own. Quitting from the Dock, or when the system logs out, cannot be asked about (gpui 0.2.2 cannot cancel it), so the song just stops with its ramp.
+Quitting or closing the window while a song plays or waits to start (`Loading…`) asks first: **Stop and quit** or **Keep playing**. On the Mac, Return picks Stop and quit and Escape keeps playing; on Windows, Escape keeps playing; on Linux, gpui draws the question in the window and it is answered with a click. Stop, the transport control, stays immediate. With nothing playing, both quit at once. The app sets no menus of its own. Quitting from the Dock, or when the system logs out, cannot be asked about (gpui 0.2.2 cannot cancel it), so the song just stops with its ramp.
 
 Closing a song (opening another one, closing the window, quitting) stops it with the usual short ramp before the device closes. If the player refuses Stop because its command queue is full, Stop is sent again every 5 ms for up to 500 ms. A refusal, or a ramp that has not ended by then, is reported on stderr, and on screen when another song replaced it.
 
