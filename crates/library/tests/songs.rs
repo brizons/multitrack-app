@@ -336,6 +336,16 @@ fn a_fifo_manifest_is_refused_without_blocking() {
     assert_eq!(unreadable_paths(&listing), ["Pipe.song"]);
     let message = listing.unreadable[0].error.to_string();
     assert!(message.contains("not a regular file"), "{message}");
+    assert!(
+        matches!(
+            listing.unreadable[0].error,
+            SongUnavailable::Load {
+                source: LoadError::ManifestNotAFile { .. },
+                ..
+            }
+        ),
+        "{message}"
+    );
 }
 
 #[cfg(unix)]

@@ -137,6 +137,11 @@ fn an_order_file_that_cannot_be_used_falls_back_to_name_order_and_says_why() {
             "is not a valid setlist order",
         ),
         (r#"{"setlists": []}"#, "is not a valid setlist order"),
+        // Versions start at 1: 0 is malformed, not newer.
+        (
+            r#"{"formatVersion": 0, "setlists": []}"#,
+            "is not a valid setlist order",
+        ),
         (
             r#"{"formatVersion": 1, "setlists": []} trailing"#,
             "is not a valid setlist order",
@@ -448,4 +453,17 @@ fn a_move_far_past_the_end_is_refused_without_overflow() {
             .to_string()
             .starts_with("cannot move a setlist to place ")
     );
+}
+
+#[test]
+fn a_move_replaces_an_order_file_of_version_0() {
+    let (dir, library) = library_with(&["A", "B"]);
+    write_order(
+        &dir,
+        r#"{"formatVersion": 0, "setlists": ["B.setlist.json"]}"#,
+    );
+
+    library.move_setlist("B.setlist.json", 0).unwrap();
+
+    assert_eq!(listed(&library), ["B", "A"]);
 }

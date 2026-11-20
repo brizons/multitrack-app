@@ -2,15 +2,16 @@
 //! without decoding any audio, so a shell can offer them for a setlist.
 
 use std::cmp::Ordering;
+use std::ffi::OsString;
 use std::fs;
-use std::io;
-use std::path::Path;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 use domain::{SectionType, Song};
 
 use crate::{
     Library, LoadError, MANIFEST_FILE, OpenFileError, SETLISTS_FOLDER, SetlistError,
-    SongUnavailable, open_package, open_regular_file, resolve_inside,
+    SongUnavailable, open_package_json, open_regular_file, resolve_inside,
 };
 
 /// A song folder that [`Library::list_songs`] could read, with what its
@@ -133,9 +134,53 @@ impl Library {
         prefix: &str,
         listing: &mut SongListing,
     ) -> io::Result<()> {
-        for found in fs::read_dir(folder)? {
-            let entry = found?;
-            let Ok(name) = entry.file_name().into_string() else {
+        let entries = fs::read_dir(folder)?.map(|found| {
+            found.map(|entry| Found {
+                name: entry.file_name(),
+                path: entry.path(),
+                is_dir: entry.file_type().is_ok_and(|kind| kind.is_dir()),
+            })
+        });
+        self.list_entries(root, folder, prefix, entries, listing);
+        Ok(())
+    }
+
+    /// Lists the songs among `entries`, the entries of `folder` at `prefix`
+    /// (see [`Self::list_folder`]). An entry that cannot be read is listed
+    /// as unreadable under the folder's path, and the others are still
+    /// listed; after [`MAX_ENTRY_ERRORS`] of them the folder is left.
+    fn list_entries(
+        &self,
+        root: &Path,
+        folder: &Path,
+        prefix: &str,
+        entries: impl Iterator<Item = io::Result<Found>>,
+        listing: &mut SongListing,
+    ) {
+        let mut errors = 0;
+        for found in entries {
+            let entry = match found {
+                Ok(entry) => entry,
+                Err(source) => {
+                    let song = if prefix.is_empty() { "." } else { prefix }.to_owned();
+                    listing.unreadable.push(UnreadableSong {
+                        song: song.clone(),
+                        error: SongUnavailable::Load {
+                            song,
+                            source: LoadError::SongFolder {
+                                path: folder.to_owned(),
+                                source,
+                            },
+                        },
+                    });
+                    errors += 1;
+                    if errors == MAX_ENTRY_ERRORS {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            let Ok(name) = entry.name.into_string() else {
                 continue;
             };
             if name.starts_with('.') || (prefix.is_empty() && name == SETLISTS_FOLDER) {
@@ -146,13 +191,13 @@ impl Library {
             } else {
                 format!("{prefix}/{name}")
             };
-            let path = entry.path();
+            let path = entry.path;
             if fs::symlink_metadata(path.join(MANIFEST_FILE)).is_ok() {
                 match self.read_song(root, &song) {
                     Ok(entry) => listing.songs.push(entry),
                     Err(error) => listing.unreadable.push(UnreadableSong { song, error }),
                 }
-            } else if entry.file_type().is_ok_and(|kind| kind.is_dir())
+            } else if entry.is_dir
                 && let Err(source) = self.list_folder(root, &path, &song, listing)
             {
                 listing.unreadable.push(UnreadableSong {
@@ -164,7 +209,6 @@ impl Library {
                 });
             }
         }
-        Ok(())
     }
 
     /// Reads the song folder at `song` inside the library folder `root`
@@ -191,19 +235,44 @@ impl Library {
                 }));
             }
         };
-        if let Err(error) = open_regular_file(&manifest) {
-            let source = match error {
-                OpenFileError::Io(error) => error,
-                other => io::Error::new(io::ErrorKind::InvalidInput, other.to_string()),
-            };
-            return Err(load(LoadError::ReadManifest {
-                path: manifest,
+        // The file checked is the file read: parsed from the handle opened,
+        // never through the path again.
+        let (mut file, _) = open_regular_file(&manifest).map_err(|error| {
+            load(match error {
+                OpenFileError::Io(source) => LoadError::ReadManifest {
+                    path: manifest.clone(),
+                    source,
+                },
+                OpenFileError::NotRegular => LoadError::ManifestNotAFile {
+                    path: manifest.clone(),
+                },
+                OpenFileError::Changed => LoadError::ManifestChanged {
+                    path: manifest.clone(),
+                },
+            })
+        })?;
+        let mut json = String::new();
+        file.read_to_string(&mut json).map_err(|source| {
+            load(LoadError::ReadManifest {
+                path: manifest.clone(),
                 source,
-            }));
-        }
-        let (validated, _stems) = open_package(&folder).map_err(load)?;
+            })
+        })?;
+        let (validated, _stems) = open_package_json(&folder, &json).map_err(load)?;
         Ok(entry(song, &validated.song))
     }
+}
+
+/// Entry errors after which [`Library::list_entries`] leaves a folder, so a
+/// folder whose reads keep failing cannot keep the listing going forever.
+const MAX_ENTRY_ERRORS: usize = 100;
+
+/// One entry of a folder being listed.
+struct Found {
+    name: OsString,
+    path: PathBuf,
+    /// Whether it is a folder itself, not a symlink to one.
+    is_dir: bool,
 }
 
 /// What the listing shows of `song`, found at `path`.
@@ -273,4 +342,59 @@ fn by_title(a: &SongEntry, b: &SongEntry) -> Ordering {
         .cmp(&b.title.to_lowercase())
         .then_with(|| a.title.cmp(&b.title))
         .then_with(|| a.song.cmp(&b.song))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_entry_that_cannot_be_read_is_listed_apart_and_the_walk_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::new(dir.path());
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let entries = [
+            Err(io::Error::other("the disk said no")),
+            // A folder that is gone by the time it is read: listed apart
+            // too, which shows the walk went on past the failed entry.
+            Ok(Found {
+                name: "Gone".into(),
+                path: root.join("Gone"),
+                is_dir: true,
+            }),
+        ];
+        let mut listing = SongListing::default();
+
+        library.list_entries(&root, &root, "", entries.into_iter(), &mut listing);
+
+        let unreadable: Vec<&str> = listing.unreadable.iter().map(|u| u.song.as_str()).collect();
+        assert_eq!(unreadable, [".", "Gone"]);
+        assert!(
+            listing.unreadable[0]
+                .error
+                .to_string()
+                .ends_with("the disk said no"),
+            "{}",
+            listing.unreadable[0].error
+        );
+    }
+
+    #[test]
+    fn a_folder_whose_entries_keep_failing_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::new(dir.path());
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let mut listing = SongListing::default();
+
+        library.list_entries(
+            &root,
+            &root,
+            "Hymns",
+            std::iter::repeat_with(|| Err(io::Error::other("again"))),
+            &mut listing,
+        );
+
+        assert_eq!(listing.unreadable.len(), MAX_ENTRY_ERRORS);
+        assert!(listing.unreadable.iter().all(|u| u.song == "Hymns"));
+    }
 }

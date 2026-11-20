@@ -121,6 +121,12 @@ fn parse(text: &str) -> Result<Vec<String>, Problem> {
         .as_u64()
         .and_then(|version| u32::try_from(version).ok())
         .ok_or_else(|| Problem::Format(format!("formatVersion {version} is not a whole number")))?;
+    // Versions start at 1, so 0 is malformed rather than newer.
+    if version == 0 {
+        return Err(format(
+            "formatVersion 0 is not a version; versions start at 1",
+        ));
+    }
     if version != SETLIST_ORDER_FORMAT_VERSION {
         return Err(Problem::Version(version));
     }

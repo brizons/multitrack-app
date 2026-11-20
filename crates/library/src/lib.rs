@@ -77,6 +77,19 @@ pub enum LoadError {
     /// `song.json` is not a valid v1 manifest.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    /// `song.json` is a folder, FIFO, device or anything but a regular
+    /// file; it was not opened, so a FIFO cannot block the reader.
+    #[error("{} is not a regular file", path.display())]
+    ManifestNotAFile {
+        /// Path of the manifest.
+        path: PathBuf,
+    },
+    /// `song.json` was replaced by another file while it was being opened.
+    #[error("{} changed while it was being opened", path.display())]
+    ManifestChanged {
+        /// Path of the manifest.
+        path: PathBuf,
+    },
     /// The song folder could not be resolved.
     #[error("cannot open song folder {}: {source}", path.display())]
     SongFolder {
@@ -219,7 +232,15 @@ fn open_package(dir: &Path) -> Result<(Validated, Vec<(Stem, OpenedStem)>), Load
         path: manifest_path,
         source,
     })?;
-    let package = SongPackage::from_json(&json)?;
+    open_package_json(dir, &json)
+}
+
+/// [`open_package`] for the manifest text `json` already read from `dir`.
+fn open_package_json(
+    dir: &Path,
+    json: &str,
+) -> Result<(Validated, Vec<(Stem, OpenedStem)>), LoadError> {
+    let package = SongPackage::from_json(json)?;
     let folder = fs::canonicalize(dir).map_err(|source| LoadError::SongFolder {
         path: dir.to_owned(),
         source,
