@@ -165,11 +165,22 @@ fn the_perform_screen_follows_a_real_session() {
     shell.step();
     assert_eq!(shell.view().map.jump, None);
 
-    // Queued again, it executes at the end of the intro.
+    // Queued again while the intro still plays, it executes at the end of
+    // the intro: one bar, so within two bars of callbacks.
+    assert_eq!(shell.snapshot.position, 0, "the intro is still playing");
     shell.act(UiAction::QueueSection(2));
-    while shell.snapshot.position == 0 {
+    let callbacks = 2 * BAR as usize / FRAMES;
+    for _ in 0..callbacks {
+        if shell.snapshot.position != 0 {
+            break;
+        }
         shell.step();
     }
+    assert_ne!(
+        shell.snapshot.position, 0,
+        "the jump did not execute within {callbacks} callbacks: {:?}",
+        shell.snapshot
+    );
     let view = shell.view();
     assert!(view.pads[2].is_now && view.pads[3].is_next);
     assert_eq!(view.now.name, "Chorus");
