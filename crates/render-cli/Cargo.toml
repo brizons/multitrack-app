@@ -1,0 +1,17 @@
+[package]
+name = "render-cli"
+description = "Headless renderer for tests and CI: renders a song package to a WAV file."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+domain.workspace = true
+engine.workspace = true
+library.workspace = true
+
+[dev-dependencies]
+hound.workspace = true
+tempfile.workspace = true
