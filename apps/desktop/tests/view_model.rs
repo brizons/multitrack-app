@@ -730,6 +730,44 @@ fn held_keys_leave_the_panic_key_and_shortcuts_to_their_own_rules() {
 }
 
 #[test]
+fn a_plain_key_released_while_command_is_held_still_acts_next_time() {
+    let plain = |key| KeyPress {
+        key,
+        mods: Mods::default(),
+    };
+    let command = Mods {
+        platform: true,
+        ..Mods::default()
+    };
+    let play = Some(KeyAction::Ui(UiAction::TogglePlay));
+    let mut keys = HeldKeys::new();
+    assert_eq!(keys.press(&plain("space"), false), play);
+    // Command goes down while Space is held; Space's key-up while Command
+    // is held never arrives (macOS drops it); then Command goes up.
+    keys.modifiers_changed(command);
+    keys.modifiers_changed(Mods::default());
+    assert_eq!(
+        keys.press(&plain("space"), false),
+        play,
+        "the next Space acts"
+    );
+
+    // Other modifiers keep the keys that are down: an X11 repeat of a held
+    // key with Shift or Ctrl going down is still ignored.
+    assert_eq!(
+        keys.press(&plain("f"), false),
+        Some(KeyAction::Ui(UiAction::ToggleFade))
+    );
+    keys.modifiers_changed(Mods {
+        control: true,
+        alt: true,
+        ..Mods::default()
+    });
+    keys.modifiers_changed(Mods::default());
+    assert_eq!(keys.press(&plain("f"), false), None, "F is still down");
+}
+
+#[test]
 fn section_families_and_short_labels_come_from_the_label() {
     let expected = [
         ("Count-off", SectionKind::Neutral, "CO"),

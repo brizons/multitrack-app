@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use app::SessionOptions;
 use gpui::{
-    App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, PathPromptOptions,
-    PromptButton, PromptLevel, Render, Subscription, Task, Window, prelude::*,
+    App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
+    ModifiersChangedEvent, PathPromptOptions, PromptButton, PromptLevel, Render, Subscription,
+    Task, Window, prelude::*,
 };
 use io_cpal::CpalOutput;
 use multitrack_desktop::action::{Intent, UiAction, command_for};
@@ -274,15 +275,9 @@ impl Perform {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let modifiers = &event.keystroke.modifiers;
         let press = KeyPress {
             key: &event.keystroke.key,
-            mods: Mods {
-                control: modifiers.control,
-                alt: modifiers.alt,
-                platform: modifiers.platform,
-                function: modifiers.function,
-            },
+            mods: mods(&event.keystroke.modifiers),
         };
         // A held key repeats; only its first press acts, so a held space
         // does not toggle play over and over.
@@ -300,11 +295,30 @@ impl Perform {
         self.handle(intent, window, cx);
     }
 
+    fn modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.keys.modifiers_changed(mods(&event.modifiers));
+    }
+
     fn key_up(&mut self, event: &KeyUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.keys.release(&event.keystroke.key);
         if is_panic_key(&event.keystroke.key) {
             self.handle(Intent::PanicUp, window, cx);
         }
+    }
+}
+
+/// The modifiers the keyboard rules read; Shift is left out.
+fn mods(modifiers: &Modifiers) -> Mods {
+    Mods {
+        control: modifiers.control,
+        alt: modifiers.alt,
+        platform: modifiers.platform,
+        function: modifiers.function,
     }
 }
 
@@ -329,6 +343,7 @@ impl Render for Perform {
         ui::root(&self.focus, cx)
             .on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(Self::key_up))
+            .on_modifiers_changed(cx.listener(Self::modifiers_changed))
             .child(body)
             .when(self.asking, |root| root.child(ui::shield()))
     }

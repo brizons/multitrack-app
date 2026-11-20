@@ -122,7 +122,8 @@ impl HeldKeys {
     /// window never saw cannot swallow their next press: the panic key
     /// (every press reaches [`crate::hold::PanicHold`], which ignores a
     /// press while held), and keys held with a modifier (macOS drops the
-    /// release of a key let go while Command is down).
+    /// release of a key let go while Command is down; see also
+    /// [`Self::modifiers_changed`]).
     pub fn press(&mut self, press: &KeyPress<'_>, repeat: bool) -> Option<KeyAction> {
         if repeat {
             return None;
@@ -142,6 +143,18 @@ impl HeldKeys {
     /// `key` went up.
     pub fn release(&mut self, key: &str) {
         self.down.retain(|down| !down.eq_ignore_ascii_case(key));
+    }
+
+    /// The modifiers held changed to `mods`. When Command (the platform
+    /// key) is down, every key counts as up: macOS never delivers the
+    /// release of a key let go while Command is held, so a key that went
+    /// down before Command would otherwise swallow its next press. Other
+    /// platforms have no such loss; there it only means that a repeat of
+    /// a key held through a Super or Windows key press acts once more.
+    pub fn modifiers_changed(&mut self, mods: Mods) {
+        if mods.platform {
+            self.forget_all();
+        }
     }
 
     /// Forgets every key: the window lost focus, so their releases may
