@@ -9,7 +9,7 @@
 
 <p align="center">Open-source live multitrack playback for worship bands.</p>
 
-OpenVamp plays a band's own backing stems live, with a click, spoken guide cues, section jumps, loops and fades. It targets Mac, Windows, Linux, iPhone, iPad and Android, and it uses an open song format instead of a content store.
+OpenVamp is built to play a band's own backing stems live, with a click, spoken guide cues, section jumps, loops and fades. It targets Mac, Windows, Linux, iPhone, iPad and Android, and it uses an open song format instead of a content store.
 
 ## Status
 
