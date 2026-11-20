@@ -9,7 +9,7 @@ use domain::{
     ClickItem, DEFAULT_ARRANGEMENT_ID, MAX_BPM, MIN_BPM, SetlistItem, SetlistValidationError,
     SongItem, TimeSignature, Transition,
 };
-use library::{ArrangementEntry, Library, SetlistError, SongEntry};
+use library::{ArrangementEntry, Library, SetlistError, SongEntry, TrashFn};
 
 use crate::catalog::Catalog;
 use crate::editor::{Edit, SetlistEditor};
@@ -44,6 +44,10 @@ pub enum LibraryAction {
     MoveSetlistUp(usize),
     /// Moves this setlist of the list one place down.
     MoveSetlistDown(usize),
+    /// Removes the setlist in the editor: the first press arms it, the
+    /// second moves its file to the system trash; any other action
+    /// disarms it.
+    RemoveSetlist,
     /// Shows this item's details in the editor (again: hides them).
     SelectRow(usize),
     /// Adds the song of this row of the song list at the end.
@@ -111,6 +115,12 @@ pub struct LibraryPage {
     warning: Option<String>,
     /// The editor's file moves not yet taken ([`Self::take_moves`]).
     moves: Vec<(String, String)>,
+    /// The setlist file the remove control is armed for: the next press
+    /// removes it.
+    armed: Option<String>,
+    /// The setlist file of this library open on Perform, which cannot be
+    /// removed.
+    playing: Option<String>,
 }
 
 impl LibraryPage {
@@ -120,12 +130,28 @@ impl LibraryPage {
     /// The folder is kept canonical ([`Self::root`]), so it compares with
     /// the library of a setlist on Perform as a plain path.
     pub fn open(root: &Path, file: Option<&str>) -> Result<Self, SetlistError> {
+        Self::open_with_trash(root, file, library::move_to_trash)
+    }
+
+    /// The setlist files the editor moved since the last call, as (from,
+    /// to): a rename, or a file named by hand moved on its first change.
+    pub fn take_moves(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.moves)
+    }
+
+    /// [`Self::open`], removing setlists with `trash` instead of the system
+    /// trash ([`Library::with_trash`]).
+    pub fn open_with_trash(
+        root: &Path,
+        file: Option<&str>,
+        trash: TrashFn,
+    ) -> Result<Self, SetlistError> {
         let root = &std::fs::canonicalize(root).map_err(|source| SetlistError::Folder {
             path: root.to_owned(),
             source,
         })?;
-        let shelf = Shelf::open(root)?;
-        let (catalog, unreadable_songs) = match Library::new(root).list_songs() {
+        let library = Library::new(root).with_trash(trash);
+        let (catalog, unreadable_songs) = match library.list_songs() {
             Ok(listing) => (
                 Catalog::from_listing(&listing),
                 listing
@@ -136,6 +162,7 @@ impl LibraryPage {
             ),
             Err(error) => (Catalog::default(), vec![error.to_string()]),
         };
+        let shelf = Shelf::open(library)?;
         let mut page = Self {
             root: root.to_owned(),
             shelf,
@@ -149,6 +176,8 @@ impl LibraryPage {
             notice: None,
             warning: None,
             moves: Vec::new(),
+            armed: None,
+            playing: None,
         };
         let file = file
             .map(str::to_owned)
@@ -159,10 +188,10 @@ impl LibraryPage {
         Ok(page)
     }
 
-    /// The setlist files the editor moved since the last call, as (from,
-    /// to): a rename, or a file named by hand moved on its first change.
-    pub fn take_moves(&mut self) -> Vec<(String, String)> {
-        std::mem::take(&mut self.moves)
+    /// Tells the page which setlist file of its library is open on the
+    /// Perform screen, which cannot be removed.
+    pub fn set_playing(&mut self, file: Option<&str>) {
+        self.playing = file.map(str::to_owned);
     }
 
     /// The library folder.
@@ -199,6 +228,10 @@ impl LibraryPage {
 
     fn try_act(&mut self, action: LibraryAction) -> Result<(), String> {
         use LibraryAction as A;
+        // Removing takes two presses in a row: anything else disarms it.
+        if action != A::RemoveSetlist {
+            self.armed = None;
+        }
         match action {
             A::SelectSetlist(row) => {
                 if let Some(file) = self.shelf.setlists.get(row).map(|s| s.entry.file.clone()) {
@@ -221,6 +254,7 @@ impl LibraryPage {
                 .move_setlist(index, index + 1)
                 .map_err(|e| e.to_string())?,
             A::MoveSetlistUp(_) | A::MoveSetlistDown(_) => {}
+            A::RemoveSetlist => self.remove_selected()?,
             A::DuplicateSetlist => {
                 if let Some(file) = self.selected_file().map(str::to_owned) {
                     let (entry, warning) =
@@ -320,6 +354,7 @@ impl LibraryPage {
 
     /// A key typed into the field that has the focus.
     pub fn type_key(&mut self, key: LineKey<'_>) {
+        self.armed = None;
         match self.typing {
             Some(Field::Search) => match self.search.key(key) {
                 LineOutcome::Editing => {}
@@ -343,6 +378,7 @@ impl LibraryPage {
 
     /// Text pasted into the field that has the focus.
     pub fn paste(&mut self, text: &str) {
+        self.armed = None;
         match self.typing {
             Some(Field::Search) => self.search.paste(text),
             Some(Field::Rename) => self.rename.paste(text),
@@ -361,13 +397,53 @@ impl LibraryPage {
         if self.typing == Some(Field::Rename) {
             self.typing = None;
         }
-        match SetlistEditor::open(Library::new(&self.root), file) {
+        match SetlistEditor::open(self.shelf.library().clone(), file) {
             Ok(editor) => self.editor = Some(editor),
             Err(error) => {
                 self.editor = None;
                 self.notice = Some(error.to_string());
             }
         }
+    }
+
+    /// The remove control: the first press arms it for the setlist in the
+    /// editor, the second moves that setlist's file to the trash and puts
+    /// the next setlist (or the one before, or none) in the editor. The
+    /// setlist open on Perform is refused.
+    fn remove_selected(&mut self) -> Result<(), String> {
+        let Some(editor) = &self.editor else {
+            return Ok(());
+        };
+        let (file, name) = (editor.file().to_owned(), editor.setlist().name.clone());
+        if self.playing.as_deref() == Some(file.as_str()) {
+            self.armed = None;
+            return Err(format!(
+                "\"{name}\" is open on Perform, so it cannot be removed: open another setlist or a song there first."
+            ));
+        }
+        if self.armed.as_deref() != Some(file.as_str()) {
+            self.armed = Some(file);
+            return Ok(());
+        }
+        self.armed = None;
+        let index = self.shelf.position(&file);
+        let (_, warning) = self.shelf.remove(&file).map_err(|e| e.to_string())?;
+        self.warn(warning);
+        let next = index.and_then(|index| {
+            let setlists = &self.shelf.setlists;
+            setlists
+                .get(index)
+                .or_else(|| index.checked_sub(1).and_then(|before| setlists.get(before)))
+                .map(|setlist| setlist.entry.file.clone())
+        });
+        match next {
+            Some(next) => self.select(&next),
+            None => {
+                self.editor = None;
+                self.row = None;
+            }
+        }
+        Ok(())
     }
 
     fn start_rename(&mut self) {
@@ -562,6 +638,7 @@ impl LibraryPage {
 
     fn editor_view(&self, editor: &SetlistEditor, playing: Option<&str>) -> EditorView {
         let setlist = editor.setlist();
+        let armed = self.armed.as_deref() == Some(editor.file());
         let rows: Vec<EditorRow> = setlist
             .items
             .iter()
@@ -598,6 +675,12 @@ impl LibraryPage {
                 .map(ToString::to_string)
                 .collect(),
             playing: playing == Some(editor.file()),
+            remove: if armed {
+                format!("Click again to remove {}", setlist.name)
+            } else {
+                "Remove".to_owned()
+            },
+            remove_armed: armed,
         }
     }
 
@@ -933,6 +1016,11 @@ pub struct EditorView {
     /// Whether it is open on the Perform screen, which plays it as it was
     /// when opened.
     pub playing: bool,
+    /// The remove control: "Remove", or "Click again to remove NAME" once
+    /// armed.
+    pub remove: String,
+    /// Whether the next press of the remove control removes the setlist.
+    pub remove_armed: bool,
 }
 
 /// One song of the library.

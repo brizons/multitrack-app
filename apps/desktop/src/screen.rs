@@ -268,7 +268,10 @@ impl Perform {
             Intent::OpenLibrary => self.prompt_for(Pick::Library, window, cx),
             Intent::ShowPage(page) => self.show_page(page),
             Intent::Library(action) => {
+                // The setlist on Perform cannot be removed.
+                let playing = self.playing_file().map(str::to_owned);
                 if let Some(library) = &mut self.library {
+                    library.set_playing(playing.as_deref());
                     library.act(action);
                 }
                 self.follow_library_moves();

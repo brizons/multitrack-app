@@ -912,3 +912,142 @@ fn a_library_opens_at_its_canonical_folder() {
     let page = LibraryPage::open(&dir.path().join("Songs/.."), None).unwrap();
     assert_eq!(page.root(), fs::canonicalize(dir.path()).unwrap());
 }
+
+/// The test trash: `LIBRARY/Trash`, so no test fills the real trash.
+fn test_trash(path: &Path) -> std::io::Result<()> {
+    let library = path
+        .parent()
+        .and_then(Path::parent)
+        .expect("a setlist file is in LIBRARY/Setlists");
+    let trash = library.join("Trash");
+    fs::create_dir_all(&trash)?;
+    fs::rename(path, trash.join(path.file_name().expect("a file name")))
+}
+
+/// A library with setlists A, B and C, open on `selected`.
+fn removable(selected: &str) -> (tempfile::TempDir, LibraryPage) {
+    let dir = library();
+    for name in ["A", "B", "C"] {
+        save(dir.path(), name, Vec::new());
+    }
+    let page = LibraryPage::open_with_trash(
+        dir.path(),
+        Some(&format!("{selected}.setlist.json")),
+        test_trash,
+    )
+    .unwrap();
+    (dir, page)
+}
+
+fn remove_label(page: &LibraryPage) -> String {
+    page.view(None)
+        .editor
+        .expect("a setlist is selected")
+        .remove
+}
+
+#[test]
+fn removing_a_setlist_takes_a_second_click_and_moves_it_to_the_trash() {
+    let (dir, mut page) = removable("B");
+    assert_eq!(remove_label(&page), "Remove");
+
+    page.act(LibraryAction::RemoveSetlist);
+    assert_eq!(remove_label(&page), "Click again to remove B");
+    assert!(page.view(None).editor.unwrap().remove_armed);
+    assert_eq!(
+        setlist_names(&page),
+        ["A", "B", "C"],
+        "one click removes nothing"
+    );
+    assert!(dir.path().join("Setlists/B.setlist.json").exists());
+
+    page.act(LibraryAction::RemoveSetlist);
+    assert_eq!(page.notice(), None);
+    assert_eq!(setlist_names(&page), ["A", "C"]);
+    assert!(!dir.path().join("Setlists/B.setlist.json").exists());
+    assert!(dir.path().join("Trash/B.setlist.json").exists());
+    // The next setlist takes its place in the editor, not armed.
+    assert_eq!(page.selected_file(), Some("C.setlist.json"));
+    assert_eq!(remove_label(&page), "Remove");
+}
+
+#[test]
+fn any_other_action_disarms_the_removal() {
+    let (dir, mut page) = removable("B");
+    page.act(LibraryAction::RemoveSetlist);
+    page.act(LibraryAction::AddClick);
+    assert_eq!(remove_label(&page), "Remove");
+    page.act(LibraryAction::RemoveSetlist);
+    assert_eq!(remove_label(&page), "Click again to remove B");
+    assert!(dir.path().join("Setlists/B.setlist.json").exists());
+
+    // Changing the selection disarms too: the second click arms A.
+    page.act(LibraryAction::SelectSetlist(0));
+    assert_eq!(remove_label(&page), "Remove");
+    page.act(LibraryAction::RemoveSetlist);
+    assert_eq!(remove_label(&page), "Click again to remove A");
+    assert_eq!(setlist_names(&page), ["A", "B", "C"]);
+
+    // So does typing into a field.
+    page.act(LibraryAction::Search);
+    page.type_key(LineKey::Text("x"));
+    assert_eq!(remove_label(&page), "Remove");
+}
+
+#[test]
+fn the_setlist_on_perform_cannot_be_removed() {
+    let (dir, mut page) = removable("B");
+    page.set_playing(Some("B.setlist.json"));
+
+    page.act(LibraryAction::RemoveSetlist);
+    page.act(LibraryAction::RemoveSetlist);
+
+    assert_eq!(
+        page.notice(),
+        Some(
+            "\"B\" is open on Perform, so it cannot be removed: open another setlist or a song there first."
+        )
+    );
+    assert_eq!(remove_label(&page), "Remove");
+    assert_eq!(setlist_names(&page), ["A", "B", "C"]);
+    assert!(dir.path().join("Setlists/B.setlist.json").exists());
+
+    // Once another setlist plays there, it can be removed.
+    page.set_playing(Some("A.setlist.json"));
+    page.act(LibraryAction::RemoveSetlist);
+    page.act(LibraryAction::RemoveSetlist);
+    assert_eq!(setlist_names(&page), ["A", "C"]);
+}
+
+#[test]
+fn after_removing_the_last_setlist_the_previous_one_or_none_is_selected() {
+    let (_dir, mut page) = removable("C");
+    page.act(LibraryAction::RemoveSetlist);
+    page.act(LibraryAction::RemoveSetlist);
+    assert_eq!(page.selected_file(), Some("B.setlist.json"));
+
+    for _ in 0..2 {
+        page.act(LibraryAction::RemoveSetlist);
+        page.act(LibraryAction::RemoveSetlist);
+    }
+    assert_eq!(setlist_names(&page), Vec::<String>::new());
+    assert_eq!(page.selected_file(), None);
+    assert_eq!(page.view(None).editor, None);
+}
+
+#[test]
+fn removing_keeps_the_stored_order_of_the_rest() {
+    let (dir, mut page) = removable("A");
+    page.act(LibraryAction::MoveSetlistDown(0));
+    page.act(LibraryAction::MoveSetlistDown(1));
+    assert_eq!(setlist_names(&page), ["B", "C", "A"]);
+    page.act(LibraryAction::SelectSetlist(1));
+
+    page.act(LibraryAction::RemoveSetlist);
+    page.act(LibraryAction::RemoveSetlist);
+
+    assert_eq!(setlist_names(&page), ["B", "A"]);
+    assert_eq!(page.selected_file(), Some("A.setlist.json"));
+    let reopened = LibraryPage::open_with_trash(dir.path(), None, test_trash).unwrap();
+    assert_eq!(setlist_names(&reopened), ["B", "A"]);
+}

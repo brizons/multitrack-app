@@ -1,11 +1,9 @@
 //! The setlists of a library folder (F5.1): listed in their stored order
-//! with their item counts, created, duplicated and moved through the
-//! `library` crate, which writes each file atomically, never overwrites
-//! another setlist and keeps the order of the list. Renaming goes
-//! through the editor ([`crate::editor::SetlistEditor::rename`]), which
-//! holds the setlist.
-
-use std::path::Path;
+//! with their item counts, created, duplicated, moved and removed (to the
+//! system trash) through the `library` crate, which writes each file
+//! atomically, never overwrites another setlist and keeps the order of the
+//! list. Renaming goes through the editor
+//! ([`crate::editor::SetlistEditor::rename`]), which holds the setlist.
 
 use domain::Setlist;
 use library::{Library, SetlistEntry, SetlistError};
@@ -37,10 +35,10 @@ pub struct Shelf {
 }
 
 impl Shelf {
-    /// Lists the setlists of the library folder `root`.
-    pub fn open(root: &Path) -> Result<Self, SetlistError> {
+    /// Lists the setlists of `library`.
+    pub fn open(library: Library) -> Result<Self, SetlistError> {
         let mut shelf = Self {
-            library: Library::new(root),
+            library,
             setlists: Vec::new(),
             unreadable: Vec::new(),
             order_problem: None,
@@ -118,6 +116,27 @@ impl Shelf {
         let copied = saved(self.library.duplicate_setlist(file, &name))?;
         self.refresh()?;
         Ok(copied)
+    }
+
+    /// Removes the setlist in `file` from the list by moving its file to
+    /// the trash ([`Library::remove_setlist`]), and lists the setlists
+    /// again. A warning comes with the entry when the file went to the
+    /// trash but the stored order kept its name.
+    pub fn remove(&mut self, file: &str) -> Result<(SetlistEntry, Option<String>), SetlistError> {
+        let removed = match self.library.remove_setlist(file) {
+            Ok(entry) => (entry, None),
+            Err(SetlistError::RemovedOrderNotUpdated { removed, reason }) => {
+                let warning = SetlistError::RemovedOrderNotUpdated {
+                    removed: removed.clone(),
+                    reason,
+                }
+                .to_string();
+                (removed, Some(warning))
+            }
+            Err(error) => return Err(error),
+        };
+        self.refresh()?;
+        Ok(removed)
     }
 
     fn names(&self) -> Vec<&str> {

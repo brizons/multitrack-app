@@ -161,6 +161,28 @@ fn warning_line(warning: String, cx: &mut Context<Perform>) -> impl IntoElement 
         )
 }
 
+/// Removes the setlist in two presses: the first arms it and says so, the
+/// second moves its file to the system trash.
+fn remove_button(view: &EditorView, cx: &mut Context<Perform>) -> impl IntoElement {
+    let (bg, fg, border) = if view.remove_armed {
+        (theme::danger_bg(), theme::danger_text(), theme::danger())
+    } else {
+        (theme::raised(), theme::text(), theme::border())
+    };
+    button("remove-setlist", cx, act(LibraryAction::RemoveSetlist))
+        .h(px(36.))
+        .px(px(10.))
+        .rounded(px(8.))
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .text_color(fg)
+        .text_size(px(13.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(icon("trash", fg, 18.))
+        .child(view.remove.clone())
+}
+
 fn heading(name: &'static str, title: &'static str) -> impl IntoElement {
     div()
         .flex()
@@ -367,6 +389,7 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                     small_square("duplicate-setlist", cx, act(LibraryAction::DuplicateSetlist))
                         .child(icon("copy", theme::text(), 18.)),
                 )
+                .child(remove_button(view, cx))
                 .child(
                     button("perform-setlist", cx, Intent::PerformSetlist)
                         .h(px(44.))
