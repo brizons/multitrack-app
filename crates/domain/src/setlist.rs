@@ -233,6 +233,14 @@ pub enum SetlistFileError {
     /// The JSON is malformed or does not have the v1 shape.
     #[error("setlist: {0}")]
     Json(serde_json::Error),
+    /// A click-only tile's tempo is not a finite number; JSON cannot hold it,
+    /// so the setlist is not written. `item` is the index into
+    /// [`Setlist::items`].
+    #[error("setlist: item {} has a tempo that is not a finite number", .item + 1)]
+    NonFiniteBpm {
+        /// The index of the click-only tile.
+        item: usize,
+    },
 }
 
 /// A rule the setlist breaks; [`Setlist::validate`] reports all of them at
@@ -452,8 +460,18 @@ impl Setlist {
         serde_json::from_str(json).map_err(SetlistFileError::Json)
     }
 
-    /// Writes the setlist as pretty-printed JSON.
+    /// Writes the setlist as pretty-printed JSON. A click-only tile whose
+    /// tempo is not a finite number is refused, since JSON cannot hold it.
     pub fn to_json(&self) -> Result<String, SetlistFileError> {
+        // serde_json writes a non-finite float as `null`, which `from_json`
+        // then refuses: refuse to write it instead.
+        if let Some(item) = self
+            .items
+            .iter()
+            .position(|item| matches!(item, SetlistItem::Click(click) if !click.bpm.is_finite()))
+        {
+            return Err(SetlistFileError::NonFiniteBpm { item });
+        }
         serde_json::to_string_pretty(self).map_err(SetlistFileError::Json)
     }
 

@@ -820,3 +820,30 @@ fn set_transition_works_for_songs_and_click_tiles() {
         Err(SetlistEditError::IndexOutOfRange { index: 3, len: 3 })
     );
 }
+
+#[test]
+fn a_tempo_that_is_not_a_finite_number_is_refused_when_saving() {
+    for bpm in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut setlist = Setlist::new("Sunday");
+        setlist
+            .insert_item(0, SetlistItem::Song(SongItem::new("a.song")))
+            .unwrap();
+        setlist
+            .insert_item(1, SetlistItem::Click(click_item(bpm, 4, 4)))
+            .unwrap();
+
+        let error = setlist.to_json().unwrap_err();
+
+        assert!(
+            matches!(error, SetlistFileError::NonFiniteBpm { item: 1 }),
+            "{bpm}: {error:?}"
+        );
+        assert_message_names(&error, &["item 2", "tempo"]);
+    }
+    // A finite tempo out of range still saves; validation reports it.
+    let mut setlist = Setlist::new("Sunday");
+    setlist
+        .insert_item(0, SetlistItem::Click(click_item(5_000.0, 4, 4)))
+        .unwrap();
+    assert!(setlist.to_json().is_ok());
+}
