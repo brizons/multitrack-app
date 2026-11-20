@@ -4129,6 +4129,7 @@ dependencies = [
  "gpui",
  "hound",
  "io-cpal",
+ "library",
  "tempfile",
 ]
 
