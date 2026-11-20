@@ -48,6 +48,9 @@ pub enum LibraryAction {
     /// second moves its file to the system trash; any other action
     /// disarms it.
     RemoveSetlist,
+    /// Removes this setlist file of those that cannot be read, in two
+    /// presses like [`Self::RemoveSetlist`].
+    RemoveUnreadable(usize),
     /// Shows this item's details in the editor (again: hides them).
     SelectRow(usize),
     /// Adds the song of this row of the song list at the end.
@@ -188,6 +191,12 @@ impl LibraryPage {
         Ok(page)
     }
 
+    /// Disarms the remove controls: the Library screen was left, or
+    /// something outside it happened.
+    pub fn disarm(&mut self) {
+        self.armed = None;
+    }
+
     /// Tells the page which setlist file of its library is open on the
     /// Perform screen, which cannot be removed.
     pub fn set_playing(&mut self, file: Option<&str>) {
@@ -229,7 +238,7 @@ impl LibraryPage {
     fn try_act(&mut self, action: LibraryAction) -> Result<(), String> {
         use LibraryAction as A;
         // Removing takes two presses in a row: anything else disarms it.
-        if action != A::RemoveSetlist {
+        if !matches!(action, A::RemoveSetlist | A::RemoveUnreadable(_)) {
             self.armed = None;
         }
         match action {
@@ -255,6 +264,7 @@ impl LibraryPage {
                 .map_err(|e| e.to_string())?,
             A::MoveSetlistUp(_) | A::MoveSetlistDown(_) => {}
             A::RemoveSetlist => self.remove_selected()?,
+            A::RemoveUnreadable(index) => self.remove_unreadable(index)?,
             A::DuplicateSetlist => {
                 if let Some(file) = self.selected_file().map(str::to_owned) {
                     let (entry, warning) =
@@ -414,15 +424,29 @@ impl LibraryPage {
         let Some(editor) = &self.editor else {
             return Ok(());
         };
-        let (file, name) = (editor.file().to_owned(), editor.setlist().name.clone());
-        if self.playing.as_deref() == Some(file.as_str()) {
+        let (name, editing) = (editor.setlist().name.clone(), editor.file().to_owned());
+        // The name as the folder lists the file: a rename on a disk that
+        // stores names decomposed lists it otherwise than it was written,
+        // and the setlist on Perform is known by its listed name.
+        let file = self
+            .shelf
+            .library()
+            .listed_setlist_file(&editing)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| editing.clone());
+        let on_perform = self
+            .playing
+            .as_deref()
+            .is_some_and(|playing| playing == file || playing == editing);
+        if on_perform {
             self.armed = None;
             return Err(format!(
                 "\"{name}\" is open on Perform, so it cannot be removed: open another setlist or a song there first."
             ));
         }
-        if self.armed.as_deref() != Some(file.as_str()) {
-            self.armed = Some(file);
+        if self.armed.as_deref() != Some(editing.as_str()) {
+            self.armed = Some(editing);
             return Ok(());
         }
         self.armed = None;
@@ -443,6 +467,28 @@ impl LibraryPage {
                 self.row = None;
             }
         }
+        Ok(())
+    }
+
+    /// The remove control of a setlist file that cannot be read: the first
+    /// press arms it, the second moves the file to the trash.
+    fn remove_unreadable(&mut self, index: usize) -> Result<(), String> {
+        let Some(file) = self.shelf.unreadable.get(index).map(|p| p.file.clone()) else {
+            return Ok(());
+        };
+        if self.playing.as_deref() == Some(file.as_str()) {
+            self.armed = None;
+            return Err(format!(
+                "{file} is open on Perform, so it cannot be removed: open another setlist or a song there first."
+            ));
+        }
+        if self.armed.as_deref() != Some(file.as_str()) {
+            self.armed = Some(file);
+            return Ok(());
+        }
+        self.armed = None;
+        let (_, warning) = self.shelf.remove(&file).map_err(|e| e.to_string())?;
+        self.warn(warning);
         Ok(())
     }
 
@@ -620,7 +666,25 @@ impl LibraryPage {
         LibraryView {
             folder: self.root.display().to_string(),
             setlists,
-            unreadable_setlists: self.shelf.unreadable.clone(),
+            unreadable_setlists: self
+                .shelf
+                .unreadable
+                .iter()
+                .enumerate()
+                .map(|(index, problem)| {
+                    let armed = self.armed.as_deref() == Some(problem.file.as_str());
+                    UnreadableRow {
+                        index,
+                        line: problem.line.clone(),
+                        remove: if armed {
+                            format!("Click again to remove {}", problem.file)
+                        } else {
+                            "Remove".to_owned()
+                        },
+                        remove_armed: armed,
+                    }
+                })
+                .collect(),
             order_problem: self.shelf.order_problem.clone(),
             editor: self
                 .editor
@@ -906,6 +970,19 @@ pub enum Opened {
     Followed,
 }
 
+/// A setlist file of the list that cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableRow {
+    /// Its row; removes it.
+    pub index: usize,
+    /// The file and why it cannot be read.
+    pub line: String,
+    /// The remove control: "Remove", or "Click again to remove FILE".
+    pub remove: String,
+    /// Whether the next press removes it.
+    pub remove_armed: bool,
+}
+
 /// One setlist of the list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetlistRow {
@@ -1050,7 +1127,7 @@ pub struct LibraryView {
     /// The setlists.
     pub setlists: Vec<SetlistRow>,
     /// Setlist files that cannot be read, with the reason.
-    pub unreadable_setlists: Vec<String>,
+    pub unreadable_setlists: Vec<UnreadableRow>,
     /// Why the stored order of the setlists cannot be used, so they are
     /// listed by name.
     pub order_problem: Option<String>,

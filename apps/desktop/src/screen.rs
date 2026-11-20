@@ -15,7 +15,7 @@ use gpui::{
     Task, Window, prelude::*,
 };
 use io_cpal::CpalOutput;
-use openvamp_desktop::action::{Intent, Page, UiAction};
+use openvamp_desktop::action::{Intent, Page, UiAction, disarms_removal};
 use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
@@ -247,6 +247,13 @@ impl Perform {
         if !control_acts(intent, self.asking) {
             return;
         }
+        // A pending "Click again to remove …" never outlives leaving the
+        // Library screen or any control outside its remove controls.
+        if disarms_removal(intent)
+            && let Some(library) = &mut self.library
+        {
+            library.disarm();
+        }
         let now = Instant::now();
         match intent {
             Intent::Ui(action) => {
@@ -469,6 +476,9 @@ impl Perform {
             Some(KeyAction::PanicDown) => Intent::PanicDown,
             Some(KeyAction::OpenSong) => Intent::OpenSong,
             Some(KeyAction::Quit) => {
+                if let Some(library) = &mut self.library {
+                    library.disarm();
+                }
                 self.end_show(Ending::Quit, window, cx);
                 return;
             }

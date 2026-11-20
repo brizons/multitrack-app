@@ -11,7 +11,7 @@ use openvamp_desktop::action::Intent;
 use openvamp_desktop::catalog::{TRANSITIONS, transition_name};
 use openvamp_desktop::library_page::{
     ClickDetails, EditorRow, EditorView, LibraryAction, LibraryView, RowDetails, SetlistRow,
-    SongDetails, SongRow,
+    SongDetails, SongRow, UnreadableRow,
 };
 
 use crate::screen::Perform;
@@ -238,12 +238,11 @@ fn setlists(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
                         .text_color(theme::queued())
                         .child(line.clone())
                 }))
-                .children(view.unreadable_setlists.iter().map(|line| {
-                    div()
-                        .text_size(px(12.))
-                        .text_color(theme::danger())
-                        .child(format!("Cannot read {line}"))
-                })),
+                .children(
+                    view.unreadable_setlists
+                        .iter()
+                        .map(|row| unreadable_row(row, cx)),
+                ),
         )
         .child(
             div()
@@ -338,6 +337,43 @@ fn setlist_row(row: &SetlistRow, rows: usize, cx: &mut Context<Perform>) -> AnyE
                 )),
         )
         .child(tile)
+        .into_any_element()
+}
+
+/// A setlist file that cannot be read: why, and a two-press remove.
+fn unreadable_row(row: &UnreadableRow, cx: &mut Context<Perform>) -> AnyElement {
+    let (fg, border) = if row.remove_armed {
+        (theme::danger_text(), theme::danger())
+    } else {
+        (theme::text_muted(), theme::border())
+    };
+    div()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme::danger())
+                .child(format!("Cannot read {}", row.line)),
+        )
+        .child(
+            button(
+                ("remove-unreadable", row.index),
+                cx,
+                act(LibraryAction::RemoveUnreadable(row.index)),
+            )
+            .h(px(28.))
+            .px(px(8.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(border)
+            .text_size(px(12.))
+            .text_color(fg)
+            .child(icon("trash", fg, 14.))
+            .child(row.remove.clone()),
+        )
         .into_any_element()
 }
 

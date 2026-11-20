@@ -77,6 +77,17 @@ pub enum Intent {
     DismissProblems,
 }
 
+/// Whether `intent` disarms an armed remove control of the Library screen:
+/// everything does but the remove controls themselves, so a pending
+/// "Click again to remove …" never survives leaving the screen, a
+/// transport key or any other control.
+pub fn disarms_removal(intent: Intent) -> bool {
+    !matches!(
+        intent,
+        Intent::Library(LibraryAction::RemoveSetlist | LibraryAction::RemoveUnreadable(_))
+    )
+}
+
 /// The command `action` sends, given the session's state; `None` when it
 /// sends nothing, such as a pad past the end of the arrangement, or a
 /// setlist control with a single song open.

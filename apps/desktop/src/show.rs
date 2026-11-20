@@ -124,12 +124,20 @@ impl Source {
                         "The library's songs could not be listed, so items show their folder names: {error}"
                     )),
                 };
+                // Kept as the folder lists it, whatever case it was given
+                // in where the disk ignores case, so the Library screen
+                // knows it as the setlist on Perform.
+                let file = Library::new(&library)
+                    .listed_setlist_file(file)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| file.clone());
                 let prepared =
-                    SetlistSession::prepare(&Library::new(&library), file, options.clone())
+                    SetlistSession::prepare(&Library::new(&library), &file, options.clone())
                         .map_err(OpenFailure::Setlist)?;
                 Ok(Prepared::Setlist {
                     library,
-                    file: file.clone(),
+                    file,
                     prepared: Box::new(prepared),
                     catalog,
                 })

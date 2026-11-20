@@ -20,6 +20,15 @@ pub struct ShelfEntry {
     pub items: usize,
 }
 
+/// A setlist file that cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShelfProblem {
+    /// Its file name inside the setlists folder.
+    pub file: String,
+    /// The file and why it cannot be read, in one line.
+    pub line: String,
+}
+
 /// The setlists of a library folder, as [`Library::list_setlists`] lists
 /// them: in the stored order, the rest by name.
 #[derive(Debug)]
@@ -27,8 +36,8 @@ pub struct Shelf {
     library: Library,
     /// The setlists that could be read.
     pub setlists: Vec<ShelfEntry>,
-    /// Setlist files that cannot be read, one line each with the reason.
-    pub unreadable: Vec<String>,
+    /// Setlist files that cannot be read, by file name, with the reason.
+    pub unreadable: Vec<ShelfProblem>,
     /// Why the stored order cannot be used, so the setlists are listed by
     /// name.
     pub order_problem: Option<String>,
@@ -69,7 +78,10 @@ impl Shelf {
         self.unreadable = listing
             .unreadable
             .iter()
-            .map(|unreadable| format!("{}: {}", unreadable.file, unreadable.error))
+            .map(|unreadable| ShelfProblem {
+                file: unreadable.file.clone(),
+                line: format!("{}: {}", unreadable.file, unreadable.error),
+            })
             .collect();
         self.order_problem = listing
             .order_error

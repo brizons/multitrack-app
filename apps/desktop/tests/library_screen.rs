@@ -1051,3 +1051,111 @@ fn removing_keeps_the_stored_order_of_the_rest() {
     let reopened = LibraryPage::open_with_trash(dir.path(), None, test_trash).unwrap();
     assert_eq!(setlist_names(&reopened), ["B", "A"]);
 }
+
+#[test]
+fn the_setlist_on_perform_is_refused_whatever_case_it_was_opened_in() {
+    use app::testing::FakeOutput;
+    use app::{AudioOutput, SessionOptions};
+    use openvamp_desktop::show::{Source, replace};
+
+    let dir = library();
+    for name in ["A", "B", "C"] {
+        save(
+            dir.path(),
+            name,
+            vec![SetlistItem::Song(SongItem::new("Songs/Amazing.song"))],
+        );
+    }
+    if !dir.path().join("Setlists/b.setlist.json").exists() {
+        return; // a case-sensitive file system has no such variant
+    }
+    let source = Source::for_path(&dir.path().join("Setlists/b.setlist.json")).unwrap();
+    let fake = FakeOutput::new();
+    let mut current = None;
+    replace(
+        &mut current,
+        &source,
+        &SessionOptions::default(),
+        || Box::new(fake.clone()) as Box<dyn AudioOutput>,
+        |_| {},
+    )
+    .unwrap();
+    let playing = current.as_ref().unwrap().setlist().unwrap().file.clone();
+    let mut page =
+        LibraryPage::open_with_trash(dir.path(), Some("B.setlist.json"), test_trash).unwrap();
+    page.set_playing(Some(&playing));
+    page.act(LibraryAction::RemoveSetlist);
+    page.act(LibraryAction::RemoveSetlist);
+    assert!(dir.path().join("Setlists/B.setlist.json").exists());
+    assert!(page.notice().is_some_and(|n| n.contains("open on Perform")));
+
+    // The list marks it as the one on Perform, and so does the editor.
+    assert_eq!(playing, "B.setlist.json", "the name as the folder lists it");
+    let view = page.view(Some(&playing));
+    assert!(view.setlists[1].playing);
+    assert!(view.editor.unwrap().playing);
+}
+
+#[test]
+fn leaving_the_library_screen_or_acting_elsewhere_disarms_the_removal() {
+    use openvamp_desktop::action::{Intent, Page, UiAction, disarms_removal};
+
+    let (_dir, mut page) = removable("B");
+    page.act(LibraryAction::RemoveSetlist);
+    page.disarm();
+    assert_eq!(remove_label(&page), "Remove");
+
+    // Every intent outside the remove controls disarms.
+    for intent in [
+        Intent::ShowPage(Page::Perform),
+        Intent::ShowPage(Page::Library),
+        Intent::Ui(UiAction::TogglePlay),
+        Intent::Ui(UiAction::NextSong),
+        Intent::PanicDown,
+        Intent::PerformSetlist,
+        Intent::OpenLibrary,
+        Intent::OpenSong,
+        Intent::DismissProblems,
+        Intent::Library(LibraryAction::AddClick),
+    ] {
+        assert!(disarms_removal(intent), "{intent:?}");
+    }
+    assert!(!disarms_removal(Intent::Library(
+        LibraryAction::RemoveSetlist
+    )));
+    assert!(!disarms_removal(Intent::Library(
+        LibraryAction::RemoveUnreadable(0)
+    )));
+}
+
+#[test]
+fn a_setlist_file_that_cannot_be_read_is_removed_from_the_list_in_two_presses() {
+    let (dir, page) = removable("A");
+    drop(page);
+    fs::write(
+        dir.path().join("Setlists/Broken.setlist.json"),
+        "{ not json",
+    )
+    .unwrap();
+    let mut page = LibraryPage::open_with_trash(dir.path(), None, test_trash).unwrap();
+    let row = page.view(None).unreadable_setlists[0].clone();
+    assert!(
+        row.line.starts_with("Broken.setlist.json: "),
+        "{}",
+        row.line
+    );
+    assert_eq!(row.remove, "Remove");
+
+    page.act(LibraryAction::RemoveUnreadable(0));
+    let row = page.view(None).unreadable_setlists[0].clone();
+    assert_eq!(row.remove, "Click again to remove Broken.setlist.json");
+    assert!(row.remove_armed);
+    // The setlist in the editor is not armed by it.
+    assert_eq!(remove_label(&page), "Remove");
+
+    page.act(LibraryAction::RemoveUnreadable(0));
+    assert_eq!(page.notice(), None);
+    assert!(page.view(None).unreadable_setlists.is_empty());
+    assert!(dir.path().join("Trash/Broken.setlist.json").exists());
+    assert_eq!(setlist_names(&page), ["A", "B", "C"]);
+}
