@@ -164,6 +164,9 @@ pub struct SetlistListing {
     /// but cannot be read or is not a valid order: the setlists are then
     /// listed by name.
     pub order_error: Option<SetlistError>,
+    /// Entries of the [`SETLISTS_FOLDER`] that could not be read at all, so
+    /// not even their names are known; every other setlist is listed.
+    pub entry_errors: Vec<SetlistError>,
 }
 
 /// Why a setlist could not be listed, read or written. Nothing on disk is
@@ -355,18 +358,16 @@ impl Library {
         let Some(folder) = self.setlists_folder()? else {
             return Ok(SetlistListing::default());
         };
-        let folder_error = |source| SetlistError::Folder {
-            path: folder.clone(),
-            source,
-        };
         let mut listing = SetlistListing::default();
-        for found in fs::read_dir(&folder).map_err(folder_error)? {
-            let Ok(file) = found.map_err(folder_error)?.file_name().into_string() else {
-                continue;
-            };
-            if !is_setlist_file_name(&file) {
-                continue;
-            }
+        let (files, errors) = read_setlist_names(&folder)?;
+        listing.entry_errors = errors
+            .into_iter()
+            .map(|source| SetlistError::Folder {
+                path: folder.clone(),
+                source,
+            })
+            .collect();
+        for file in files {
             match read_setlist(&folder, &file) {
                 Ok(setlist) => listing.setlists.push(SetlistEntry {
                     name: setlist.name,
@@ -730,22 +731,56 @@ fn check_file_name(file: &str) -> Result<(), SetlistError> {
     }
 }
 
+/// Entry errors after which [`setlist_file_names`] stops reading a folder,
+/// so a folder whose reads keep failing cannot keep a listing going.
+const MAX_ENTRY_ERRORS: usize = 100;
+
+/// The setlist file names among `entries`, the names a folder lists, and
+/// why the entries that could not be read could not: those are skipped,
+/// so one bad entry hides no setlist (after [`MAX_ENTRY_ERRORS`] the rest
+/// of the folder is left).
+fn setlist_file_names(
+    entries: impl Iterator<Item = io::Result<std::ffi::OsString>>,
+) -> (Vec<String>, Vec<io::Error>) {
+    let mut names = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(name) => {
+                if let Ok(name) = name.into_string()
+                    && is_setlist_file_name(&name)
+                {
+                    names.push(name);
+                }
+            }
+            Err(error) => {
+                errors.push(error);
+                if errors.len() == MAX_ENTRY_ERRORS {
+                    break;
+                }
+            }
+        }
+    }
+    (names, errors)
+}
+
+/// The names `folder` (canonical) lists, the setlist files among them and
+/// why the entries that could not be read could not ([`setlist_file_names`]);
+/// only a folder that cannot be opened is an error.
+fn read_setlist_names(folder: &Path) -> Result<(Vec<String>, Vec<io::Error>), SetlistError> {
+    let entries = fs::read_dir(folder).map_err(|source| SetlistError::Folder {
+        path: folder.to_owned(),
+        source,
+    })?;
+    Ok(setlist_file_names(
+        entries.map(|found| found.map(|entry| entry.file_name())),
+    ))
+}
+
 /// The setlist file names the folder `folder` (canonical) lists, as
 /// [`Library::list_setlists`] takes them: valid setlist file names in UTF-8.
 fn listed_file_names(folder: &Path) -> Result<Vec<String>, SetlistError> {
-    let folder_error = |source| SetlistError::Folder {
-        path: folder.to_owned(),
-        source,
-    };
-    let mut names = Vec::new();
-    for found in fs::read_dir(folder).map_err(folder_error)? {
-        if let Ok(name) = found.map_err(folder_error)?.file_name().into_string()
-            && is_setlist_file_name(&name)
-        {
-            names.push(name);
-        }
-    }
-    Ok(names)
+    Ok(read_setlist_names(folder)?.0)
 }
 
 /// Checks that `file` (already checked by [`check_file_name`]) resolves
@@ -958,4 +993,35 @@ fn is_windows_reserved(stem: &str) -> bool {
     WINDOWS_RESERVED_NAMES
         .iter()
         .any(|reserved| base.eq_ignore_ascii_case(reserved))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_entry_that_cannot_be_read_hides_no_setlist() {
+        let entries = [
+            Ok("A.setlist.json".into()),
+            Err(io::Error::other("the disk said no")),
+            Ok("B.setlist.json".into()),
+            Ok("notes.txt".into()),
+            Ok(".hidden.setlist.json".into()),
+            Ok(SETLIST_ORDER_FILE.into()),
+        ];
+
+        let (names, errors) = setlist_file_names(entries.into_iter());
+
+        assert_eq!(names, ["A.setlist.json", "B.setlist.json"]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].to_string(), "the disk said no");
+    }
+
+    #[test]
+    fn a_folder_whose_entries_keep_failing_is_left() {
+        let (names, errors) =
+            setlist_file_names(std::iter::repeat_with(|| Err(io::Error::other("again"))));
+        assert!(names.is_empty());
+        assert_eq!(errors.len(), MAX_ENTRY_ERRORS);
+    }
 }
