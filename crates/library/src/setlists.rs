@@ -82,9 +82,16 @@ const WINDOWS_RESERVED_NAMES: [&str; 30] = [
 /// order is reported in [`SetlistListing::order_error`] and the list falls
 /// back to name order; no setlist is hidden or lost because of it. While
 /// an order is stored, a new setlist goes at the end, a renamed one keeps
-/// its place, and a duplicate goes right after its original; without one,
+/// its place, a duplicate goes right after its original, and a removed one
+/// leaves it ([`Library::remove_setlist`]); without one,
 /// nothing writes an order file but a move. No setlist file changes when
 /// the order does.
+///
+/// # Removing
+///
+/// [`Library::remove_setlist`] takes a setlist out of the list by moving
+/// its file to the system trash (through the `trash` crate), where it can
+/// be restored; no setlist file is ever deleted.
 ///
 /// # Writing
 ///
@@ -93,9 +100,32 @@ const WINDOWS_RESERVED_NAMES: [&str; 30] = [
 /// is always either complete or untouched. Between checking that a file name
 /// is free and the rename, another program could create that file; this
 /// library assumes one writer per library folder.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Library {
     root: PathBuf,
+    /// What moves a removed setlist's file to the trash.
+    trash: TrashFn,
+}
+
+/// Two libraries are the same when they are the same folder; the trash
+/// they use does not count.
+impl PartialEq for Library {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+    }
+}
+
+impl Eq for Library {}
+
+/// Moves the file at a path to the trash; [`Library::remove_setlist`] calls
+/// it. [`move_to_trash`] unless replaced with [`Library::with_trash`].
+pub type TrashFn = fn(&Path) -> io::Result<()>;
+
+/// Moves the file at `path` to the system trash (the `trash` crate: the
+/// Trash on macOS, the Recycle Bin on Windows, the freedesktop.org trash on
+/// Linux), where the person can restore it.
+pub fn move_to_trash(path: &Path) -> io::Result<()> {
+    trash::delete(path).map_err(io::Error::other)
 }
 
 /// A setlist file that [`Library::list_setlists`] could read.
@@ -254,6 +284,26 @@ pub enum SetlistError {
         /// Why its place could not be stored.
         reason: String,
     },
+    /// The trash refused the setlist file, which stays where it was.
+    #[error("cannot move {} to the trash: {source}", path.display())]
+    Trash {
+        /// The setlist file.
+        path: PathBuf,
+        /// Why the trash refused it.
+        source: io::Error,
+    },
+    /// The setlist file was moved to the trash, but the stored order could
+    /// not be updated: the name it keeps names no file, so it is ignored.
+    #[error(
+        "setlist \"{}\" was moved to the trash, but the order of the list could not be updated: {reason}",
+        removed.name
+    )]
+    RemovedOrderNotUpdated {
+        /// The setlist removed.
+        removed: SetlistEntry,
+        /// Why the order could not be updated.
+        reason: String,
+    },
     /// A setlist was asked to move past the end of the list.
     #[error("cannot move a setlist to place {}: the library lists {len} setlists", .to.saturating_add(1))]
     MoveOutOfRange {
@@ -265,9 +315,19 @@ pub enum SetlistError {
 }
 
 impl Library {
-    /// The library at the folder `root`.
+    /// The library at the folder `root`, removing setlists to the system
+    /// trash ([`move_to_trash`]).
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            trash: move_to_trash,
+        }
+    }
+
+    /// The same library, moving removed setlists with `trash` instead of to
+    /// the system trash: tests use it so they never fill a real trash.
+    pub fn with_trash(self, trash: TrashFn) -> Self {
+        Self { trash, ..self }
     }
 
     /// The library folder, as given to [`Library::new`].
@@ -359,6 +419,36 @@ impl Library {
             }
         }
         write_order(&folder, &files)
+    }
+
+    /// Removes the setlist in `file` from the library's list (F5.1, L33) by
+    /// moving its file to the system trash, where it can be restored; it is
+    /// never deleted. `file` must be a setlist file name as for
+    /// [`Library::load_setlist`], and the file must resolve inside the
+    /// [`SETLISTS_FOLDER`], be a regular file and hold a readable setlist;
+    /// otherwise nothing moves. A stored order loses its entry and keeps the
+    /// rest. When the file is in the trash but the order cannot be written,
+    /// [`SetlistError::RemovedOrderNotUpdated`] says so; the name left in
+    /// the order names no file, so it is ignored.
+    pub fn remove_setlist(&self, file: &str) -> Result<SetlistEntry, SetlistError> {
+        check_file_name(file)?;
+        let folder = self.existing_setlists_folder(file)?;
+        // The same checks as reading it: inside the folder, a regular file,
+        // a setlist.
+        let setlist = read_setlist(&folder, file)?;
+        let path = folder.join(file);
+        (self.trash)(&path).map_err(|source| SetlistError::Trash { path, source })?;
+        let removed = SetlistEntry {
+            name: setlist.name,
+            file: file.to_owned(),
+        };
+        match update_order(&folder, |order| order.retain(|listed| listed != file)) {
+            Ok(()) => Ok(removed),
+            Err(error) => Err(SetlistError::RemovedOrderNotUpdated {
+                removed,
+                reason: error.to_string(),
+            }),
+        }
     }
 
     /// Reads the setlist file `file`, a file name inside the

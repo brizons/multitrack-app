@@ -9,7 +9,8 @@
 //! [`SETLISTS_FOLDER`]: it lists, loads, saves, renames and duplicates them,
 //! never leaving a half-written file or overwriting another setlist, and
 //! keeps the order of the list in its [`SETLIST_ORDER_FILE`]
-//! ([`Library::move_setlist`]).
+//! ([`Library::move_setlist`]); a setlist removed from the list
+//! ([`Library::remove_setlist`]) goes to the system trash, never deleted.
 //! [`Library::setlist_songs`] reads the songs a setlist names, so
 //! [`domain::Setlist::validate`] can report the ones the library lacks while
 //! the rest of the setlist stays usable. [`Library::list_songs`] lists every
@@ -44,7 +45,7 @@ pub use setlist_songs::{SetlistSongs, SongUnavailable};
 pub use setlists::{
     Library, MAX_SETLIST_FILE_BYTES, SETLIST_EXTENSION, SETLIST_ORDER_FILE,
     SETLIST_ORDER_FORMAT_VERSION, SETLISTS_FOLDER, SetlistEntry, SetlistError, SetlistListing,
-    UnreadableSetlist,
+    TrashFn, UnreadableSetlist, move_to_trash,
 };
 pub use songs::{ArrangementEntry, PositionEntry, SongEntry, SongListing, UnreadableSong};
 pub use stream::{DiskMonitor, Gate, StreamCapacity, StreamConfig, StreamingSong, open_streaming};
