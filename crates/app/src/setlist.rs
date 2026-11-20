@@ -961,11 +961,13 @@ fn first_buildable<T>(
 
 /// Whether `error`, from building one item, would stop every item the same
 /// way: it comes from the session's settings or the system, not the item.
+/// Output errors are not among them: building an item never opens the
+/// device, and the device opens at the first item's own rate, so a refusal
+/// there belongs to that item.
 fn is_session_wide(error: &OpenError) -> bool {
     matches!(
         error,
         OpenError::BufferSize { .. }
-            | OpenError::Output(_)
             | OpenError::Load(library::LoadError::DiskThread { .. })
             | OpenError::Live(engine::live::LiveError::ZeroBufferSize)
     )
