@@ -21,11 +21,27 @@ Opens the Perform screen. SONG_DIR is a song folder: song.json and the WAV
 stems it lists; without it, use \"Open song…\" (Cmd/Ctrl-O). The song plays
 on the system's default audio output, at the song's sample rate.";
 
+/// The exit code when the window cannot open. macOS ends the app from
+/// inside its run loop, so this exits the process at once; nothing has
+/// opened a song or a device by then.
+const WINDOW_FAILED: i32 = 1;
+
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     let song_dir = args.next().map(PathBuf::from);
-    if args.next().is_some() {
-        eprintln!("{USAGE}");
+    let extra: Vec<String> = args
+        .map(|arg| format!("{:?}", arg.to_string_lossy()))
+        .collect();
+    if !extra.is_empty() {
+        let noun = if extra.len() == 1 {
+            "argument"
+        } else {
+            "arguments"
+        };
+        eprintln!(
+            "unexpected {noun} {} (one song folder at most)\n\n{USAGE}",
+            extra.join(" ")
+        );
         return ExitCode::from(2);
     }
     if let Some(dir) = &song_dir
@@ -46,7 +62,10 @@ fn main() -> ExitCode {
             }
         })
         .detach();
-        screen::open_window(song_dir, cx);
+        if let Err(error) = screen::open_window(song_dir, cx) {
+            eprintln!("error: cannot open the window: {error}");
+            std::process::exit(WINDOW_FAILED);
+        }
         cx.activate(true);
     });
     ExitCode::SUCCESS

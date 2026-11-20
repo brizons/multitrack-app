@@ -364,8 +364,9 @@ impl Render for Perform {
     }
 }
 
-/// Opens the Perform window for `song_dir`, if any.
-pub fn open_window(song_dir: Option<PathBuf>, cx: &mut App) {
+/// Opens the Perform window for `song_dir`, if any. An error means no
+/// window opened, and so no song or device either.
+pub fn open_window(song_dir: Option<PathBuf>, cx: &mut App) -> gpui::Result<()> {
     let bounds = gpui::Bounds::centered(None, gpui::size(gpui::px(1366.), gpui::px(900.)), cx);
     let options = gpui::WindowOptions {
         window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
@@ -376,7 +377,7 @@ pub fn open_window(song_dir: Option<PathBuf>, cx: &mut App) {
         window_min_size: Some(gpui::size(gpui::px(960.), gpui::px(640.))),
         ..Default::default()
     };
-    let opened = cx.open_window(options, |window, cx| {
+    cx.open_window(options, |window, cx| {
         let screen = cx.new(|cx| Perform::new(song_dir, window, cx));
         // Closing the window while a song plays asks first; otherwise the
         // song stops with its ramp before the window closes.
@@ -389,9 +390,6 @@ pub fn open_window(song_dir: Option<PathBuf>, cx: &mut App) {
                 .unwrap_or(true)
         });
         screen
-    });
-    if let Err(error) = opened {
-        eprintln!("error: cannot open the window: {error}");
-        cx.quit();
-    }
+    })?;
+    Ok(())
 }

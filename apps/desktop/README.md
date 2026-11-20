@@ -6,7 +6,7 @@ The desktop shell for Mac, Windows and Linux: the Perform screen from the design
 multitrack-desktop [SONG_DIR]
 ```
 
-`SONG_DIR` is a song folder: `song.json` and the WAV stems it lists; its `default` arrangement plays. Without it, the screen offers **Open song…** (also Cmd-O on the Mac, Ctrl-O elsewhere). `--help` prints the usage; any other option, or a second argument, exits with code 2.
+`SONG_DIR` is a song folder: `song.json` and the WAV stems it lists; its `default` arrangement plays. Without it, the screen offers **Open song…** (also Cmd-O on the Mac, Ctrl-O elsewhere). `--help` prints the usage; any other option, or a second argument, is named in the error and exits with code 2. A window that cannot open exits with code 1.
 
 To try it without a song of your own, write the demo song (48 kHz, 8 positions, 48 s, one quiet chord stem) and open it:
 
@@ -32,7 +32,7 @@ The session is polled about 30 times a second on a timer that keeps running whil
 
 **Open song…** opens the new folder while the current song keeps playing; only once it opened does the current song stop and close. A folder that does not open, or a folder picker that fails, leaves the current song playing and shows why under the header until dismissed.
 
-Quitting or closing the window while a song plays or waits to start (`Loading…`) asks first: **Stop and quit** (Return on the Mac) or **Keep playing** (Escape). Stop, the transport control, stays immediate. With nothing playing, both quit at once. The app has no menu bar of its own; quitting from the Dock or when the system logs out cannot be asked about (gpui 0.2.2 cannot cancel it), so the song just stops with its ramp.
+Quitting or closing the window while a song plays or waits to start (`Loading…`) asks first: **Stop and quit** (Return on the Mac) or **Keep playing** (Escape). Stop, the transport control, stays immediate. With nothing playing, both quit at once. The app sets no menus of its own. Quitting from the Dock, or when the system logs out, cannot be asked about (gpui 0.2.2 cannot cancel it), so the song just stops with its ramp.
 
 Closing a song (opening another one, closing the window, quitting) stops it with the usual short ramp before the device closes. If the player refuses Stop because its command queue is full, Stop is sent again every 5 ms for up to 500 ms. A refusal, or a ramp that has not ended by then, is reported on stderr, and on screen when another song replaced it.
 
