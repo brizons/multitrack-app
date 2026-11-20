@@ -616,3 +616,30 @@ fn a_fifo_setlist_file_is_refused_without_blocking() {
         }]
     ));
 }
+
+#[test]
+fn renaming_only_the_case_works_when_the_file_name_is_stored_decomposed() {
+    // HFS+ and exFAT on macOS store file names decomposed (NFD): a setlist
+    // saved as "Domingo Mañana" is listed as "Domingo Man\u{303}ana.setlist.json".
+    let (dir, library) = new_library();
+    let folder = setlists_folder(&dir);
+    fs::create_dir(&folder).unwrap();
+    fs::write(
+        folder.join("Domingo Man\u{303}ana.setlist.json"),
+        full_setlist("Domingo Ma\u{f1}ana").to_json().unwrap(),
+    )
+    .unwrap();
+    let file = library.list_setlists().unwrap().setlists[0].file.clone();
+
+    let renamed = library
+        .rename_setlist(&file, "Domingo ma\u{f1}ana")
+        .unwrap();
+
+    assert_eq!(renamed.name, "Domingo ma\u{f1}ana");
+    let listing = library.list_setlists().unwrap();
+    assert_eq!(names(&listing).len(), 1, "{:?}", names(&listing));
+    assert_eq!(
+        library.load_setlist(&listing.setlists[0].file).unwrap(),
+        full_setlist("Domingo ma\u{f1}ana")
+    );
+}

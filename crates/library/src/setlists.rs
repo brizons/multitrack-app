@@ -501,15 +501,21 @@ fn entry_exists(path: &Path) -> Result<bool, SetlistError> {
     }
 }
 
-/// Whether the existing `target` is `source` spelled with another case, as
-/// a file system that ignores case sees it.
+/// Whether the existing `target` is `source` spelled with another case or
+/// Unicode normalization, as a file system that ignores them sees it.
+///
+/// On unix the file's identity (device and inode) decides alone: HFS+ and
+/// exFAT list names decomposed (NFD), so comparing the listed name with a
+/// freshly built one as strings would refuse a case-only rename there.
+/// Elsewhere identity falls back to size and modification time, so the
+/// names must also match ignoring case.
 fn same_entry(
     source: &str,
     source_path: &Path,
     target: &str,
     target_path: &Path,
 ) -> Result<bool, SetlistError> {
-    if source.to_lowercase() != target.to_lowercase() {
+    if !cfg!(unix) && source.to_lowercase() != target.to_lowercase() {
         return Ok(false);
     }
     let metadata = |path: &Path| {

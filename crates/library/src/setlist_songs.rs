@@ -93,8 +93,10 @@ impl Library {
 
     /// Reads every song `setlist` names, once each, with the checks
     /// [`crate::load_song`] makes but without decoding any audio, so
-    /// [`Setlist::validate`] can check the setlist against them. Song paths
-    /// stay inside the library folder, symlinks included.
+    /// [`Setlist::validate`] can check the setlist against them. Song
+    /// folders stay inside the library folder, symlinks included; the
+    /// `song.json` inside a folder is read as [`crate::load_song`] reads it,
+    /// which does not yet refuse a manifest that is a symlink out or a FIFO.
     pub fn setlist_songs(&self, setlist: &Setlist) -> Result<SetlistSongs, SetlistError> {
         let root = self.canonical_root()?;
         let mut songs = SetlistSongs::default();
