@@ -124,8 +124,26 @@ pub type TrashFn = fn(&Path) -> io::Result<()>;
 /// Moves the file at `path` to the system trash (the `trash` crate: the
 /// Trash on macOS, the Recycle Bin on Windows, the freedesktop.org trash on
 /// Linux), where the person can restore it.
+///
+/// On macOS it asks `NSFileManager` directly. The crate's default there
+/// asks the Finder through AppleScript, which can bring up a permission
+/// prompt for automating the Finder while the calling thread (the screen's,
+/// in the desktop app) waits for it. `NSFileManager` needs no permission;
+/// what it gives up is the Finder's sound and its "Put Back" for the file,
+/// which the person can still restore by dragging it out of the Trash.
+/// Elsewhere the crate's default is used: a setlist file is a few KiB, so
+/// moving it is quick.
 pub fn move_to_trash(path: &Path) -> io::Result<()> {
-    trash::delete(path).map_err(io::Error::other)
+    #[cfg(target_os = "macos")]
+    let context = {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut context = trash::TrashContext::new();
+        context.set_delete_method(DeleteMethod::NsFileManager);
+        context
+    };
+    #[cfg(not(target_os = "macos"))]
+    let context = trash::TrashContext::new();
+    context.delete(path).map_err(io::Error::other)
 }
 
 /// A setlist file that [`Library::list_setlists`] could read.
