@@ -5,15 +5,18 @@
 //! player is driven deterministically. Devices can be unplugged and plugged
 //! back in, lose their stream for another reason, and change the rates they
 //! run at. The n-th device added has the id `fake:n`; the methods that act
-//! on one device take its id, since two devices can share a name.
+//! on one device take its id, since two devices can share a name. Clones
+//! share one stream at a time, like an interface that takes one; a check
+//! ([`AudioOutput::check`]) looks at the devices only and is counted apart
+//! from opens ([`FakeOutput::checks`], [`FakeOutput::open_attempts`]).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use crate::output::{
-    AudioOutput, DeviceInfo, LossReason, OutputError, OutputRequest, OutputStream, StreamHealth,
-    StreamInfo,
+    AudioOutput, DeviceInfo, LossReason, OutputCheck, OutputError, OutputRequest, OutputStream,
+    StreamHealth, StreamInfo,
 };
 use crate::renderer::AudioRenderer;
 
@@ -40,6 +43,8 @@ struct State {
     stream: Option<Running>,
     next_id: u64,
     opened: Vec<OutputRequest>,
+    open_attempts: usize,
+    checks: usize,
     drop_on_audio_thread: bool,
 }
 
@@ -155,6 +160,17 @@ impl FakeOutput {
             .is_some_and(|r| r.lost.is_none())
     }
 
+    /// How many times [`AudioOutput::check`] ran.
+    pub fn checks(&self) -> usize {
+        self.lock().checks
+    }
+
+    /// How many times [`AudioOutput::open`] ran, accepted or refused; a
+    /// check never counts.
+    pub fn open_attempts(&self) -> usize {
+        self.lock().open_attempts
+    }
+
     /// Every request [`AudioOutput::open`] accepted, in order.
     pub fn opened(&self) -> Vec<OutputRequest> {
         self.lock().opened.clone()
@@ -195,38 +211,25 @@ impl AudioOutput for FakeOutput {
             .collect())
     }
 
+    /// The device's presence, channels and rates, as [`Self::open`] checks
+    /// them; the stream already playing, if any, is left out.
+    fn check(&self, request: &OutputRequest) -> OutputCheck {
+        let mut state = self.lock();
+        state.checks += 1;
+        match lookup(&state.devices, request) {
+            Ok(_) => OutputCheck::Fits,
+            Err(error) => OutputCheck::Refused(error),
+        }
+    }
+
     fn open(
         &mut self,
         request: &OutputRequest,
         renderer: AudioRenderer,
     ) -> Result<Box<dyn OutputStream>, OutputError> {
         let mut state = self.lock();
-        let present: Vec<&Device> = state.devices.iter().filter(|d| d.present).collect();
-        let device = match &request.device {
-            Some(choice) => {
-                let keys: Vec<(&str, &str)> = present
-                    .iter()
-                    .map(|d| (d.id.as_str(), d.name.as_str()))
-                    .collect();
-                present[choice.find(&keys)?]
-            }
-            None => present.first().ok_or(OutputError::NoDevice)?,
-        };
-        if device.channels < 2 {
-            return Err(OutputError::NotStereo {
-                device: device.name.clone(),
-                channels: device.channels,
-            });
-        }
-        if let Some(rates) = &device.rates
-            && !rates.contains(&request.sample_rate)
-        {
-            return Err(OutputError::UnsupportedSampleRate {
-                device: device.name.clone(),
-                requested: request.sample_rate,
-                supported: rates.iter().map(|&rate| (rate, rate)).collect(),
-            });
-        }
+        state.open_attempts += 1;
+        let device = lookup(&state.devices, request)?;
         if state.stream.is_some() {
             return Err(OutputError::Device {
                 device: device.name.clone(),
@@ -255,6 +258,38 @@ impl AudioOutput for FakeOutput {
             info,
         }))
     }
+}
+
+/// The present device `request` means, if it plays stereo at the request's
+/// rate: what [`FakeOutput`] checks before it opens a stream.
+fn lookup<'a>(devices: &'a [Device], request: &OutputRequest) -> Result<&'a Device, OutputError> {
+    let present: Vec<&Device> = devices.iter().filter(|d| d.present).collect();
+    let device = match &request.device {
+        Some(choice) => {
+            let keys: Vec<(&str, &str)> = present
+                .iter()
+                .map(|d| (d.id.as_str(), d.name.as_str()))
+                .collect();
+            present[choice.find(&keys)?]
+        }
+        None => present.first().ok_or(OutputError::NoDevice)?,
+    };
+    if device.channels < 2 {
+        return Err(OutputError::NotStereo {
+            device: device.name.clone(),
+            channels: device.channels,
+        });
+    }
+    if let Some(rates) = &device.rates
+        && !rates.contains(&request.sample_rate)
+    {
+        return Err(OutputError::UnsupportedSampleRate {
+            device: device.name.clone(),
+            requested: request.sample_rate,
+            supported: rates.iter().map(|&rate| (rate, rate)).collect(),
+        });
+    }
+    Ok(device)
 }
 
 struct FakeStream {

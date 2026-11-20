@@ -2,7 +2,7 @@
 
 **Decision:** a Rust audio engine built as a hexagonal core, shared by one UI per platform family: SwiftUI for iPhone and iPad, Jetpack Compose for Android, and GPUI (Rust) for Mac, Windows and Linux. The default build uses only permissive or weak-copyleft dependencies, so the app can ship on every store, including the Apple App Store. This document supports the [MVP spec](mvp-spec.md).
 
-> **Status:** Decision 1 (stack) decided on 2026-10-30; on 2026-11-19 the desktop shell moved from Tauri with React to GPUI, and the Mac moved from the SwiftUI app to the GPUI app. Decision 5 (project license) still needs sign-off. The Rust core (`domain`, `engine`, `library`, `render-cli`) is built and reviewed on `feat/core-render-pipeline`.
+> **Status:** Decision 1 (stack) decided on 2026-10-30; on 2026-11-19 the desktop shell moved from Tauri with React to GPUI, and the Mac moved from the SwiftUI app to the GPUI app. Decision 5 (project license) decided on 2026-11-19: MPL-2.0. The Rust core (`domain`, `engine`, `library`, `render-cli`) is built and reviewed on `feat/core-render-pipeline`.
 
 ## Decisions at a glance
 
@@ -12,7 +12,7 @@
 | 2 | Engine model | One sample clock driving a compiled timeline | Proposed |
 | 3 | Threads | Real-time audio thread fed by lock-free queues | Proposed |
 | 4 | Key and tempo change (v0.2) | Offline render with Signalsmith Stretch | Proposed |
-| 5 | Licenses | Permissive dependencies by default; GPL-only features are opt-in | **Decision needed** |
+| 5 | Licenses | MPL-2.0 project; permissive dependencies by default; GPL-only features are opt-in | Decided |
 | 6 | Storage | Open song package, stems stored as FLAC | Proposed |
 
 ## System overview
@@ -150,7 +150,7 @@ Render transposed and time-stretched stems **offline**, into a cache keyed by ke
 | ASIO SDK (Windows) | — | GPLv3 or proprietary | Opt-in feature only |
 | Ableton Link (`rusty_link`) | 0.4.9 | GPL-2.0-or-later | Opt-in feature only, if ever |
 
-**Project license — Decision needed.** The proposal is **MPL-2.0**: changes to our files must stay open, yet the app can ship on the App Store and link permissive libraries. A Windows build with the ASIO feature becomes a GPLv3 binary and is distributed separately.
+**Project license — decided (2026-11-19): MPL-2.0** (see `LICENSE`): changes to our files must stay open, yet the app can ship on the App Store and link permissive libraries. A Windows build with the ASIO feature becomes a GPLv3 binary and is distributed separately.
 
 ## Decision 6 — Storage
 
@@ -217,6 +217,6 @@ Static analysis of the shipped macOS binary, used only to understand the archite
 
 ## Next step
 
-1. Settle Decision 5 (project license).
-2. Build live playback — the `app` API, the real-time engine with `cpal`, and the first shell — as planned in [odd/tasks/live-playback.md](../odd/tasks/live-playback.md).
+1. Live playback is built — the `app` API, the real-time engine with `cpal`, `play-cli` and the GPUI desktop shell — as recorded in [odd/tasks/live-playback.md](../odd/tasks/live-playback.md).
+2. Next feature: setlists and transitions (F5).
 3. Run spikes S1–S5 when the hardware is available (an Android tablet, an iPad and a multichannel USB interface).

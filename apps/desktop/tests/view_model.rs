@@ -12,7 +12,10 @@ use app::{
 };
 use multitrack_desktop::action::{UiAction, command_for};
 use multitrack_desktop::hold::{PANIC_HOLD, PanicHold};
-use multitrack_desktop::keys::{KeyAction, KeyPress, Mods, SECONDARY_IS_PLATFORM, key_down};
+use multitrack_desktop::keys::{
+    HeldKeys, KeyAction, KeyPlatform, KeyPress, Mods, PANIC_KEY, SECONDARY_IS_PLATFORM,
+    is_panic_key, key_down,
+};
 use multitrack_desktop::view::{Level, PerformView, SectionKind, open_error_lines, short_label};
 
 const RATE: u32 = 48_000;
@@ -275,6 +278,40 @@ fn a_pad_queues_a_jump_and_the_queued_pad_cancels_it() {
 }
 
 #[test]
+fn a_hold_whose_press_is_lost_never_fires() {
+    let start = Instant::now();
+    let at = |millis| start + Duration::from_millis(millis);
+    let mut hold = PanicHold::new();
+
+    // Halfway through, the window loses focus: the hold ends at once.
+    hold.press(at(0));
+    close(hold.fill(at(500)), 0.5);
+    hold.cancel();
+    assert!(!hold.is_counting());
+    assert_eq!(hold.fill(at(500)), 0.0);
+    assert!(
+        !hold.tick(at(0) + PANIC_HOLD),
+        "the full time passes, no panic"
+    );
+    assert!(
+        !hold.release(at(2_000)),
+        "a release that still arrives fires nothing"
+    );
+
+    // Cancelled with the full hold already reached but no tick yet: still
+    // no panic.
+    hold.press(at(3_000));
+    hold.cancel();
+    assert!(!hold.tick(at(5_000)));
+    assert!(!hold.release(at(5_000)));
+
+    // The next press is a fresh hold that fires.
+    hold.press(at(6_000));
+    assert!(hold.is_counting());
+    assert!(hold.tick(at(6_000) + PANIC_HOLD));
+}
+
+#[test]
 fn transport_plays_pauses_stops_and_goes_back_to_start() {
     let song = song();
     let mut snapshot = snapshot();
@@ -347,26 +384,29 @@ fn hold_to_panic_needs_the_full_hold() {
     assert!(!hold.tick(at(50)));
     assert!(!hold.release(at(80)));
     assert!(!hold.tick(at(2_000)), "a released hold never fires");
-    assert_eq!(hold.progress(at(2_000)), 0.0);
+    assert_eq!(hold.fill(at(2_000)), 0.0);
 
     // Half a hold, then a fresh press starts from zero.
     hold.press(at(3_000));
-    close(hold.progress(at(3_500)), 0.5);
+    close(hold.fill(at(3_500)), 0.5);
     assert!(!hold.release(at(3_500)));
     hold.press(at(4_000));
     assert!(!hold.tick(at(4_900)));
-    assert!(hold.is_held());
+    assert!(hold.is_counting());
 
-    // The full hold fires once, on the first tick past it.
+    // The full hold fires once, on the first tick past it; while the
+    // control stays down, nothing counts any more and the fill is empty.
     assert!(hold.tick(at(4_000) + PANIC_HOLD));
+    assert!(!hold.is_counting());
+    assert_eq!(hold.fill(at(5_100)), 0.0);
     assert!(!hold.tick(at(5_100)));
     assert!(!hold.release(at(5_200)));
-    assert!(!hold.is_held());
+    assert!(!hold.is_counting());
 
     // A key that repeats while held does not restart the hold.
     hold.press(at(6_000));
     hold.press(at(6_500));
-    close(hold.progress(at(6_500)), 0.5);
+    close(hold.fill(at(6_500)), 0.5);
     // Released after the full hold with no tick in between: it fires then.
     assert!(hold.release(at(7_100)));
 
@@ -577,6 +617,196 @@ fn keys_match_play_cli() {
         ),
         None
     );
+}
+
+#[test]
+fn the_panic_key_is_one_key_for_press_and_release() {
+    let press = |key| {
+        key_down(&KeyPress {
+            key,
+            mods: Mods::default(),
+        })
+    };
+    assert_eq!(press(PANIC_KEY), Some(KeyAction::PanicDown));
+    assert!(is_panic_key(PANIC_KEY));
+    let upper = PANIC_KEY.to_ascii_uppercase();
+    assert_eq!(press(&upper), Some(KeyAction::PanicDown));
+    assert!(is_panic_key(&upper));
+    assert!(!is_panic_key("space"));
+}
+
+#[test]
+fn a_held_key_acts_once_until_it_is_released() {
+    let plain = |key| KeyPress {
+        key,
+        mods: Mods::default(),
+    };
+    let play = Some(KeyAction::Ui(UiAction::TogglePlay));
+    let mut keys = HeldKeys::new();
+
+    // X11 (gpui 0.2.2) reports every repeat as a fresh press: only the
+    // first acts until the key is released.
+    assert_eq!(keys.press(&plain("space"), false), play);
+    assert_eq!(keys.press(&plain("space"), false), None);
+    assert_eq!(keys.press(&plain("space"), false), None);
+    // Another key acts meanwhile, and the first stays down.
+    assert_eq!(
+        keys.press(&plain("f"), false),
+        Some(KeyAction::Ui(UiAction::ToggleFade))
+    );
+    assert_eq!(keys.press(&plain("space"), false), None);
+    keys.release("space");
+    assert_eq!(keys.press(&plain("space"), false), play);
+    // Letters count as one key in either case.
+    assert_eq!(keys.press(&plain("F"), false), None);
+    keys.release("F");
+    assert_eq!(
+        keys.press(&plain("f"), false),
+        Some(KeyAction::Ui(UiAction::ToggleFade))
+    );
+
+    // macOS and Windows mark their repeats: never acted on.
+    keys.release("space");
+    assert_eq!(keys.press(&plain("space"), true), None);
+
+    // After focus loss every key counts as up, since their releases went
+    // elsewhere.
+    assert_eq!(keys.press(&plain("space"), false), play);
+    keys.forget_all();
+    assert_eq!(keys.press(&plain("space"), false), play);
+
+    // A key without a control never counts as down.
+    assert_eq!(keys.press(&plain("q"), false), None);
+}
+
+#[test]
+fn held_keys_leave_the_panic_key_and_shortcuts_to_their_own_rules() {
+    let plain = |key| KeyPress {
+        key,
+        mods: Mods::default(),
+    };
+    let secondary = Mods {
+        platform: SECONDARY_IS_PLATFORM,
+        control: !SECONDARY_IS_PLATFORM,
+        ..Mods::default()
+    };
+    let mut keys = HeldKeys::new();
+
+    // Every press of the panic key reaches the hold, which ignores a press
+    // while held; so a release the window never saw cannot swallow the
+    // next panic press.
+    for _ in 0..3 {
+        assert_eq!(
+            keys.press(&plain(PANIC_KEY), false),
+            Some(KeyAction::PanicDown)
+        );
+    }
+    // A platform repeat of it is still ignored.
+    assert_eq!(keys.press(&plain(PANIC_KEY), true), None);
+
+    // Shortcuts with a modifier are not tracked: macOS drops the release of
+    // a key let go while Command is down.
+    let open = KeyPress {
+        key: "o",
+        mods: secondary,
+    };
+    assert_eq!(keys.press(&open, false), Some(KeyAction::OpenSong));
+    assert_eq!(keys.press(&open, false), Some(KeyAction::OpenSong));
+    assert_eq!(keys.press(&open, true), None);
+    // Cmd-S out of habit, its release dropped: the next plain S still stops.
+    let save = KeyPress {
+        key: "s",
+        mods: secondary,
+    };
+    assert_eq!(keys.press(&save, false), None);
+    assert_eq!(
+        keys.press(&plain("s"), false),
+        Some(KeyAction::Ui(UiAction::Stop))
+    );
+    let quit = KeyPress {
+        key: "q",
+        mods: secondary,
+    };
+    assert_eq!(keys.press(&quit, false), Some(KeyAction::Quit));
+}
+
+#[test]
+fn a_plain_key_released_while_command_is_held_still_acts_next_time() {
+    let plain = |key| KeyPress {
+        key,
+        mods: Mods::default(),
+    };
+    let command = Mods {
+        platform: true,
+        ..Mods::default()
+    };
+    let play = Some(KeyAction::Ui(UiAction::TogglePlay));
+    let mut keys = HeldKeys::on(KeyPlatform::Mac);
+    assert_eq!(keys.press(&plain("space"), false), play);
+    // Command goes down while Space is held; Space's key-up while Command
+    // is held never arrives (macOS drops it); then Command goes up.
+    keys.modifiers_changed(command);
+    keys.modifiers_changed(Mods::default());
+    assert_eq!(
+        keys.press(&plain("space"), false),
+        play,
+        "the next Space acts"
+    );
+
+    // Other modifiers keep the keys that are down: an X11 repeat of a held
+    // key with Shift or Ctrl going down is still ignored.
+    assert_eq!(
+        keys.press(&plain("f"), false),
+        Some(KeyAction::Ui(UiAction::ToggleFade))
+    );
+    keys.modifiers_changed(Mods {
+        control: true,
+        alt: true,
+        ..Mods::default()
+    });
+    keys.modifiers_changed(Mods::default());
+    assert_eq!(keys.press(&plain("f"), false), None, "F is still down");
+}
+
+#[test]
+fn elsewhere_the_super_key_keeps_the_keys_that_are_down() {
+    let plain = |key| KeyPress {
+        key,
+        mods: Mods::default(),
+    };
+    let super_key = Mods {
+        platform: true,
+        ..Mods::default()
+    };
+    // Windows and X11 report every release, so a key held through a Super
+    // or Windows key press stays down: its repeats are still ignored.
+    let mut keys = HeldKeys::on(KeyPlatform::Other);
+    assert_eq!(
+        keys.press(&plain("space"), false),
+        Some(KeyAction::Ui(UiAction::TogglePlay))
+    );
+    keys.modifiers_changed(super_key);
+    keys.modifiers_changed(Mods::default());
+    assert_eq!(
+        keys.press(&plain("space"), false),
+        None,
+        "Space is still down"
+    );
+    keys.release("space");
+    assert_eq!(
+        keys.press(&plain("space"), false),
+        Some(KeyAction::Ui(UiAction::TogglePlay))
+    );
+}
+
+#[test]
+fn the_key_platform_here_is_this_one() {
+    let expected = if cfg!(target_os = "macos") {
+        KeyPlatform::Mac
+    } else {
+        KeyPlatform::Other
+    };
+    assert_eq!(KeyPlatform::HERE, expected);
 }
 
 #[test]

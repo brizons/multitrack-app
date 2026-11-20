@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 pub const PANIC_HOLD: Duration = Duration::from_millis(1_000);
 
 /// The state of the panic control. The screen calls [`Self::press`] and
-/// [`Self::release`] from the pointer or the key, and [`Self::tick`] from
-/// its timer; whichever sees the full hold first fires, once per hold.
+/// [`Self::release`] from the pointer or the key, [`Self::tick`] from its
+/// timer, and [`Self::cancel`] when the window loses focus; whichever of
+/// tick and release sees the full hold first fires, once per hold.
 #[derive(Debug, Clone, Default)]
 pub struct PanicHold {
     since: Option<Instant>,
@@ -42,13 +43,30 @@ impl PanicHold {
     /// Returns whether panic fires at `now`: the first tick after the hold
     /// is complete.
     pub fn tick(&mut self, now: Instant) -> bool {
-        let fires = !self.fired && self.progress(now) >= 1.0;
+        let fires = self.is_counting() && self.fill(now) >= 1.0;
         self.fired |= fires;
         fires
     }
 
-    /// How far the hold is at `now`, 0.0 to 1.0; 0.0 when not held.
-    pub fn progress(&self, now: Instant) -> f32 {
+    /// The press was lost before its release (the window lost focus, so
+    /// the release may never reach it): the hold ends without panic, and a
+    /// release that still arrives later fires nothing.
+    pub fn cancel(&mut self) {
+        self.since = None;
+        self.fired = false;
+    }
+
+    /// Whether a hold is counting toward panic: the control is down and
+    /// panic has not fired yet. False once panic fired, even while the
+    /// control is still down.
+    pub fn is_counting(&self) -> bool {
+        self.since.is_some() && !self.fired
+    }
+
+    /// How far the hold that is counting is toward panic at `now`, 0.0 to
+    /// 1.0, as the panic button's fill shows it; 0.0 when nothing counts
+    /// (the control is up, or panic fired while it is still down).
+    pub fn fill(&self, now: Instant) -> f32 {
         match self.since {
             Some(since) if !self.fired => {
                 let held = now.saturating_duration_since(since);
@@ -56,10 +74,5 @@ impl PanicHold {
             }
             _ => 0.0,
         }
-    }
-
-    /// Whether the control is held.
-    pub fn is_held(&self) -> bool {
-        self.since.is_some() && !self.fired
     }
 }

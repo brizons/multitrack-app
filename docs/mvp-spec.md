@@ -264,7 +264,7 @@ Shells: the SwiftUI app covers iPadOS and iPhone; the Compose app covers Android
 ## Open decisions
 
 - [x] **Engine and UI stack** — decided: Rust core with a native UI per platform; see [architecture.md](architecture.md#decision-1--engine-and-ui-stack).
-- [ ] **Project license** — constrained by the chosen libraries (see the architecture doc).
+- [x] **Project license** — MPL-2.0, decided 2026-11-19 (see `LICENSE` and the architecture doc).
 - [ ] **Guide voices** — record original voices or use an open TTS voice with a compatible license.
 - [ ] **Reference hardware** — one low-end device per Tier 1 platform for the performance targets.
 - [ ] **Platform tiers** — confirm the table above.

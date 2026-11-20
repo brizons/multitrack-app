@@ -32,14 +32,27 @@ pub enum UiAction {
     Panic,
 }
 
+/// What the screen's controls and keys ask the screen for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// A control of the Perform screen.
+    Ui(UiAction),
+    /// The panic button or key went down.
+    PanicDown,
+    /// The panic button or key went up.
+    PanicUp,
+    /// "Open song…".
+    OpenSong,
+    /// Hides the problems shown above a playing song.
+    DismissProblems,
+}
+
 /// The command `action` sends, given the session's state; `None` when it
 /// sends nothing, such as a pad past the end of the arrangement.
 pub fn command_for(action: UiAction, snapshot: &Snapshot, song: &SongInfo) -> Option<Command> {
     Some(match action {
-        UiAction::TogglePlay => match snapshot.transport {
-            TransportState::Playing | TransportState::Starting => Command::Pause,
-            _ => Command::Play,
-        },
+        UiAction::TogglePlay if is_playing(snapshot.transport) => Command::Pause,
+        UiAction::TogglePlay => Command::Play,
         UiAction::Stop => Command::Stop,
         UiAction::BackToStart => Command::BackToStart,
         UiAction::QueueSection(position) if position >= song.positions.len() => return None,
@@ -61,4 +74,15 @@ pub fn command_for(action: UiAction, snapshot: &Snapshot, song: &SongInfo) -> Op
         UiAction::ToggleFade => Command::ToggleFade,
         UiAction::Panic => Command::Panic,
     })
+}
+
+/// Whether `transport` counts as playing: playing, or waiting for the disk
+/// to start (shown as "Loading…"). Play/pause then pauses and reads
+/// "Pause", and quitting or closing the window asks first
+/// ([`crate::ending`]).
+pub fn is_playing(transport: TransportState) -> bool {
+    matches!(
+        transport,
+        TransportState::Playing | TransportState::Starting
+    )
 }

@@ -4,6 +4,12 @@
 //! for one arrangement, and plays it on an audio device through the
 //! [`AudioOutput`] port. Shells only send [`Command`]s and draw the
 //! [`Snapshot`]s [`Session::poll`] returns, about 30 times a second.
+//! [`Session::open`] is two steps a shell can also take apart:
+//! [`Session::prepare`] checks the song and builds its player with no
+//! device, and [`PreparedSong::start`] opens the device, so the next song
+//! can be checked while another one still plays on that device. In
+//! between, [`PreparedSong::check`] asks the output whether it would take
+//! the song ([`OutputCheck`]) without opening anything.
 //!
 //! # Threads
 //!
@@ -60,10 +66,12 @@ pub use error::{OpenError, RuntimeError};
 pub use library::{LoadError, SongProblem};
 pub use output::{
     AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceChoice, DeviceInfo, LossReason, MAX_BUFFER_FRAMES,
-    MIN_BUFFER_FRAMES, OutputError, OutputRequest, OutputStream, StreamHealth, StreamInfo,
+    MIN_BUFFER_FRAMES, OutputCheck, OutputError, OutputRequest, OutputStream, StreamHealth,
+    StreamInfo,
 };
 pub use renderer::AudioRenderer;
 pub use session::{
-    Command, DeviceStatus, FadeView, QueuedView, Session, SessionOptions, Snapshot, TransportState,
+    Command, DeviceStatus, FadeView, PreparedSong, QueuedView, Session, SessionOptions, Snapshot,
+    TransportState,
 };
 pub use song::{PositionInfo, SongInfo};
