@@ -643,3 +643,36 @@ fn renaming_only_the_case_works_when_the_file_name_is_stored_decomposed() {
         full_setlist("Domingo ma\u{f1}ana")
     );
 }
+
+#[test]
+fn renaming_onto_a_setlist_differing_only_by_normalization_is_refused_where_both_can_exist() {
+    let (dir, library) = new_library();
+    let folder = setlists_folder(&dir);
+    fs::create_dir(&folder).unwrap();
+    let composed = folder.join("Caf\u{e9}.setlist.json");
+    let decomposed = folder.join("Cafe\u{301}.setlist.json");
+    fs::write(&composed, full_setlist("Caf\u{e9}").to_json().unwrap()).unwrap();
+    if decomposed.exists() {
+        // macOS file systems treat both spellings as one file.
+        return;
+    }
+    fs::write(&decomposed, Setlist::new("Cafe\u{301}").to_json().unwrap()).unwrap();
+    let before = (fs::read(&composed).unwrap(), fs::read(&decomposed).unwrap());
+
+    let rename = library
+        .rename_setlist("Caf\u{e9}.setlist.json", "Cafe\u{301}")
+        .unwrap_err();
+    assert!(matches!(rename, SetlistError::FileTaken { .. }), "{rename}");
+    let duplicate = library
+        .duplicate_setlist("Caf\u{e9}.setlist.json", "Cafe\u{301}")
+        .unwrap_err();
+    assert!(
+        matches!(duplicate, SetlistError::FileTaken { .. }),
+        "{duplicate}"
+    );
+
+    assert_eq!(
+        (fs::read(&composed).unwrap(), fs::read(&decomposed).unwrap()),
+        before
+    );
+}
