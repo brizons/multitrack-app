@@ -86,6 +86,8 @@ pub fn key_down(press: &KeyPress<'_>) -> Option<KeyAction> {
         "i" => ui(UiAction::ToggleInfinite),
         "f" => ui(UiAction::ToggleFade),
         "c" | "escape" => ui(UiAction::CancelJump),
+        "." => ui(UiAction::NextSong),
+        "," => ui(UiAction::PreviousSong),
         PANIC_KEY => Some(KeyAction::PanicDown),
         digit => match digit.as_bytes() {
             &[byte @ b'1'..=b'9'] => ui(UiAction::QueueSection(usize::from(byte - b'1'))),

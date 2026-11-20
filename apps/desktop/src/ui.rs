@@ -1,13 +1,16 @@
-//! The Perform screen's presentational code: draws a [`PerformView`] after
-//! the design canvas's Main artboard, reduced to S6, and reports what the
-//! person does as an [`Intent`]. It decides nothing.
+//! The Perform screen's presentational code: draws a [`PerformView`], and
+//! for a setlist a [`SetlistView`], after the design canvas's Main artboard
+//! (reduced to S6 and S4), and reports what the person does as an
+//! [`Intent`]. It decides nothing.
 
 use app::JumpTiming;
+use domain::Transition;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, ElementId, FocusHandle, FontWeight, IntoElement,
     MouseButton, Rgba, SharedString, Stateful, Window, div, prelude::*, px, relative, svg,
 };
 use openvamp_desktop::action::UiAction;
+use openvamp_desktop::strip::{ItemState, SetlistView, StripItem, TransitionChip};
 use openvamp_desktop::view::{
     FadeButton, Level, NextCard, NowCard, Pad, PerformView, SongMap, StatusView, TransportView,
 };
@@ -23,6 +26,9 @@ const KEYS: &str = if cfg!(target_os = "macos") {
 } else {
     "Space play/pause · S stop · B start · 1–9 queue · N timing · L loop · I infinite · F fade · C cancel · hold X panic · Ctrl-O open · Ctrl-Q quit"
 };
+
+/// The keys of a setlist, listed before [`KEYS`].
+const SETLIST_KEYS: &str = ", previous · . next · ";
 
 /// How the empty screen names the open shortcut.
 const OPEN_HINT: &str = if cfg!(target_os = "macos") {
@@ -57,9 +63,11 @@ pub fn shield() -> impl IntoElement {
     div().absolute().top_0().left_0().size_full().occlude()
 }
 
-/// The screen with a song open, and the `problems` that did not stop it.
+/// The screen with a song or a setlist open, and the `problems` that did
+/// not stop it.
 pub fn perform(
     view: &PerformView,
+    setlist: Option<&SetlistView>,
     hold: f32,
     problems: &[String],
     cx: &mut Context<Perform>,
@@ -70,12 +78,18 @@ pub fn perform(
         .flex()
         .flex_col()
         .gap(px(12.))
-        .child(header(view, hold, cx))
+        .child(header(view, setlist, hold, cx))
         .when(!problems.is_empty(), |screen| {
             screen.child(problem_banner(problems, cx))
         })
+        .when_some(setlist, |screen, setlist| {
+            screen.child(strip(setlist, cx)).when(
+                !setlist.problems.is_empty() || setlist.blend.is_some(),
+                |screen| screen.child(setlist_notes(setlist)),
+            )
+        })
         .child(now_playing(view, cx))
-        .child(status(&view.status))
+        .child(status(&view.status, setlist.is_some()))
 }
 
 /// Problems that did not stop the song playing, such as a pick that did
@@ -156,8 +170,13 @@ pub fn no_song(errors: &[String], cx: &mut Context<Perform>) -> impl IntoElement
         )
 }
 
-fn header(view: &PerformView, hold: f32, cx: &mut Context<Perform>) -> impl IntoElement {
-    div()
+fn header(
+    view: &PerformView,
+    setlist: Option<&SetlistView>,
+    hold: f32,
+    cx: &mut Context<Perform>,
+) -> impl IntoElement {
+    let header = div()
         .h(px(64.))
         .flex_none()
         .flex()
@@ -166,13 +185,23 @@ fn header(view: &PerformView, hold: f32, cx: &mut Context<Perform>) -> impl Into
         .pb(px(12.))
         .border_b_1()
         .border_color(theme::divider())
-        .child(brand_mark())
-        .child(
-            chip_button("open", cx, Intent::OpenSong)
-                .child(icon("folder", theme::text_muted(), 20.))
-                .child("Open song…"),
-        )
-        .child(transport(&view.transport, cx))
+        .child(brand_mark());
+    let header = match setlist {
+        Some(setlist) => header.child(setlist_chip(setlist, cx)),
+        None => header
+            .child(
+                chip_button("open", cx, Intent::OpenSong)
+                    .child(icon("folder", theme::text_muted(), 20.))
+                    .child("Open song…"),
+            )
+            .child(
+                chip_button("open-setlist", cx, Intent::OpenSetlist)
+                    .child(icon("setlist", theme::text_muted(), 20.))
+                    .child("Open setlist…"),
+            ),
+    };
+    header
+        .child(transport(&view.transport, setlist, cx))
         .child(
             div()
                 .flex_none()
@@ -200,12 +229,58 @@ fn header(view: &PerformView, hold: f32, cx: &mut Context<Perform>) -> impl Into
         .child(panic(hold, cx))
 }
 
-fn transport(transport: &TransportView, cx: &mut Context<Perform>) -> impl IntoElement {
+/// The setlist's name and the current item's place; picks another
+/// setlist.
+fn setlist_chip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoElement {
+    chip_button("setlist", cx, Intent::OpenSetlist)
+        .flex_shrink()
+        .min_w_0()
+        .max_w(px(260.))
+        .child(icon("setlist", theme::text_muted(), 20.))
+        .child(
+            div()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(div().truncate().child(setlist.name.clone()))
+                .child(
+                    div()
+                        .font_family(theme::MONO)
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(theme::text_muted())
+                        .child(setlist.position.clone()),
+                ),
+        )
+}
+
+/// Back to start, play/pause and stop; with a setlist, previous and next
+/// song around play, as on the design canvas.
+fn transport(
+    transport: &TransportView,
+    setlist: Option<&SetlistView>,
+    cx: &mut Context<Perform>,
+) -> impl IntoElement {
     let (play_icon, play_label) = if transport.playing {
         ("pause", "Pause")
     } else {
         ("play", "Play")
     };
+    let step = |id: &'static str, name: &'static str, enabled: bool, cx: &mut Context<Perform>| {
+        let action = if name == "previous" {
+            UiAction::PreviousSong
+        } else {
+            UiAction::NextSong
+        };
+        let color = if enabled {
+            theme::text()
+        } else {
+            theme::text_faint()
+        };
+        square_button(id, cx, Intent::Ui(action)).child(icon(name, color, 22.))
+    };
+    let previous = setlist.map(|setlist| step("previous", "previous", setlist.has_previous, cx));
+    let next = setlist.map(|setlist| step("next", "next", setlist.has_next, cx));
     div()
         .flex_none()
         .flex()
@@ -218,6 +293,7 @@ fn transport(transport: &TransportView, cx: &mut Context<Perform>) -> impl IntoE
                 22.,
             )),
         )
+        .children(previous)
         .child(
             button("play", cx, Intent::Ui(UiAction::TogglePlay))
                 .w(px(96.))
@@ -230,6 +306,7 @@ fn transport(transport: &TransportView, cx: &mut Context<Perform>) -> impl IntoE
                 .child(icon(play_icon, theme::on_fill(), 26.))
                 .child(play_label),
         )
+        .children(next)
         .child(
             square_button("stop", cx, Intent::Ui(UiAction::Stop)).child(icon(
                 "stop",
@@ -755,7 +832,198 @@ fn pad_button(pad: &Pad, cx: &mut Context<Perform>) -> AnyElement {
         .into_any_element()
 }
 
-fn status(status: &StatusView) -> impl IntoElement {
+/// The setlist strip: a tile per item, the chip with its transition
+/// between tiles; a tile selects its item.
+fn strip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoElement {
+    div()
+        .id("strip")
+        .h(px(84.))
+        .flex_none()
+        .flex()
+        .gap(px(8.))
+        .pb(px(6.))
+        .overflow_x_scroll()
+        .children(setlist.items.iter().map(|item| {
+            div()
+                .flex_none()
+                .flex()
+                .gap(px(8.))
+                .child(strip_tile(item, cx))
+                .children(item.transition.as_ref().map(transition_chip))
+        }))
+}
+
+fn strip_tile(item: &StripItem, cx: &mut Context<Perform>) -> AnyElement {
+    let (border, bg, fg) = match item.state {
+        ItemState::Current => (theme::accent(), theme::raised(), theme::text()),
+        ItemState::Played => (theme::border(), theme::panel(), theme::text_muted()),
+        ItemState::Upcoming => (theme::border(), theme::surface(), theme::text()),
+    };
+    let (badge_icon, badge_bg, badge_fg) = if !item.playable {
+        ("panic", theme::danger_bg(), theme::danger())
+    } else {
+        match item.state {
+            ItemState::Current => ("play", theme::accent(), theme::on_fill()),
+            ItemState::Played => ("check", theme::raised(), theme::text_faint()),
+            ItemState::Upcoming if item.click => ("metronome", theme::badge(), theme::text_soft()),
+            ItemState::Upcoming => ("note", theme::badge(), theme::text_soft()),
+        }
+    };
+    let tag = if item.loading {
+        Some(("Loading…", theme::queued()))
+    } else if item.is_next {
+        Some(("Next", theme::accent()))
+    } else {
+        None
+    };
+    let (detail, detail_color) = match &item.warning {
+        Some(warning) => (warning.clone(), theme::danger()),
+        None => (item.meta.clone(), theme::text_muted()),
+    };
+    let tile = div()
+        .id(ElementId::Name(format!("item-{}", item.index).into()))
+        .w(px(240.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(10.))
+        .px(px(12.))
+        .rounded(px(12.))
+        .bg(bg)
+        .text_color(fg)
+        .cursor_pointer()
+        .on_click(on_click(cx, Intent::Ui(UiAction::SelectItem(item.index))));
+    let tile = if item.state == ItemState::Current {
+        tile.border_2().border_color(border)
+    } else {
+        tile.border_1().border_color(border)
+    };
+    tile.child(
+        div()
+            .size(px(34.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(9.))
+            .bg(badge_bg)
+            .child(icon(badge_icon, badge_fg, 18.)),
+    )
+    .child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(theme::MONO)
+                            .text_size(px(12.))
+                            .text_color(theme::text_faint())
+                            .child(item.number.clone()),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(16.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(item.title.clone()),
+                    )
+                    .when_some(tag, |row, (tag, color)| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(color)
+                                .child(tag),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .truncate()
+                    .text_size(px(13.))
+                    .text_color(detail_color)
+                    .child(detail),
+            ),
+    )
+    .into_any_element()
+}
+
+/// How an item leads to the next one.
+fn transition_chip(chip: &TransitionChip) -> impl IntoElement {
+    let name = match chip.transition {
+        Transition::CueNext => "cue",
+        Transition::Stay => "stay",
+        Transition::AutoLink => "link",
+        Transition::Crossfade => "crossfade",
+    };
+    div()
+        .w(px(58.))
+        .flex_none()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(4.))
+        .rounded(px(10.))
+        .border_1()
+        .border_dashed()
+        .border_color(theme::chip_border())
+        .text_color(theme::text_muted())
+        .child(icon(name, theme::text_muted(), 20.))
+        .child(
+            div()
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(chip.short),
+        )
+}
+
+/// A crossfade under way and the setlist's problems, under the strip.
+fn setlist_notes(setlist: &SetlistView) -> impl IntoElement {
+    div()
+        .id("setlist-notes")
+        .flex_none()
+        .max_h(px(110.))
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .px(px(14.))
+        .py(px(8.))
+        .rounded(px(12.))
+        .bg(theme::surface())
+        .border_1()
+        .border_color(theme::border())
+        .text_size(px(13.))
+        .when_some(setlist.blend.clone(), |notes, blend| {
+            notes.child(
+                div()
+                    .text_color(theme::accent())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(blend),
+            )
+        })
+        .children(
+            setlist
+                .problems
+                .iter()
+                .map(|line| div().text_color(theme::queued()).child(line.clone())),
+        )
+}
+
+fn status(status: &StatusView, setlist: bool) -> impl IntoElement {
     let dot = match status.device_level {
         Level::Ok => theme::accent(),
         Level::Error => theme::danger(),
@@ -794,7 +1062,11 @@ fn status(status: &StatusView) -> impl IntoElement {
                         .truncate()
                         .text_size(px(12.))
                         .text_color(theme::text_faint())
-                        .child(KEYS),
+                        .child(if setlist {
+                            format!("{SETLIST_KEYS}{KEYS}")
+                        } else {
+                            KEYS.to_owned()
+                        }),
                 ),
         )
         .when_some(status.last_error.clone(), |area, error| {

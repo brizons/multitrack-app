@@ -1,6 +1,9 @@
 //! The controls of the Perform screen, as the `app` commands they send.
 
-use app::{Command, JumpKind, JumpTiming, Snapshot, SongInfo, TransportState};
+use app::{
+    Command, JumpKind, JumpTiming, SetlistCommand, SetlistSnapshot, Snapshot, SongInfo,
+    TransportState,
+};
 
 /// A control on the Perform screen, or the key that stands for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +33,12 @@ pub enum UiAction {
     /// Panic. The screen sends it only after a full hold
     /// ([`crate::hold::PanicHold`]), never on a click.
     Panic,
+    /// Selects the previous playable item of the setlist (F6.1).
+    PreviousSong,
+    /// Selects the next playable item of the setlist (F6.1).
+    NextSong,
+    /// Selects the setlist item at this index, a tile of the strip.
+    SelectItem(usize),
 }
 
 /// What the screen's controls and keys ask the screen for.
@@ -43,12 +52,15 @@ pub enum Intent {
     PanicUp,
     /// "Open song…".
     OpenSong,
+    /// "Open setlist…".
+    OpenSetlist,
     /// Hides the problems shown above a playing song.
     DismissProblems,
 }
 
 /// The command `action` sends, given the session's state; `None` when it
-/// sends nothing, such as a pad past the end of the arrangement.
+/// sends nothing, such as a pad past the end of the arrangement, or a
+/// setlist control with a single song open.
 pub fn command_for(action: UiAction, snapshot: &Snapshot, song: &SongInfo) -> Option<Command> {
     Some(match action {
         UiAction::TogglePlay if is_playing(snapshot.transport) => Command::Pause,
@@ -73,6 +85,23 @@ pub fn command_for(action: UiAction, snapshot: &Snapshot, song: &SongInfo) -> Op
         UiAction::ToggleInfinite => Command::SetInfinite(!snapshot.infinite),
         UiAction::ToggleFade => Command::ToggleFade,
         UiAction::Panic => Command::Panic,
+        UiAction::PreviousSong | UiAction::NextSong | UiAction::SelectItem(_) => return None,
+    })
+}
+
+/// The setlist command `action` sends while a setlist plays: previous, next
+/// and a strip tile move through the setlist; every other control acts on
+/// the current item, as [`command_for`] maps it for a single song.
+pub fn setlist_command_for(
+    action: UiAction,
+    snapshot: &SetlistSnapshot,
+    song: &SongInfo,
+) -> Option<SetlistCommand> {
+    Some(match action {
+        UiAction::PreviousSong => SetlistCommand::Previous,
+        UiAction::NextSong => SetlistCommand::Next,
+        UiAction::SelectItem(item) => SetlistCommand::Select(item),
+        action => SetlistCommand::Item(command_for(action, &snapshot.song, song)?),
     })
 }
 

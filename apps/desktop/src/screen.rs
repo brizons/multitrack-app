@@ -1,6 +1,8 @@
-//! The Perform screen's container: owns the session, polls it on a timer,
-//! turns pointer and key events into view-model actions, and hands a
-//! [`PerformView`] to the presentational code in [`crate::ui`].
+//! The Perform screen's container: owns the session of the song or setlist
+//! that plays, polls it on a timer, turns pointer and key events into
+//! view-model actions, and hands a [`PerformView`] (and, for a setlist, a
+//! [`openvamp_desktop::strip::SetlistView`]) to the presentational code in
+//! [`crate::ui`].
 
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -13,12 +15,12 @@ use gpui::{
     Task, Window, prelude::*,
 };
 use io_cpal::CpalOutput;
-use openvamp_desktop::action::{Intent, UiAction, command_for};
+use openvamp_desktop::action::{Intent, UiAction};
 use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, is_panic_key};
-use openvamp_desktop::song::{Song, close, replace};
-use openvamp_desktop::view::{PerformView, open_error_lines};
+use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
+use openvamp_desktop::view::PerformView;
 
 use crate::ui;
 
@@ -30,7 +32,7 @@ const POLL_EVERY: Duration = Duration::from_millis(33);
 /// The Perform screen.
 pub struct Perform {
     focus: FocusHandle,
-    loaded: Option<Song>,
+    loaded: Option<Show>,
     /// Problems to show, one line each: why the last pick did not open (the
     /// song that was playing goes on), or how the song it replaced closed.
     problems: Vec<String>,
@@ -45,8 +47,9 @@ pub struct Perform {
 }
 
 impl Perform {
-    /// The screen, with the song folder `song_dir` open when one is given.
-    pub fn new(song_dir: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// The screen, with `path` open when one is given: a song folder, or a
+    /// setlist file ([`Source::for_path`]).
+    pub fn new(path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window);
         let poll = cx.spawn(async move |this, cx| {
@@ -81,18 +84,18 @@ impl Perform {
             _deactivated: deactivated,
             _blurred: blurred,
         };
-        if let Some(dir) = song_dir {
-            screen.open_song(&dir);
+        if let Some(path) = path {
+            screen.open_path(&path);
         }
         screen
     }
 
-    /// Stops the song with its ramp, sending a Stop the player refuses
-    /// again within [`openvamp_desktop::song::STOP_WAIT`], then closes
-    /// the session and its device; what went wrong goes to stderr.
+    /// Stops the song or setlist with its ramp, sending a Stop the player
+    /// refuses again within [`openvamp_desktop::song::STOP_WAIT`], then
+    /// closes the session and its device; what went wrong goes to stderr.
     pub fn close_song(&mut self) {
-        if let Some(song) = self.loaded.take()
-            && let Some(problem) = close(song, thread::sleep).problem()
+        if let Some(show) = self.loaded.take()
+            && let Some(problem) = close(show, thread::sleep).problem()
         {
             eprintln!("warning: {problem}");
         }
@@ -103,9 +106,9 @@ impl Perform {
     /// the person confirms ([`end_request`]). Returns whether it ended at
     /// once, which lets the window close.
     fn end_show(&mut self, ending: Ending, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let transport = self.loaded.as_mut().map(|song| {
-            song.poll();
-            song.snapshot.transport
+        let transport = self.loaded.as_mut().map(|show| {
+            show.poll();
+            show.snapshot().transport
         });
         match end_request(transport, self.asking) {
             EndRequest::EndNow => {
@@ -157,15 +160,24 @@ impl Perform {
         .detach();
     }
 
-    /// Opens the song folder `dir` in place of the current song
-    /// ([`replace`]): a folder that does not open leaves the current song
-    /// loaded and playing, and the reasons show on screen; otherwise the
-    /// current song stops with its ramp and closes its device before the
-    /// new song opens the device.
-    fn open_song(&mut self, dir: &Path) {
+    /// Opens what `path` names ([`Source::for_path`]); one that cannot be
+    /// opened says why.
+    fn open_path(&mut self, path: &Path) {
+        match Source::for_path(path) {
+            Ok(source) => self.open(&source),
+            Err(problem) => self.problems = vec![problem],
+        }
+    }
+
+    /// Opens `source` in place of what plays ([`replace`]): a pick that
+    /// does not open leaves the current song or setlist loaded and
+    /// playing, and the reasons show on screen; otherwise what plays stops
+    /// with its ramp and closes its device before the pick opens the
+    /// device.
+    fn open(&mut self, source: &Source) {
         let replaced = replace(
             &mut self.loaded,
-            dir,
+            source,
             &SessionOptions::default(),
             || Box::new(CpalOutput::new()),
             thread::sleep,
@@ -179,9 +191,9 @@ impl Perform {
                 }
             }
             Err(error) => {
-                self.problems = open_error_lines(&error);
+                self.problems = error.lines();
                 self.problems
-                    .insert(0, format!("Could not open {}:", dir.display()));
+                    .insert(0, format!("Could not open {}:", source.describe()));
             }
         }
     }
@@ -200,7 +212,7 @@ impl Perform {
     fn tick(&mut self, cx: &mut Context<Self>) {
         let counting = self.hold.is_counting();
         let fires = self.hold.tick(Instant::now());
-        let Some(song) = &mut self.loaded else {
+        let Some(show) = &mut self.loaded else {
             // Nothing moves without a song, except a hold's fill.
             if counting {
                 cx.notify();
@@ -208,9 +220,9 @@ impl Perform {
             return;
         };
         if fires {
-            send(song, UiAction::Panic);
+            show.send(UiAction::Panic);
         }
-        song.poll();
+        show.poll();
         cx.notify();
     }
 
@@ -224,31 +236,41 @@ impl Perform {
         let now = Instant::now();
         match intent {
             Intent::Ui(action) => {
-                if let Some(song) = &mut self.loaded {
-                    send(song, action);
-                    song.poll();
+                if let Some(show) = &mut self.loaded {
+                    show.send(action);
+                    show.poll();
                 }
             }
             Intent::PanicDown => self.hold.press(now),
             Intent::PanicUp => {
                 if self.hold.release(now)
-                    && let Some(song) = &mut self.loaded
+                    && let Some(show) = &mut self.loaded
                 {
-                    send(song, UiAction::Panic);
+                    show.send(UiAction::Panic);
                 }
             }
-            Intent::OpenSong => self.prompt_for_song(window, cx),
+            Intent::OpenSong => self.prompt_for(Pick::Song, window, cx),
+            Intent::OpenSetlist => self.prompt_for(Pick::Setlist, window, cx),
             Intent::DismissProblems => self.problems.clear(),
         }
         cx.notify();
     }
 
-    fn prompt_for_song(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Open song".into()),
+    /// Asks for a song folder or a setlist file, then opens it.
+    fn prompt_for(&mut self, pick: Pick, _window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(match pick {
+            Pick::Song => PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: false,
+                prompt: Some("Open song".into()),
+            },
+            Pick::Setlist => PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("Open setlist".into()),
+            },
         });
         cx.spawn(async move |this, cx| {
             let chosen = match paths.await {
@@ -264,9 +286,15 @@ impl Perform {
                 }
                 _ => None,
             };
-            if let Some(dir) = chosen {
+            if let Some(path) = chosen {
                 let _ = this.update(cx, |screen, cx| {
-                    screen.open_song(&dir);
+                    match pick {
+                        Pick::Song => screen.open(&Source::Song(path)),
+                        Pick::Setlist => match Source::picked_setlist(&path) {
+                            Ok(source) => screen.open(&source),
+                            Err(problem) => screen.problems = vec![problem],
+                        },
+                    }
                     cx.notify();
                 });
             }
@@ -322,21 +350,29 @@ fn mods(modifiers: &Modifiers) -> Mods {
     }
 }
 
-/// Sends the command `action` stands for; a refused command shows as the
-/// snapshot's last error.
-fn send(song: &mut Song, action: UiAction) {
-    if let Some(command) = command_for(action, &song.snapshot, song.session.song()) {
-        let _ = song.session.send(command);
-    }
+/// What a picker asks for.
+#[derive(Debug, Clone, Copy)]
+enum Pick {
+    /// A song folder.
+    Song,
+    /// A setlist file in the Setlists folder of a library folder.
+    Setlist,
 }
 
 impl Render for Perform {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.loaded {
-            Some(song) => {
-                let view = PerformView::new(&song.snapshot, song.session.song());
-                ui::perform(&view, self.hold.fill(Instant::now()), &self.problems, cx)
-                    .into_any_element()
+            Some(show) => {
+                let view = PerformView::new(show.snapshot(), show.song());
+                let setlist = show.setlist().map(LoadedSetlist::view);
+                ui::perform(
+                    &view,
+                    setlist.as_ref(),
+                    self.hold.fill(Instant::now()),
+                    &self.problems,
+                    cx,
+                )
+                .into_any_element()
             }
             None => ui::no_song(&self.problems, cx).into_any_element(),
         };
@@ -349,9 +385,10 @@ impl Render for Perform {
     }
 }
 
-/// Opens the Perform window for `song_dir`, if any. An error means no
-/// window opened, and so no song or device either.
-pub fn open_window(song_dir: Option<PathBuf>, cx: &mut App) -> gpui::Result<()> {
+/// Opens the Perform window for `path` (a song folder or a setlist file),
+/// if any. An error means no window opened, and so no song or device
+/// either.
+pub fn open_window(path: Option<PathBuf>, cx: &mut App) -> gpui::Result<()> {
     let bounds = gpui::Bounds::centered(None, gpui::size(gpui::px(1366.), gpui::px(900.)), cx);
     let options = gpui::WindowOptions {
         window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
@@ -363,7 +400,7 @@ pub fn open_window(song_dir: Option<PathBuf>, cx: &mut App) -> gpui::Result<()> 
         ..Default::default()
     };
     cx.open_window(options, |window, cx| {
-        let screen = cx.new(|cx| Perform::new(song_dir, window, cx));
+        let screen = cx.new(|cx| Perform::new(path, window, cx));
         // Closing the window while a song plays asks first; otherwise the
         // song stops with its ramp before the window closes.
         let closing = screen.downgrade();

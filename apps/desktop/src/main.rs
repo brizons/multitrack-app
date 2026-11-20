@@ -1,7 +1,8 @@
 //! `openvamp`: the desktop shell for Mac, Windows and Linux (S6).
 //!
-//! Opens the Perform screen, with the song folder given on the command line
-//! when there is one, on the system's default audio output.
+//! Opens the Perform screen, with the song folder or setlist file given on
+//! the command line when there is one, on the system's default audio
+//! output.
 
 #![forbid(unsafe_code)]
 
@@ -16,10 +17,13 @@ use gpui::Application;
 
 const USAGE: &str = "\
 usage: openvamp [SONG_DIR]
+       openvamp SETLIST_FILE
 
 Opens the Perform screen. SONG_DIR is a song folder: song.json and the WAV
-stems it lists; without it, use \"Open song…\" (Cmd/Ctrl-O). The song plays
-on the system's default audio output, at the song's sample rate.";
+stems it lists; without it, use \"Open song…\" (Cmd/Ctrl-O) or \"Open
+setlist…\". SETLIST_FILE is a file ending in .setlist.json in the Setlists
+folder of a library folder, whose songs are in that library folder. Songs
+play on the system's default audio output, at their sample rate.";
 
 /// The exit code when the window cannot open. macOS ends the app from
 /// inside its run loop, so this exits the process at once; nothing has
@@ -28,7 +32,7 @@ const WINDOW_FAILED: i32 = 1;
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
-    let song_dir = args.next().map(PathBuf::from);
+    let path = args.next().map(PathBuf::from);
     let extra: Vec<String> = args
         .map(|arg| format!("{:?}", arg.to_string_lossy()))
         .collect();
@@ -44,8 +48,8 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    if let Some(dir) = &song_dir
-        && let Some(flag) = dir.to_str().filter(|arg| arg.starts_with('-'))
+    if let Some(path) = &path
+        && let Some(flag) = path.to_str().filter(|arg| arg.starts_with('-'))
     {
         if flag == "-h" || flag == "--help" {
             println!("{USAGE}");
@@ -62,7 +66,7 @@ fn main() -> ExitCode {
             }
         })
         .detach();
-        if let Err(error) = screen::open_window(song_dir, cx) {
+        if let Err(error) = screen::open_window(path, cx) {
             eprintln!("error: cannot open the window: {error}");
             std::process::exit(WINDOW_FAILED);
         }
