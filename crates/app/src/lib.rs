@@ -66,6 +66,7 @@
 
 mod error;
 mod item;
+mod mixer;
 mod output;
 mod renderer;
 mod routing;
@@ -77,6 +78,7 @@ pub mod testing;
 pub use engine::live::{FadeState, JumpKind, JumpTiming};
 pub use error::{OpenError, RuntimeError};
 pub use library::{LoadError, SongProblem};
+pub use mixer::StemView;
 pub use output::{
     AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceChoice, DeviceInfo, LossReason, MAX_BUFFER_FRAMES,
     MIN_BUFFER_FRAMES, OutputCheck, OutputError, OutputRequest, OutputStream, StreamHealth,

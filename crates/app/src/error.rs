@@ -112,6 +112,24 @@ pub enum RuntimeError {
         /// The command that was not sent.
         command: String,
     },
+    /// A mixer command for a stem the song does not have.
+    #[error("stem {stem} is not in the song, which has {stems} stem(s)")]
+    UnknownStem {
+        /// The requested stem.
+        stem: usize,
+        /// Stems in the song.
+        stems: usize,
+    },
+    /// A mixer command with a volume that is neither silent nor a number of
+    /// dB up to [`domain::MAX_VOLUME_DB`].
+    #[error(
+        "a volume is silent or at most {} dB, not {db} dB",
+        domain::MAX_VOLUME_DB
+    )]
+    InvalidVolume {
+        /// The requested volume in dB, as written.
+        db: String,
+    },
     /// A jump to a position outside the arrangement.
     #[error("position {position} is outside the arrangement, which has {positions} positions")]
     UnknownPosition {

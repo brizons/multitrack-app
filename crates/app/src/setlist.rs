@@ -7,8 +7,8 @@ use std::mem;
 use std::path::PathBuf;
 
 use domain::{
-    CROSSFADE_SECONDS, ClickItem, Routing, SetlistItem, SetlistValidationError, SongItem,
-    SongLookup, Transition,
+    BusSettings, CROSSFADE_SECONDS, ClickItem, MixFile, Routing, SetlistItem,
+    SetlistValidationError, SongItem, SongLookup, Transition,
 };
 use engine::live::{DeckStatus, Handoff};
 use library::{DiskMonitor, Library, SetlistError, SetlistSongs};
@@ -610,6 +610,30 @@ impl SetlistSession {
         self.session.set_routing(routing)
     }
 
+    /// The current song's folder and the `mix.json` to write there to save
+    /// its mix as it plays, as [`crate::Session::mix_file`] gives them;
+    /// `None` for a click-only tile.
+    pub fn mix_file(&self) -> Option<(PathBuf, MixFile)> {
+        self.session.mix_file()
+    }
+
+    /// The current song's mix as it plays was saved
+    /// ([`crate::Session::mix_saved`]).
+    pub fn mix_saved(&mut self) {
+        self.session.mix_saved();
+    }
+
+    /// The global bus and master settings as they play, to save.
+    pub fn bus_settings(&self) -> &BusSettings {
+        self.session.bus_settings()
+    }
+
+    /// The bus settings as they play were saved
+    /// ([`crate::Session::bus_settings_saved`]).
+    pub fn bus_settings_saved(&mut self) {
+        self.session.bus_settings_saved();
+    }
+
     /// Sends `command`. An error from the current item is also kept as
     /// [`Snapshot::last_error`], as a single-song session keeps it.
     pub fn send(&mut self, command: SetlistCommand) -> Result<(), SetlistCommandError> {
@@ -981,9 +1005,10 @@ impl SetlistSession {
             info,
             player,
             monitor,
+            mix,
             ..
         } = pending.item;
-        if self.session.cue(player, tag, handoff).is_ok() {
+        if self.session.cue(player, mix, tag, handoff).is_ok() {
             self.cued = Some(Staged {
                 index: pending.index,
                 tag,

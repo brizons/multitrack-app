@@ -6,9 +6,12 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use domain::{DEFAULT_ARRANGEMENT_ID, DEFAULT_SEAM_CROSSFADE, Routing};
+use domain::{
+    ArrangementMix, Bus, BusSettings, DEFAULT_ARRANGEMENT_ID, DEFAULT_SEAM_CROSSFADE, MixFile,
+    MixValidationError, Routing, Volume, bus_for_stem,
+};
 use engine::live::{
-    self, DECLICK_FRAMES, DEFAULT_FADE_SECONDS, Deck, DeckController, DeckStatus, FadeState,
+    self, DECLICK_FRAMES, DEFAULT_FADE_SECONDS, Deck, DeckController, DeckStatus, FadeState, Gain,
     Handoff, JumpKind, JumpTiming, PANIC_MILLISECONDS, Player, SendError, Transport,
 };
 use library::{DiskMonitor, Gate};
@@ -16,6 +19,7 @@ use rtrb::Consumer;
 
 use crate::error::{OpenError, RuntimeError};
 use crate::item::Item;
+use crate::mixer::{ItemMix, StemView};
 use crate::output::{
     AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceChoice, LossReason, MAX_BUFFER_FRAMES,
     MIN_BUFFER_FRAMES, OutputCheck, OutputError, OutputRequest, OutputStream, StreamHealth,
@@ -70,6 +74,11 @@ pub struct SessionOptions {
     /// ([`Session::set_routing`]) plays on those outputs at most.
     /// Default: `None`.
     pub routing: Option<Routing>,
+    /// The global bus and master settings (F7.5), as the shell keeps them
+    /// (`library::ConfigStore::load_bus_settings`); they carry from song to
+    /// song. Default: every bus and the master at unity
+    /// ([`BusSettings::new`]).
+    pub bus_settings: BusSettings,
 }
 
 impl Default for SessionOptions {
@@ -83,6 +92,7 @@ impl Default for SessionOptions {
             reconnect_interval: Duration::from_millis(500),
             disk_gate: None,
             routing: None,
+            bus_settings: BusSettings::new(),
         }
     }
 }
@@ -122,6 +132,57 @@ pub enum Command {
     SetFadeDuration(Duration),
     /// Fades everything out in 0.5 s and stops (F6.6).
     Panic,
+    /// Sets the volume of stem `stem`, an index into [`MixerView::stems`]
+    /// (F7.1). Like every mixer command, it ramps over 20 ms while the
+    /// transport plays (F7.4) and changes the mix as it plays
+    /// ([`MixerView::mix`]), not `mix.json`.
+    SetStemVolume {
+        /// Index into [`MixerView::stems`].
+        stem: usize,
+        /// Silent, or up to [`domain::MAX_VOLUME_DB`].
+        volume: Volume,
+    },
+    /// Mutes or unmutes stem `stem` (F7.1).
+    SetStemMute {
+        /// Index into [`MixerView::stems`].
+        stem: usize,
+        /// Whether it is muted.
+        mute: bool,
+    },
+    /// Solos stem `stem` or ends its solo (F7.1): while a stem is soloed,
+    /// the stems that are not are silent, except click and guide (F7.3).
+    SetStemSolo {
+        /// Index into [`MixerView::stems`].
+        stem: usize,
+        /// Whether it is soloed.
+        solo: bool,
+    },
+    /// Sends stem `stem` to `bus`, or back to the bus the rules table
+    /// gives it with `None` (F7.2); it crossfades between the two buses'
+    /// outputs.
+    SetStemBus {
+        /// Index into [`MixerView::stems`].
+        stem: usize,
+        /// The bus, or `None` for the rules table's.
+        bus: Option<Bus>,
+    },
+    /// Sets the volume of `bus`, for every song (F7.1, F7.5).
+    SetBusVolume {
+        /// The bus.
+        bus: Bus,
+        /// Silent, or up to [`domain::MAX_VOLUME_DB`].
+        volume: Volume,
+    },
+    /// Mutes or unmutes `bus`, for every song: every stem in it goes silent
+    /// and comes back at its level (F7 acceptance).
+    SetBusMute {
+        /// The bus.
+        bus: Bus,
+        /// Whether it is muted.
+        mute: bool,
+    },
+    /// Sets the master volume, for every song (F7.1).
+    SetMasterVolume(Volume),
 }
 
 /// What the transport is doing.
@@ -202,6 +263,26 @@ pub enum DeviceStatus {
 /// save.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MixerView {
+    /// The current item's stems, in package order: the order mixer
+    /// commands number them in.
+    pub stems: Vec<StemView>,
+    /// The current arrangement's mix as it plays.
+    pub mix: ArrangementMix,
+    /// Whether [`Self::mix`] differs from the song's `mix.json` as it was
+    /// read or last saved ([`Session::mix_saved`]).
+    pub mix_changed: bool,
+    /// Why the song's `mix.json` could not be used, so the default mix
+    /// plays: unreadable, malformed, or a newer format. The file is left as
+    /// it is.
+    pub mix_error: Option<String>,
+    /// The rules the song's `mix.json` breaks against the song; the mix is
+    /// still used, and entries the song lacks are ignored.
+    pub mix_problems: Vec<MixValidationError>,
+    /// The global bus and master settings.
+    pub buses: BusSettings,
+    /// Whether [`Self::buses`] differ from [`SessionOptions::bus_settings`]
+    /// or from what was last saved ([`Session::bus_settings_saved`]).
+    pub buses_changed: bool,
     /// The routing in use: [`SessionOptions::routing`] (or
     /// [`Session::set_routing`]'s), or plain stereo, fitted to the device's
     /// outputs.
@@ -209,9 +290,16 @@ pub struct MixerView {
 }
 
 impl Default for MixerView {
-    /// Plain stereo on outputs 1 and 2.
+    /// No stems, every level at unity, plain stereo on outputs 1 and 2.
     fn default() -> Self {
         Self {
+            stems: Vec::new(),
+            mix: ArrangementMix::default(),
+            mix_changed: false,
+            mix_error: None,
+            mix_problems: Vec::new(),
+            buses: BusSettings::new(),
+            buses_changed: false,
             routing: Routing::stereo(2),
         }
     }
@@ -343,6 +431,17 @@ pub struct Session {
     /// The routing in use changed while the device was away: say so once
     /// it plays again.
     refit_pending: bool,
+    /// The global bus and master settings, and as last saved.
+    buses: BusSettings,
+    buses_saved: BusSettings,
+    /// The current item's mix.
+    mix: ItemMix,
+    /// The cued item's, and the one sent back last, by their deck numbers:
+    /// a handoff makes one of them current.
+    cued_mix: Option<(u64, ItemMix)>,
+    withdrawn_mix: Option<(u64, ItemMix)>,
+    /// The generated click's gain, as the players have it.
+    click_gain: f32,
 }
 
 /// A song folder opened for streaming with its player built, ready to play
@@ -360,6 +459,8 @@ pub struct PreparedSong {
     start_timeout: Duration,
     reconnect_interval: Duration,
     router: Router,
+    mix: ItemMix,
+    buses: BusSettings,
 }
 
 impl PreparedSong {
@@ -370,9 +471,11 @@ impl PreparedSong {
             mut player,
             controller: _,
             monitor,
+            mut mix,
         } = item;
         let router = Router::new(options.routing.clone());
         player.set_routes(router.routes());
+        mix.prime(&mut player, &options.bus_settings);
         let channels = player.channels();
         let (deck, controller) = Deck::new(player, tag, options.buffer_frames as usize);
         let first = Report {
@@ -399,6 +502,8 @@ impl PreparedSong {
             start_timeout: options.start_timeout,
             reconnect_interval: options.reconnect_interval,
             router,
+            mix,
+            buses: options.bus_settings.clone(),
         }
     }
 
@@ -437,7 +542,10 @@ impl PreparedSong {
             start_timeout,
             reconnect_interval,
             router,
+            mix,
+            buses,
         } = self;
+        let click_gain = buses.bus_gain(Bus::ClickGuide);
         let mut session = Session {
             song: info,
             output,
@@ -459,6 +567,12 @@ impl PreparedSong {
             sent: 0,
             router,
             refit_pending: false,
+            buses_saved: buses.clone(),
+            buses,
+            mix,
+            cued_mix: None,
+            withdrawn_mix: None,
+            click_gain,
         };
         match session.open_held(state) {
             Ok((stream, home)) => {
@@ -554,6 +668,33 @@ impl Session {
         Ok(())
     }
 
+    /// The song folder and the `mix.json` to write there to save the mix as
+    /// it plays (`library::write_mix`): the file as it was read, with the
+    /// current arrangement's mix replaced; `None` for a click-only tile.
+    /// Call [`Self::mix_saved`] once it is written.
+    pub fn mix_file(&self) -> Option<(std::path::PathBuf, MixFile)> {
+        self.mix.to_save()
+    }
+
+    /// The mix as it plays was saved: [`MixerView::mix_changed`] compares
+    /// with it from now on.
+    pub fn mix_saved(&mut self) {
+        self.mix.saved();
+    }
+
+    /// The global bus and master settings as they play, to save
+    /// (`library::ConfigStore::save_bus_settings`); call
+    /// [`Self::bus_settings_saved`] once they are.
+    pub fn bus_settings(&self) -> &BusSettings {
+        &self.buses
+    }
+
+    /// The bus settings as they play were saved: [`MixerView::buses_changed`]
+    /// compares with them from now on.
+    pub fn bus_settings_saved(&mut self) {
+        self.buses_saved = self.buses.clone();
+    }
+
     /// Moves the session on and returns its state: starts a play that waited
     /// for the disk, notices a lost device (pausing the transport) and opens
     /// it again when it is back, and records decode failures and waiting
@@ -603,6 +744,13 @@ impl Session {
                 frames: self.fade_frames(duration),
             },
             Command::Panic => live::Command::Panic,
+            Command::SetStemVolume { .. }
+            | Command::SetStemMute { .. }
+            | Command::SetStemSolo { .. }
+            | Command::SetStemBus { .. }
+            | Command::SetBusVolume { .. }
+            | Command::SetBusMute { .. }
+            | Command::SetMasterVolume(_) => return self.mixer(command),
         };
         self.forward(engine_command)?;
         if let Command::SetJumpTiming(timing) = command {
@@ -612,6 +760,112 @@ impl Session {
             let frames = self.fade_frames(duration).max(DECLICK_FRAMES);
             self.fade_duration =
                 Duration::from_secs_f64(frames as f64 / f64::from(self.song.sample_rate));
+        }
+        Ok(())
+    }
+
+    /// Changes the mix or the bus settings as `command`, a mixer command,
+    /// says, then sends the players what that changes. A command refused
+    /// (an unknown stem, a volume out of range) changes nothing.
+    fn mixer(&mut self, command: Command) -> Result<(), RuntimeError> {
+        let valid = |volume: Volume| {
+            if volume.is_valid() {
+                Ok(())
+            } else {
+                Err(RuntimeError::InvalidVolume {
+                    db: volume.db().to_string(),
+                })
+            }
+        };
+        let stem = |stem: usize| {
+            let stems = self.mix.stems();
+            stems.get(stem).cloned().ok_or(RuntimeError::UnknownStem {
+                stem,
+                stems: stems.len(),
+            })
+        };
+        match command {
+            Command::SetStemVolume {
+                stem: index,
+                volume,
+            } => {
+                valid(volume)?;
+                let stem = stem(index)?;
+                self.change_stem(&stem.id, |mix| mix.volume = volume);
+            }
+            Command::SetStemMute { stem: index, mute } => {
+                let stem = stem(index)?;
+                self.change_stem(&stem.id, |mix| mix.mute = mute);
+            }
+            Command::SetStemSolo { stem: index, solo } => {
+                let stem = stem(index)?;
+                self.change_stem(&stem.id, |mix| mix.solo = solo);
+            }
+            Command::SetStemBus { stem: index, bus } => {
+                let stem = stem(index)?;
+                // The rules table's bus is stored as no choice at all.
+                let bus = bus.filter(|&bus| bus != bus_for_stem(&stem));
+                self.change_stem(&stem.id, |mix| mix.set_bus(bus));
+            }
+            Command::SetBusVolume { bus, volume } => {
+                valid(volume)?;
+                let mut level = self.buses.level(bus);
+                level.volume = volume;
+                self.buses.set_level(bus, level);
+            }
+            Command::SetBusMute { bus, mute } => {
+                let mut level = self.buses.level(bus);
+                level.mute = mute;
+                self.buses.set_level(bus, level);
+            }
+            Command::SetMasterVolume(volume) => {
+                valid(volume)?;
+                self.buses.master_volume = volume;
+            }
+            _ => {}
+        }
+        self.send_gains()
+    }
+
+    fn change_stem(&mut self, id: &str, change: impl FnOnce(&mut domain::StemMix)) {
+        let mut stem = self.mix.mix.stem(id);
+        change(&mut stem);
+        self.mix.mix.set_stem(id, stem);
+    }
+
+    /// Sends the current and the cued item the gains their mixes and the
+    /// bus settings give, and every item the click's gain: only what
+    /// changed, each item by its deck number, so a handoff on its way does
+    /// not give one item's gains to another's stems.
+    fn send_gains(&mut self) -> Result<(), RuntimeError> {
+        let mut result = Ok(());
+        let current = self.item;
+        let mut mix = mem::replace(&mut self.mix, ItemMix::click());
+        result = result.and(self.send_mix(current, &mut mix));
+        self.mix = mix;
+        if let Some((tag, mut mix)) = self.cued_mix.take() {
+            result = result.and(self.send_mix(tag, &mut mix));
+            self.cued_mix = Some((tag, mix));
+        }
+        let click = self.buses.bus_gain(Bus::ClickGuide);
+        if click != self.click_gain && result.is_ok() {
+            result = self
+                .push(live::Command::SetClickGain(Gain::new(click)))
+                .map_err(queue_full);
+            if result.is_ok() {
+                self.click_gain = click;
+            }
+        }
+        self.apply_if_held();
+        result
+    }
+
+    /// Sends item `item` what takes it to `mix` with the bus settings.
+    fn send_mix(&mut self, item: u64, mix: &mut ItemMix) -> Result<(), RuntimeError> {
+        for (stem, target, command) in mix.changes(&self.buses) {
+            self.deck.send_to(item, command).map_err(queue_full)?;
+            self.sent += 1;
+            mix.sent(stem, target, command);
         }
         Ok(())
     }
@@ -717,18 +971,7 @@ impl Session {
     /// Sends `command` to the player. While the device is lost the control
     /// thread holds the player, so it applies the command at once.
     fn forward(&mut self, command: live::Command) -> Result<(), RuntimeError> {
-        self.push(command).map_err(|error| match error {
-            SendError::Full(command) => RuntimeError::QueueFull {
-                command: format!("{command:?}"),
-            },
-            SendError::UnknownPosition {
-                position,
-                positions,
-            } => RuntimeError::UnknownPosition {
-                position,
-                positions,
-            },
-        })?;
+        self.push(command).map_err(queue_full)?;
         self.apply_if_held();
         Ok(())
     }
@@ -1023,6 +1266,13 @@ impl Session {
             },
             device,
             mixer: MixerView {
+                stems: self.mix.views(),
+                mix: self.mix.mix.clone(),
+                mix_changed: self.mix.changed(),
+                mix_error: self.mix.error().map(str::to_owned),
+                mix_problems: self.mix.problems().to_vec(),
+                buses: self.buses.clone(),
+                buses_changed: self.buses != self.buses_saved,
                 routing: self.router.routing().clone(),
             },
             underruns: status.underruns,
@@ -1070,6 +1320,10 @@ impl Session {
     /// `song`, and its disk is watched through `monitor`. A waiting play
     /// and the problems that belonged to the item before end with it.
     pub(crate) fn bind(&mut self, song: SongInfo, monitor: DiskMonitor, item: u64) {
+        let handed_over = [&mut self.cued_mix, &mut self.withdrawn_mix]
+            .into_iter()
+            .find(|mix| mix.as_ref().is_some_and(|(tag, _)| *tag == item))
+            .and_then(Option::take);
         self.song = song;
         self.monitor = monitor;
         self.item = item;
@@ -1086,25 +1340,48 @@ impl Session {
         ) {
             self.last_error = None;
         }
+        // An item the deck handed over to plays its own mix from now on.
+        // One sent back first missed the bus changes since: they follow.
+        if let Some((_, mix)) = handed_over {
+            self.mix = mix;
+            if let Err(error) = self.send_gains() {
+                self.last_error = Some(error);
+            }
+        }
     }
 
-    /// Cues `player` as item `item`, to follow the current one with
-    /// `handoff`.
+    /// Cues `player` as item `item`, with its `mix`, to follow the current
+    /// one with `handoff`. It takes the routing, the mix's gains and the bus
+    /// settings first.
     pub(crate) fn cue(
         &mut self,
         mut player: Player,
+        mut mix: ItemMix,
         item: u64,
         handoff: Handoff,
     ) -> Result<(), RuntimeError> {
-        player.set_routes(self.router.routes());
+        self.prime(&mut player, &mut mix);
         let sent = self.deck.cue(player, item, handoff);
-        self.count(sent.is_ok(), "Cue")
+        self.count(sent.is_ok(), "Cue")?;
+        self.cued_mix = Some((item, mix));
+        Ok(())
     }
 
     /// Sends the cued item back.
     pub(crate) fn uncue(&mut self) -> Result<(), RuntimeError> {
         let sent = self.deck.uncue();
-        self.count(sent.is_ok(), "Uncue")
+        self.count(sent.is_ok(), "Uncue")?;
+        if let Some(cued) = self.cued_mix.take() {
+            self.withdrawn_mix = Some(cued);
+        }
+        Ok(())
+    }
+
+    /// Gives a player about to join the deck the routing in use, and its
+    /// mix's gains with the bus settings.
+    fn prime(&self, player: &mut Player, mix: &mut ItemMix) {
+        player.set_routes(self.router.routes());
+        mix.prime(player, &self.buses);
     }
 
     /// Makes `item` the current item as `tag`, stopped at its start; the
@@ -1114,12 +1391,14 @@ impl Session {
             info,
             mut player,
             monitor,
+            mut mix,
             ..
         } = item;
-        player.set_routes(self.router.routes());
+        self.prime(&mut player, &mut mix);
         let sent = self.deck.select(player, tag);
         self.count(sent.is_ok(), "Select")?;
         self.bind(info, monitor, tag);
+        self.mix = mix;
         Ok(())
     }
 
@@ -1169,9 +1448,10 @@ impl Session {
             info,
             mut player,
             monitor,
+            mut mix,
             ..
         } = item;
-        player.set_routes(self.router.routes());
+        self.prime(&mut player, &mut mix);
         let rate = info.sample_rate;
         // With no player left nothing is sent: the item is dropped here,
         // on the control thread, with its disk thread.
@@ -1198,6 +1478,7 @@ impl Session {
         state.deck.process(&mut []);
         state.publish();
         self.bind(info, monitor, tag);
+        self.mix = mix;
         self.request.sample_rate = rate;
         self.open_or_hold(state, LossReason::StreamInvalidated);
         match self.link {
@@ -1214,6 +1495,22 @@ type Opened = Result<
     (Box<dyn OutputStream>, Consumer<Box<AudioState>>),
     (Option<Box<AudioState>>, OutputError),
 >;
+
+/// The error a full queue to the audio thread gives.
+fn queue_full(error: SendError) -> RuntimeError {
+    match error {
+        SendError::Full(command) => RuntimeError::QueueFull {
+            command: format!("{command:?}"),
+        },
+        SendError::UnknownPosition {
+            position,
+            positions,
+        } => RuntimeError::UnknownPosition {
+            position,
+            positions,
+        },
+    }
+}
 
 /// Whether opening failed because the device is not there.
 fn is_absent(error: &OutputError) -> bool {
