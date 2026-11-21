@@ -30,6 +30,7 @@ pub mod hold;
 pub mod keys;
 pub mod library_page;
 pub mod line_edit;
+pub mod mixer;
 pub mod reorder;
 pub mod shelf;
 pub mod show;

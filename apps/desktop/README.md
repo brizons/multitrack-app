@@ -43,7 +43,7 @@ Closing a song (opening another one, closing the window, quitting) stops it with
 
 ## The Library & setlists screen
 
-The side navigation switches between **Perform** and **Library** (the design canvas's other screens are not built yet, so they are not shown). The Library screen shows one library folder: the one picked with **Open library…**, which stays, or, until one is picked, the library of the setlist on the Perform screen, which it follows when a setlist from another library is opened there. Renaming the setlist that is on Perform, or the first change that moves a hand-named file, is followed there: it opens again from its new file and stays marked.
+The side navigation switches between **Perform**, **Library** and **Mixer** (the design canvas's other screens are not built yet, so they are not shown). The Library screen shows one library folder: the one picked with **Open library…**, which stays, or, until one is picked, the library of the setlist on the Perform screen, which it follows when a setlist from another library is opened there. Renaming the setlist that is on Perform, or the first change that moves a hand-named file, is followed there: it opens again from its new file and stays marked.
 
 | Area | Shows and does |
 |------|----------------|
@@ -54,6 +54,12 @@ The side navigation switches between **Perform** and **Library** (the design can
 Every change is saved at once through the `library` crate, which writes the setlist file atomically and never overwrites another setlist; a name another setlist already uses is refused and says so. When a setlist is saved but its place in the stored order cannot be written, a warning (not a failure) says so, and the setlist is listed after the ordered ones until it is moved. A setlist file named by hand is moved to the file its name maps to on its first change, so it never ends up in two files. The Perform screen plays a setlist as it was when it was opened: changes to it play once it is opened again, which the editor says while it is open there.
 
 The setlist's name and the song search are typed with the keyboard while they have the focus: Enter keeps the text, Escape leaves it (a rename is not made, the search is cleared), Backspace deletes the last character, Cmd-V (Ctrl-V elsewhere) pastes. Every other key types, Space, `x` and the digits too, so the transport keys and the panic key do nothing while typing; Cmd/Ctrl-O and Cmd/Ctrl-Q still work. There is no caret to move and no input-method composition, since gpui 0.2.2 has no text field of its own.
+
+## The Mixer screen
+
+The Mixer mixes the song on Perform (a setlist's current item) as it plays (F7). **Stems** has a strip per stem: its name, a bus chip, a fader, its level in dB and **M** and **S**. The bus chip shows its choices: **Default** puts the stem back on the bus the rules table gives it, any other bus moves it there. **Buses** has a strip per bus with the output it plays on in the routing in use ("Out 1", "Out 7/8"), a fader, its level and **M**, then the master. A fader drags smoothly and sends its level as it moves; a double click puts it back at 0 dB; at the bottom it reads `-inf`, at the top +12 dB, with 0 dB a little above the middle. A stem that plays nothing (muted, its bus muted, or another stem soloed; solo never silences click or guide) is drawn dimmed.
+
+**Save mix to arrangement** writes the stems' levels, mutes, solos and buses to the song's `mix.json` for the arrangement playing; it is offered only when the mix differs from what that file holds, and a folder that refuses the file says why. **Reset to song mix** puts every stem back at 0 dB, unmuted, unsoloed and on its own bus, as the song plays with no saved mix; saving then forgets the arrangement's mix. Bus and master levels are global: they carry from song to song and are saved to the app's settings folder half a second after the last change (and before a song closes), so the next session opens with them. There are no meters: the engine does not report levels yet.
 
 ## Keys
 

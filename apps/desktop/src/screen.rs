@@ -22,13 +22,14 @@ use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_req
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
 use openvamp_desktop::library_page::{Dragged, LibraryPage, Opened, library_to_open};
+use openvamp_desktop::mixer::{MixerAction, MixerPage};
 use openvamp_desktop::reorder::Half;
 use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
 use openvamp_desktop::view::PerformView;
 
 use crate::library_ui::{DraggedItem, DraggedSetlist};
 use crate::ui::DraggedTile;
-use crate::{library_ui, ui};
+use crate::{library_ui, mixer_ui, ui};
 
 /// How often the session is polled: about 30 Hz (Decision 3). The timer
 /// keeps running while the window is hidden, since a waiting play starts
@@ -57,6 +58,8 @@ pub struct Perform {
     library_problem: Option<String>,
     /// The saved routings and bus settings every session opens with.
     settings: AudioSettings,
+    /// The Mixer screen's own state.
+    mixer: MixerPage,
     _poll: Task<()>,
     _quit: Subscription,
     _deactivated: Subscription,
@@ -101,6 +104,7 @@ impl Perform {
             opened: Opened::Followed,
             library_problem: None,
             settings: AudioSettings::load(ConfigStore::from_environment()),
+            mixer: MixerPage::new(),
             _poll: poll,
             _quit: quit,
             _deactivated: deactivated,
@@ -116,6 +120,7 @@ impl Perform {
     /// refuses again within [`openvamp_desktop::song::STOP_WAIT`], then
     /// closes the session and its device; what went wrong goes to stderr.
     pub fn close_song(&mut self) {
+        self.save_waiting_buses();
         if let Some(show) = self.loaded.take()
             && let Some(problem) = close(show, thread::sleep).problem()
         {
@@ -197,7 +202,9 @@ impl Perform {
     /// with its ramp and closes its device before the pick opens the
     /// device.
     fn open(&mut self, source: &Source) {
-        // The saved routing of the device it opens on, and the bus settings.
+        // The saved routing of the device it opens on, and the bus settings,
+        // with the last bus changes in them.
+        self.save_waiting_buses();
         let devices = CpalOutput::new().devices().unwrap_or_default();
         let options = self.settings.options(&devices);
         let replaced = replace(
@@ -236,7 +243,11 @@ impl Perform {
     /// that is complete.
     fn tick(&mut self, cx: &mut Context<Self>) {
         let counting = self.hold.is_counting();
-        let fires = self.hold.tick(Instant::now());
+        let now = Instant::now();
+        let fires = self.hold.tick(now);
+        if let Some(show) = &mut self.loaded {
+            self.mixer.tick(show, &mut self.settings, now);
+        }
         let Some(show) = &mut self.loaded else {
             // Nothing moves without a song, except a hold's fill.
             if counting {
@@ -388,6 +399,28 @@ impl Perform {
             if let Some(show) = &mut self.loaded {
                 show.follow_move(&root, &from, &to);
             }
+        }
+    }
+
+    /// Carries out what a Mixer screen control asks for; nothing while the
+    /// question before ending the show is open.
+    pub fn mixer_act(&mut self, action: MixerAction, cx: &mut Context<Self>) {
+        if self.asking {
+            return;
+        }
+        if let Some(show) = &mut self.loaded {
+            self.mixer.act(action, show, Instant::now());
+            cx.notify();
+        }
+    }
+
+    /// Saves bus and master changes that wait for their delay, before the
+    /// song that has them closes.
+    fn save_waiting_buses(&mut self) {
+        if self.mixer.buses_waiting()
+            && let Some(show) = &mut self.loaded
+        {
+            self.mixer.save_buses(show, &mut self.settings);
         }
     }
 
@@ -675,6 +708,10 @@ impl Render for Perform {
                 .into_any_element()
             }
             (Page::Perform, None) => ui::no_song(&self.problems, cx).into_any_element(),
+            (Page::Mixer, show) => match self.mixer.view(show.as_ref()) {
+                Some(view) => mixer_ui::mixer(&view, cx).into_any_element(),
+                None => mixer_ui::no_mixer().into_any_element(),
+            },
         };
         ui::root(&self.focus, cx)
             .on_key_down(cx.listener(Self::key_down))
