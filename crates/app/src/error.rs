@@ -112,6 +112,14 @@ pub enum RuntimeError {
         /// The command that was not sent.
         command: String,
     },
+    /// A buffer size outside what F8.5 allows.
+    #[error(
+        "the buffer size must be {MIN_BUFFER_FRAMES} to {MAX_BUFFER_FRAMES} frames, not {frames}"
+    )]
+    BufferSize {
+        /// The requested frames.
+        frames: u32,
+    },
     /// A mixer command for a stem the song does not have.
     #[error("stem {stem} is not in the song, which has {stems} stem(s)")]
     UnknownStem {

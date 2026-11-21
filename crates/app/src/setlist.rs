@@ -610,6 +610,14 @@ impl SetlistSession {
         self.session.set_routing(routing)
     }
 
+    /// Plays with a buffer of `frames` frames from now on, as
+    /// [`crate::Session::set_buffer_frames`] does, for every item.
+    pub fn set_buffer_frames(&mut self, frames: u32) -> Result<(), RuntimeError> {
+        self.session.set_buffer_frames(frames)?;
+        self.options.buffer_frames = frames;
+        Ok(())
+    }
+
     /// The current song's folder and the `mix.json` to write there to save
     /// its mix as it plays, as [`crate::Session::mix_file`] gives them;
     /// `None` for a click-only tile.

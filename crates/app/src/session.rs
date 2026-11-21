@@ -668,6 +668,27 @@ impl Session {
         Ok(())
     }
 
+    /// Plays with a buffer of `frames` frames per callback from now on,
+    /// [`MIN_BUFFER_FRAMES`] to [`MAX_BUFFER_FRAMES`] (F8.5); the latency it
+    /// adds is [`StreamInfo::latency`]. The stream opens again with it and
+    /// the transport goes on where it was, after a gap as long as the
+    /// device takes to open; the players stay as they are, since they render
+    /// any buffer in pieces of the size they were built with. A device that
+    /// refuses the size is held as a lost one, saying why
+    /// ([`RuntimeError::DeviceReopenFailed`]), until a size it takes is set.
+    pub fn set_buffer_frames(&mut self, frames: u32) -> Result<(), RuntimeError> {
+        if !(MIN_BUFFER_FRAMES..=MAX_BUFFER_FRAMES).contains(&frames) {
+            let error = RuntimeError::BufferSize { frames };
+            self.last_error = Some(error.clone());
+            return Err(error);
+        }
+        if frames != self.request.buffer_frames {
+            self.request.buffer_frames = frames;
+            self.reopen_stream();
+        }
+        Ok(())
+    }
+
     /// The song folder and the `mix.json` to write there to save the mix as
     /// it plays (`library::write_mix`): the file as it was read, with the
     /// current arrangement's mix replaced; `None` for a click-only tile.
