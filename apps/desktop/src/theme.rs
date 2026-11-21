@@ -158,16 +158,36 @@ pub fn faded(color: Rgba, alpha: f32) -> Rgba {
     Rgba { a: alpha, ..color }
 }
 
-/// Monospace family for times, counts and keys; the system UI font is
-/// used for everything else (the canvas's Barlow and JetBrains Mono are not
-/// bundled).
-pub const MONO: &str = if cfg!(target_os = "macos") {
-    "Menlo"
-} else if cfg!(target_os = "windows") {
-    "Consolas"
-} else {
-    "DejaVu Sans Mono"
-};
+/// The design canvas's UI font, for every text not named otherwise.
+pub const UI: &str = "Barlow";
+
+/// The canvas's condensed font, for strip, pad and stem labels and M/S.
+pub const CONDENSED: &str = "Barlow Semi Condensed";
+
+/// The canvas's monospace font, for times, dB, counts and meta lines.
+pub const MONO: &str = "JetBrains Mono";
+
+/// The fonts the app carries (SIL Open Font License, each with its
+/// license file in `assets/fonts`), loaded at startup ([`load_fonts`]).
+const FONTS: &[&[u8]] = &[
+    include_bytes!("../assets/fonts/Barlow-Regular.ttf"),
+    include_bytes!("../assets/fonts/Barlow-Medium.ttf"),
+    include_bytes!("../assets/fonts/Barlow-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/Barlow-Bold.ttf"),
+    include_bytes!("../assets/fonts/BarlowSemiCondensed-Medium.ttf"),
+    include_bytes!("../assets/fonts/BarlowSemiCondensed-SemiBold.ttf"),
+    include_bytes!("../assets/fonts/BarlowSemiCondensed-Bold.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMono[wght].ttf"),
+];
+
+/// Gives GPUI the fonts the app carries; a font it refuses leaves its
+/// texts in the system font.
+pub fn load_fonts(cx: &mut gpui::App) {
+    let fonts = FONTS.iter().map(|font| Cow::Borrowed(*font)).collect();
+    if let Err(error) = cx.text_system().add_fonts(fonts) {
+        eprintln!("warning: the app's fonts could not be loaded: {error}");
+    }
+}
 
 /// The icons, by the path [`gpui::svg`] asks for.
 pub struct Icons;

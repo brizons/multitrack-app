@@ -89,6 +89,6 @@ The same single keys as `play-cli`; letters work in either case, and a key held 
 
 ## Building
 
-On macOS, GPUI's `runtime_shaders` feature compiles the Metal shaders when the app starts, so the build needs no Metal Toolchain (Xcode 26 ships it as a separate download). The screen uses the system UI font, and Menlo, Consolas or DejaVu Sans Mono for times and keys; the canvas's Barlow and JetBrains Mono are not bundled.
+On macOS, GPUI's `runtime_shaders` feature compiles the Metal shaders when the app starts, so the build needs no Metal Toolchain (Xcode 26 ships it as a separate download). The screens use the design canvas's fonts, which the app carries in `assets/fonts` and loads at startup: Barlow for the interface, Barlow Semi Condensed for strip, pad and stem labels, and JetBrains Mono for times, levels and counts. All three are under the SIL Open Font License 1.1; each license file sits beside its fonts (`Barlow-OFL.txt`, `BarlowSemiCondensed-OFL.txt`, `JetBrainsMono-OFL.txt`).
 
 The view-model (`src/view.rs`, `src/strip.rs`, `src/catalog.rs`, `src/action.rs`, `src/hold.rs`, `src/keys.rs`, `src/song.rs`, `src/show.rs`, `src/ending.rs`, and for the Library screen `src/library_page.rs`, `src/editor.rs`, `src/shelf.rs`, `src/line_edit.rs`) holds every decision the screens make and is tested without a window (`cargo test -p openvamp`); the GPUI code (`src/screen.rs`, `src/ui.rs`, `src/library_ui.rs`) only draws it and dispatches, and has no automated test.

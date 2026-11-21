@@ -351,6 +351,7 @@ fn stem_strip(stem: &StemStrip, menu: bool, cx: &mut Context<Perform>) -> AnyEle
                 .w_full()
                 .px(px(6.))
                 .one_line()
+                .font_family(theme::CONDENSED)
                 .text_size(px(14.))
                 .font_weight(FontWeight::BOLD)
                 .flex()
@@ -512,6 +513,7 @@ fn toggle(
     action_button(id, cx, action)
         .size(px(30.))
         .rounded(px(7.))
+        .font_family(theme::CONDENSED)
         .text_size(px(13.))
         .font_weight(FontWeight::BOLD)
         .map(|button| {

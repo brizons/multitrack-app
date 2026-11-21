@@ -52,6 +52,7 @@ pub fn root(focus: &FocusHandle, cx: &mut Context<Perform>) -> Div {
         .size_full()
         .flex()
         .bg(theme::bg())
+        .font_family(theme::UI)
         .text_color(theme::text())
         .text_size(px(15.))
 }
