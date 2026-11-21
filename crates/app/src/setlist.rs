@@ -212,6 +212,14 @@ pub enum SetlistProblem {
         /// Why.
         error: String,
     },
+    /// A move changed the item after the current one, but the deck had
+    /// already started handing over to the item cued before it took that
+    /// item back: that item played, and the setlist follows it.
+    #[error("item {} played: the move came after its hand-over had started", .item + 1)]
+    MovedLate {
+        /// Index of the item that played.
+        item: usize,
+    },
     /// An AutoLink or Crossfade found the next item not buffered in time;
     /// it started as soon as it was.
     #[error("item {} was not loaded in time to follow on; it started once it was", .item + 1)]
@@ -708,7 +716,9 @@ impl SetlistSession {
         // deck took the message, nothing hands over to it any more.
         if let Some(withdrawn) = self.withdrawn.take() {
             if withdrawn.staged.tag == deck.item {
+                let item = withdrawn.staged.index;
                 self.follow_hand_over(withdrawn.staged, deck);
+                self.problem = Some(SetlistProblem::MovedLate { item });
             } else if applied < withdrawn.sent {
                 self.withdrawn = Some(withdrawn);
             }
@@ -864,6 +874,7 @@ impl SetlistSession {
             self.blend_from.as_mut(),
             self.problem.as_mut().map(|problem| match problem {
                 SetlistProblem::Prepare { item, .. }
+                | SetlistProblem::MovedLate { item }
                 | SetlistProblem::LateLink { item }
                 | SetlistProblem::Transition { item, .. } => item,
             }),
@@ -1395,6 +1406,75 @@ mod tests {
             "recorded as item 1's problem"
         );
         assert!(plans[0].is_none());
+    }
+
+    /// The one-callback race no fake output can stage: the deck hands over
+    /// to a cue the session already sent back after a move, before it takes
+    /// that message. The cued record is moved to `withdrawn` by hand and no
+    /// uncue is sent, so the deck still hands over to it.
+    #[test]
+    fn a_hand_over_that_beats_the_cue_sent_back_is_followed_and_explained() {
+        use crate::testing::FakeOutput;
+        use domain::Setlist;
+
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::new(dir.path());
+        let click = |transition| {
+            SetlistItem::Click(ClickItem {
+                bars: Some(1),
+                transition,
+                ..ClickItem::new(
+                    120.0,
+                    TimeSignature {
+                        numerator: 4,
+                        denominator: 4,
+                    },
+                )
+            })
+        };
+        let mut setlist = Setlist::new("Sunday");
+        setlist.items = vec![
+            click(Transition::AutoLink),
+            click(Transition::CueNext),
+            click(Transition::CueNext),
+        ];
+        let file = library.save_setlist(&setlist).unwrap().file;
+        let fake = FakeOutput::new();
+        let options = SessionOptions {
+            buffer_frames: 256,
+            ..SessionOptions::default()
+        };
+        let mut session =
+            SetlistSession::open(&library, &file, Box::new(fake.clone()), options).unwrap();
+        for _ in 0..100 {
+            session.poll();
+            if session.cued.is_some() {
+                break;
+            }
+        }
+        let staged = session.cued.take().expect("item 2 is cued");
+        session.withdrawn = Some(Withdrawn {
+            staged,
+            sent: u64::MAX,
+        });
+
+        session.send(SetlistCommand::Item(Command::Play)).unwrap();
+        // One bar at 120 BPM is two seconds.
+        let bar = 2 * CLICK_ONLY_SAMPLE_RATE as usize;
+        let mut state = session.poll().setlist;
+        for _ in 0..(bar + 4_096) / 256 {
+            fake.render(256);
+            state = session.poll().setlist;
+        }
+
+        assert_eq!(state.current, 1, "the setlist follows the item that plays");
+        let problem = state.problem.expect("the setlist says why");
+        assert_eq!(problem, SetlistProblem::MovedLate { item: 1 });
+        assert_eq!(
+            problem.to_string(),
+            "item 2 played: the move came after its hand-over had started"
+        );
+        assert!(session.withdrawn.is_none());
     }
 
     #[test]
