@@ -29,7 +29,7 @@
 //! }
 //! ```
 //!
-//! `devices` is keyed by the device name. A destination is `[n]` for output
+//! `devices` is keyed by the output device id. A destination is `[n]` for output
 //! `n` alone or `[left, right]` for a stereo pair. A bus without a
 //! destination plays on outputs 1 and 2 (output 1 on a one-output device);
 //! `master` is optional.
@@ -420,7 +420,7 @@ pub enum RoutingError {
 pub struct RoutingFile {
     /// File format version; must be [`ROUTING_FORMAT_VERSION`].
     pub format_version: u32,
-    /// Routing by device name.
+    /// Routing by output device id.
     #[serde(default)]
     pub devices: BTreeMap<String, Routing>,
 }
@@ -508,7 +508,7 @@ pub enum RoutingValidationError {
     /// A device's routing breaks a rule.
     #[error("device \"{device}\": {error}")]
     Device {
-        /// The device name.
+        /// The output device id.
         device: String,
         /// The broken rule.
         error: RoutingError,
