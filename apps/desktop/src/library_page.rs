@@ -783,7 +783,8 @@ impl LibraryPage {
             index,
             number: (index + 1).to_string(),
             title: self.catalog.title(item),
-            meta: self.catalog.meta(item),
+            // The arrangement has a column of its own in the editor.
+            meta: self.catalog.meta_without_arrangement(item),
             click: matches!(item, SetlistItem::Click(_)),
             arrangement,
             transition: item.transition(),

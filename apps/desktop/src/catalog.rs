@@ -69,8 +69,19 @@ impl Catalog {
     /// for a click-only tile its tempo, meter and bar count ("70 BPM · 6/8 ·
     /// 8 bars").
     pub fn meta(&self, item: &SetlistItem) -> String {
+        self.describe(item, Arrangement::Named)
+    }
+
+    /// [`Self::meta`] without the song's arrangement, for a list that shows
+    /// the arrangement in a column of its own: "A · 132 BPM", or "—" when
+    /// there is nothing else to say (a song the library lacks).
+    pub fn meta_without_arrangement(&self, item: &SetlistItem) -> String {
+        self.describe(item, Arrangement::Left)
+    }
+
+    fn describe(&self, item: &SetlistItem, arrangement: Arrangement) -> String {
         match item {
-            SetlistItem::Song(song) => self.song_meta(song),
+            SetlistItem::Song(song) => self.song_meta(song, arrangement),
             SetlistItem::Click(click) => {
                 let meter = click.time_signature;
                 let length = match click.bars {
@@ -86,7 +97,7 @@ impl Catalog {
         }
     }
 
-    fn song_meta(&self, item: &SongItem) -> String {
+    fn song_meta(&self, item: &SongItem, named: Arrangement) -> String {
         let mut parts = Vec::new();
         let arrangement = self.song(&item.song).and_then(|entry| {
             parts.extend(entry.key.clone());
@@ -96,15 +107,20 @@ impl Catalog {
                 .iter()
                 .find(|arrangement| arrangement.id == item.arrangement)
         });
+        let shown = named == Arrangement::Named;
         match arrangement {
             Some(arrangement) => {
-                parts.push(arrangement.name.clone());
+                if shown {
+                    parts.push(arrangement.name.clone());
+                }
                 if let Some(range) = range_labels(item, arrangement) {
                     parts.push(range);
                 }
             }
             None => {
-                parts.push(format!("arrangement \"{}\"", item.arrangement));
+                if shown {
+                    parts.push(format!("arrangement \"{}\"", item.arrangement));
+                }
                 if item.start_position.is_some() || item.end_position.is_some() {
                     parts.push(range_numbers(item));
                 }
@@ -112,6 +128,9 @@ impl Catalog {
         }
         if item.fade_out {
             parts.push("fade-out".to_owned());
+        }
+        if parts.is_empty() {
+            return "—".to_owned();
         }
         parts.join(" · ")
     }
@@ -148,6 +167,15 @@ fn range_numbers(item: &SongItem) -> String {
         (None, Some(end)) => format!("to position {}", end.saturating_add(1)),
         (None, None) => String::new(),
     }
+}
+
+/// Whether a song's meta line names its arrangement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arrangement {
+    /// It does: the strip shows nothing else about the arrangement.
+    Named,
+    /// It does not: a column of its own shows it.
+    Left,
 }
 
 /// A song folder's name without `.song`: `Hymns/Example.song` gives

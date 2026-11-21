@@ -16,7 +16,7 @@ use openvamp_desktop::library_page::{
 
 use crate::screen::Perform;
 use crate::theme;
-use crate::ui::{button, chip_button, icon};
+use crate::ui::{OneLine, button, chip_button, icon};
 
 /// An element id made of words and numbers, such as `arrangement-2-1`.
 fn id(name: String) -> ElementId {
@@ -169,21 +169,35 @@ fn remove_button(view: &EditorView, cx: &mut Context<Perform>) -> impl IntoEleme
     } else {
         (theme::raised(), theme::text(), theme::border())
     };
-    // It may shrink to its icon before the setlist's name does.
-    button("remove-setlist", cx, act(LibraryAction::RemoveSetlist))
-        .flex_shrink()
-        .min_w(px(36.))
-        .h(px(36.))
-        .px(px(10.))
-        .rounded(px(8.))
-        .bg(bg)
-        .border_1()
-        .border_color(border)
-        .text_color(fg)
-        .text_size(px(13.))
-        .font_weight(FontWeight::SEMIBOLD)
-        .child(icon("trash", fg, 18.))
-        .child(div().min_w_0().truncate().child(view.remove.clone()))
+    // It shrinks, down to its icon, well before the setlist's name does.
+    gives_way_first(button(
+        "remove-setlist",
+        cx,
+        act(LibraryAction::RemoveSetlist),
+    ))
+    .min_w(px(36.))
+    .h(px(36.))
+    .px(px(10.))
+    .rounded(px(8.))
+    .bg(bg)
+    .border_1()
+    .border_color(border)
+    .text_color(fg)
+    .text_size(px(13.))
+    .font_weight(FontWeight::SEMIBOLD)
+    .child(icon("trash", fg, 18.))
+    .child(div().min_w_0().one_line().child(view.remove.clone()))
+}
+
+/// How much faster an element that gives way first shrinks than its
+/// neighbours: flex shrinking is weighted by this factor and the element's
+/// width, so it loses most of a shortfall until it reaches its minimum.
+const GIVES_WAY: f32 = 20.;
+
+/// `element`, shrinking [`GIVES_WAY`] times faster than its neighbours.
+fn gives_way_first<E: Styled>(mut element: E) -> E {
+    element.style().flex_shrink = Some(GIVES_WAY);
+    element
 }
 
 fn heading(name: &'static str, title: &'static str) -> impl IntoElement {
@@ -254,7 +268,7 @@ fn setlists(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
         )
         .child(
             div()
-                .truncate()
+                .one_line()
                 .text_size(px(12.))
                 .text_color(theme::text_faint())
                 .child(view.folder.clone()),
@@ -311,7 +325,7 @@ fn setlist_row(row: &SetlistRow, rows: usize, cx: &mut Context<Perform>) -> AnyE
         .child(
             div()
                 .w_full()
-                .truncate()
+                .one_line()
                 .text_size(px(16.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(row.name.clone()),
@@ -319,7 +333,7 @@ fn setlist_row(row: &SetlistRow, rows: usize, cx: &mut Context<Perform>) -> AnyE
         .child(
             div()
                 .w_full()
-                .truncate()
+                .one_line()
                 .text_size(px(13.))
                 .text_color(theme::text_muted())
                 .child(meta),
@@ -382,7 +396,7 @@ fn unreadable_row(row: &UnreadableRow, cx: &mut Context<Perform>) -> AnyElement 
             .text_size(px(12.))
             .text_color(fg)
             .child(icon("trash", fg, 14.))
-            .child(div().min_w_0().truncate().child(row.remove.clone())),
+            .child(div().min_w_0().one_line().child(row.remove.clone())),
         )
         .into_any_element()
 }
@@ -400,7 +414,7 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
     let title: AnyElement = match &view.renaming {
         Some(name) => text_field(name, true, "Setlist name").into_any_element(),
         None => div()
-            .truncate()
+            .one_line()
             .text_size(px(26.))
             .font_weight(FontWeight::BOLD)
             .child(view.name.clone())
@@ -412,11 +426,13 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                 .flex()
                 .items_end()
                 .gap(px(12.))
-                // The name keeps a readable share next to the buttons and is
-                // cut with an ellipsis rather than squeezed into a column.
+                // The name asks for its whole width and takes all the room
+                // the buttons leave; the Remove button gives way first, and
+                // the name ends in an ellipsis only below that.
                 .child(
                     div()
-                        .flex_1()
+                        .flex_grow()
+                        .flex_shrink()
                         .min_w(px(HEADER_NAME_MIN))
                         .flex()
                         .flex_col()
@@ -424,7 +440,7 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                         .child(title)
                         .child(
                             div()
-                                .truncate()
+                                .one_line()
                                 .text_size(px(14.))
                                 .text_color(theme::text_muted())
                                 .child(view.summary.clone()),
@@ -476,8 +492,8 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                 .text_color(theme::text_muted())
                 .child(number_column(div()).child("#"))
                 .child(song_column(div()).child("Song"))
-                .child(arrangement_column(div()).truncate().child("Arrangement"))
-                .child(transition_column(div()).truncate().child("Transition out"))
+                .child(arrangement_column(div()).one_line().child("Arrangement"))
+                .child(transition_column(div()).one_line().child("Transition out"))
                 .child(length_column(div()).child("Length"))
                 .child(remove_column(div())),
         )
@@ -566,7 +582,7 @@ fn song_column<E: Styled>(element: E) -> E {
         .flex_grow()
         .flex_shrink_0()
         .flex_basis(px(0.))
-        .min_w(px(150.))
+        .min_w(px(180.))
 }
 
 fn arrangement_column<E: Styled>(element: E) -> E {
@@ -675,14 +691,14 @@ fn editor_row(row: &EditorRow, rows: usize, cx: &mut Context<Perform>) -> AnyEle
                         .gap(px(2.))
                         .child(
                             div()
-                                .truncate()
+                                .one_line()
                                 .text_size(px(16.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(row.title.clone()),
                         )
                         .child(
                             div()
-                                .truncate()
+                                .one_line()
                                 .text_size(px(13.))
                                 .text_color(theme::text_muted())
                                 .child(row.meta.clone()),
@@ -691,7 +707,7 @@ fn editor_row(row: &EditorRow, rows: usize, cx: &mut Context<Perform>) -> AnyEle
             )
             .child(
                 arrangement_column(div())
-                    .truncate()
+                    .one_line()
                     .text_size(px(13.))
                     .child(row.arrangement.clone()),
             )
@@ -705,7 +721,7 @@ fn editor_row(row: &EditorRow, rows: usize, cx: &mut Context<Perform>) -> AnyEle
                     .child(
                         div()
                             .min_w_0()
-                            .truncate()
+                            .one_line()
                             .child(transition_name(row.transition)),
                     ),
             )
@@ -989,14 +1005,14 @@ fn song_row(song: &SongRow, cx: &mut Context<Perform>) -> AnyElement {
                 .gap(px(1.))
                 .child(
                     div()
-                        .truncate()
+                        .one_line()
                         .text_size(px(15.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(song.title.clone()),
                 )
                 .child(
                     div()
-                        .truncate()
+                        .one_line()
                         .font_family(theme::MONO)
                         .text_size(px(11.))
                         .text_color(theme::text_muted())
@@ -1043,7 +1059,7 @@ fn text_field(text: &str, focused: bool, placeholder: &'static str) -> impl Into
         })
         .text_size(px(15.))
         .text_color(color)
-        .child(div().min_w_0().truncate().child(shown))
+        .child(div().min_w_0().one_line().child(shown))
 }
 
 fn small_square(

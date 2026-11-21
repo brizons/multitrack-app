@@ -309,7 +309,8 @@ fn a_song_gets_its_arrangement_start_end_fade_out_and_transition() {
     let row = &page.view(None).editor.unwrap().rows[0];
     assert_eq!(
         row.meta,
-        "A · 132 BPM · Default · Verse 1 – Chorus · fade-out"
+        // The arrangement has its own column, so the meta line leaves it out.
+        "A · 132 BPM · Verse 1 – Chorus · fade-out"
     );
     assert_eq!(row.length, "0:02");
 
@@ -1210,4 +1211,26 @@ fn a_removed_setlist_never_stays_open_even_when_the_list_cannot_be_read_again() 
     // Whatever was selected, no edit can save B again.
     page.act(LibraryAction::AddClick);
     assert!(!folder.join("B.setlist.json").exists());
+}
+
+#[test]
+fn the_editor_meta_line_leaves_the_arrangement_to_its_column() {
+    let dir = library();
+    let file = save(
+        dir.path(),
+        "Sunday",
+        vec![
+            SetlistItem::Song(SongItem::new("Songs/Bright.song")),
+            SetlistItem::Song(SongItem::new("Songs/Gone.song")),
+        ],
+    );
+    let page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
+
+    let rows = page.view(None).editor.unwrap().rows;
+    assert_eq!(rows[0].meta, "90 BPM");
+    assert_eq!(rows[0].arrangement, "Default");
+    // A song the library lacks has nothing to say but its arrangement,
+    // which its column shows.
+    assert_eq!(rows[1].meta, "—");
+    assert_eq!(rows[1].arrangement, "default");
 }

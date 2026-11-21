@@ -284,7 +284,7 @@ fn setlist_chip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoEl
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(div().truncate().child(setlist.name.clone()))
+                .child(div().one_line().child(setlist.name.clone()))
                 .child(
                     div()
                         .font_family(theme::MONO)
@@ -451,14 +451,14 @@ fn now_playing(view: &PerformView, cx: &mut Context<Perform>) -> impl IntoElemen
                         .gap(px(4.))
                         .child(
                             div()
-                                .truncate()
+                                .one_line()
                                 .text_size(px(26.))
                                 .font_weight(FontWeight::BOLD)
                                 .child(view.title.clone()),
                         )
                         .child(
                             div()
-                                .truncate()
+                                .one_line()
                                 .text_size(px(14.))
                                 .text_color(theme::text_muted())
                                 .child(view.subtitle.clone()),
@@ -487,7 +487,7 @@ fn now_card(now: &NowCard) -> impl IntoElement {
         .child(small_heading("Now", theme::text_muted()))
         .child(
             div()
-                .truncate()
+                .one_line()
                 .text_size(px(20.))
                 .font_weight(FontWeight::BOLD)
                 .child(now.name.clone()),
@@ -529,14 +529,14 @@ fn next_card(next: &NextCard, cx: &mut Context<Perform>) -> impl IntoElement {
             .child(small_heading(next.heading.clone(), heading_color))
             .child(
                 div()
-                    .truncate()
+                    .one_line()
                     .text_size(px(20.))
                     .font_weight(FontWeight::BOLD)
                     .child(next.name.clone()),
             )
             .child(
                 div()
-                    .truncate()
+                    .one_line()
                     .text_size(px(12.))
                     .text_color(theme::text_muted())
                     .child(next.detail.clone()),
@@ -861,7 +861,7 @@ fn pad_button(pad: &Pad, cx: &mut Context<Perform>) -> AnyElement {
                 )
                 .child(
                     div()
-                        .truncate()
+                        .one_line()
                         .text_size(px(20.))
                         .font_weight(FontWeight::BOLD)
                         .child(pad.label.clone()),
@@ -981,7 +981,7 @@ fn strip_tile(item: &StripItem, cx: &mut Context<Perform>) -> AnyElement {
                     .child(
                         div()
                             .min_w_0()
-                            .truncate()
+                            .one_line()
                             .text_size(px(16.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(item.title.clone()),
@@ -999,7 +999,7 @@ fn strip_tile(item: &StripItem, cx: &mut Context<Perform>) -> AnyElement {
             )
             .child(
                 div()
-                    .truncate()
+                    .one_line()
                     .text_size(px(13.))
                     .text_color(detail_color)
                     .child(detail),
@@ -1101,7 +1101,7 @@ fn status(status: &StatusView, setlist: bool) -> impl IntoElement {
                     div()
                         .flex_shrink()
                         .min_w(px(160.))
-                        .truncate()
+                        .one_line()
                         .child(status.device.clone()),
                 )
                 .child(
@@ -1115,7 +1115,7 @@ fn status(status: &StatusView, setlist: bool) -> impl IntoElement {
                 .child(
                     div()
                         .min_w_0()
-                        .truncate()
+                        .one_line()
                         .text_size(px(12.))
                         .text_color(theme::text_faint())
                         .child(if setlist {
@@ -1223,6 +1223,22 @@ fn brand_mark() -> impl IntoElement {
                 .child("OpenVamp"),
         )
 }
+
+/// One line of text cut with an ellipsis ("…") when it does not fit.
+///
+/// gpui 0.2.2's own `truncate()` sets `whitespace_nowrap`, and a text that
+/// does not wrap keeps the size of its first measurement, taken while its
+/// width is not known yet (the layout's max-content pass): it then draws in
+/// full and its box clips it, with no ellipsis. A text that wraps is
+/// measured again once its width is known, so this one wraps, is clamped
+/// to one line, and ends in an ellipsis at that width.
+pub(crate) trait OneLine: Styled + Sized {
+    fn one_line(self) -> Self {
+        self.whitespace_normal().text_ellipsis().line_clamp(1)
+    }
+}
+
+impl<E: Styled> OneLine for E {}
 
 pub(crate) fn icon(name: &str, color: Rgba, size: f32) -> impl IntoElement {
     svg()
