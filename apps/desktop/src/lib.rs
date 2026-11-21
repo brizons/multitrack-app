@@ -22,6 +22,7 @@
 #![warn(missing_docs)]
 
 pub mod action;
+pub mod audio_settings;
 pub mod catalog;
 pub mod editor;
 pub mod ending;

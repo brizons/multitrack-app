@@ -8,14 +8,16 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use app::SessionOptions;
+use app::AudioOutput;
 use gpui::{
     App, AppContext, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
     ModifiersChangedEvent, PathPromptOptions, PromptButton, PromptLevel, Render, Subscription,
     Task, Window, prelude::*,
 };
 use io_cpal::CpalOutput;
+use library::ConfigStore;
 use openvamp_desktop::action::{Intent, Page, UiAction, disarms_removal};
+use openvamp_desktop::audio_settings::AudioSettings;
 use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
@@ -53,6 +55,8 @@ pub struct Perform {
     opened: Opened,
     /// Why the last library folder picked did not open.
     library_problem: Option<String>,
+    /// The saved routings and bus settings every session opens with.
+    settings: AudioSettings,
     _poll: Task<()>,
     _quit: Subscription,
     _deactivated: Subscription,
@@ -96,6 +100,7 @@ impl Perform {
             library: None,
             opened: Opened::Followed,
             library_problem: None,
+            settings: AudioSettings::load(ConfigStore::from_environment()),
             _poll: poll,
             _quit: quit,
             _deactivated: deactivated,
@@ -192,10 +197,13 @@ impl Perform {
     /// with its ramp and closes its device before the pick opens the
     /// device.
     fn open(&mut self, source: &Source) {
+        // The saved routing of the device it opens on, and the bus settings.
+        let devices = CpalOutput::new().devices().unwrap_or_default();
+        let options = self.settings.options(&devices);
         let replaced = replace(
             &mut self.loaded,
             source,
-            &SessionOptions::default(),
+            &options,
             || Box::new(CpalOutput::new()),
             thread::sleep,
         );
