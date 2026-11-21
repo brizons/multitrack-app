@@ -15,6 +15,7 @@
 pub mod bus;
 pub mod compile;
 pub mod grid;
+pub mod mix;
 pub mod package;
 pub mod setlist;
 pub mod song;
@@ -26,6 +27,10 @@ pub use compile::{
     DEFAULT_SEAM_CROSSFADE, RenderPlan, Segment, compile, seam_fade,
 };
 pub use grid::{BarBeat, BeatGrid, SourceClick};
+pub use mix::{
+    ArrangementMix, MAX_VOLUME_DB, MIX_FORMAT_VERSION, MixFile, MixValidationError, MixerFile,
+    MixerFileError, StemMix, Volume,
+};
 pub use package::{
     Arrangement, DEFAULT_ARRANGEMENT_ID, FORMAT_VERSION, IdKind, MAX_BPM, MAX_SONG_HOURS, MIN_BPM,
     ManifestError, MapKind, SectionMarker, SectionType, SongPackage, Stem, StemInfo,
