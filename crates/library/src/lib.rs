@@ -17,7 +17,8 @@
 //! song folder in the library, from the manifest and stem headers only.
 //! [`read_mix`] and [`write_mix`] keep a song's mix in the [`MIX_FILE`]
 //! beside its `song.json`, with the rules the [settings files](SettingsError)
-//! share.
+//! share. A [`ConfigStore`] keeps the global bus settings and the routing of
+//! every device in the app's configuration folder ([`config_folder`]).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -38,6 +39,7 @@ use engine::StemAudio;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use thiserror::Error;
 
+mod config;
 mod mix_store;
 mod setlist_order;
 mod setlist_songs;
@@ -46,6 +48,10 @@ mod settings;
 mod songs;
 mod stream;
 
+pub use config::{
+    BUS_SETTINGS_FILE, ConfigStore, LoadedBusSettings, LoadedRouting, Platform, ROUTING_FILE,
+    config_folder,
+};
 pub use mix_store::{MIX_FILE, SongMix, read_mix, write_mix};
 pub use setlist_songs::{SetlistSongs, SongUnavailable};
 pub use setlists::{
