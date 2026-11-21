@@ -114,7 +114,7 @@ struct Stem {
 /// The whole stem on `bus`.
 fn on_bus(bus: Bus) -> [f32; BUSES] {
     let mut weights = [0.0; BUSES];
-    weights[bus_index(bus)] = 1.0;
+    weights[bus.index()] = 1.0;
     weights
 }
 
@@ -168,18 +168,6 @@ impl Stem {
 
 /// Number of buses: [`Bus::ALL`].
 const BUSES: usize = Bus::ALL.len();
-
-/// Index of `bus` in [`Bus::ALL`] and [`Routes::buses`].
-fn bus_index(bus: Bus) -> usize {
-    match bus {
-        Bus::ClickGuide => 0,
-        Bus::Drums => 1,
-        Bus::Bass => 2,
-        Bus::KeysPads => 3,
-        Bus::Guitars => 4,
-        Bus::Vocals => 5,
-    }
-}
 
 /// What every stem of a block shares when it is mixed.
 struct Block<'a> {
@@ -265,7 +253,7 @@ fn route_matrix(routes: &Routes, channels: usize, matrix: &mut [f32]) {
         add(bus, destination);
     }
     if let Some(master) = routes.master {
-        let click = bus_index(Bus::ClickGuide);
+        let click = Bus::ClickGuide.index();
         for bus in (0..BUSES).filter(|&bus| bus != click) {
             add(bus, master);
         }
@@ -1279,7 +1267,7 @@ impl Player {
         };
         for stem in &mut self.stems {
             if stem.bus_fade.is_done() {
-                let bus = bus_index(stem.bus);
+                let bus = stem.bus.index();
                 used[bus] = true;
                 let target = &mut buses[bus * stride..bus * stride + 2 * n];
                 add_stem(
@@ -1318,7 +1306,7 @@ impl Player {
             }
         }
         if self.bursts.is_some() {
-            let click = bus_index(Bus::ClickGuide);
+            let click = Bus::ClickGuide.index();
             used[click] = true;
             self.add_clicks(&mut buses[click * stride..click * stride + 2 * n], source);
         }

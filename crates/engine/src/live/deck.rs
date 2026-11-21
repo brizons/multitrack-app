@@ -115,7 +115,12 @@ impl From<DeckFull> for DeckError {
 
 enum Message {
     Command(Command),
-    CuedCommand(Command),
+    /// For the item with this number wherever the deck holds it; for none
+    /// when `None`.
+    ItemCommand {
+        item: Option<u64>,
+        command: Command,
+    },
     Cue {
         player: Box<Player>,
         item: u64,
@@ -146,6 +151,7 @@ enum Exit {
 
 struct Leaving {
     player: Box<Player>,
+    item: u64,
     exit: Exit,
 }
 
@@ -230,6 +236,9 @@ pub struct DeckController {
     returns: Consumer<Box<Player>>,
     /// The output channels every player of the deck renders.
     channels: usize,
+    /// The item cued last, until it is sent back or selected: the one
+    /// [`Self::send_cued`] is for, wherever the deck holds it by then.
+    cued: Option<u64>,
 }
 
 impl Deck {
@@ -262,6 +271,7 @@ impl Deck {
             messages: producer,
             returns: back,
             channels,
+            cued: None,
         };
         (deck, controller)
     }
@@ -322,11 +332,11 @@ impl Deck {
             self.applied += 1;
             match message {
                 Message::Command(command) => self.apply(command),
-                Message::CuedCommand(command) => {
-                    if let Some(cued) = &mut self.cued {
-                        cued.player.command(command);
-                    }
-                }
+                Message::ItemCommand {
+                    item: Some(item),
+                    command,
+                } => self.apply_to(item, command),
+                Message::ItemCommand { item: None, .. } => {}
                 Message::Cue {
                     player,
                     item,
@@ -389,6 +399,20 @@ impl Deck {
         }
     }
 
+    /// Applies `command` to item `item`, current, cued or leaving; to none
+    /// when the deck no longer holds it.
+    fn apply_to(&mut self, item: u64, command: Command) {
+        if self.item == item {
+            self.current.command(command);
+        } else if let Some(cued) = &mut self.cued
+            && cued.item == item
+        {
+            cued.player.command(command);
+        } else if let Some(leaving) = self.leaving.iter_mut().find(|leaving| leaving.item == item) {
+            leaving.player.command(command);
+        }
+    }
+
     /// Makes `player` the current item, stopped at its start. The items
     /// heard so far leave with their stop ramp at the level they had.
     fn select(&mut self, player: Box<Player>, item: u64) {
@@ -406,21 +430,21 @@ impl Deck {
             None => 1.0,
         };
         let mut old = mem::replace(&mut self.current, player);
-        self.item = item;
+        let old_item = mem::replace(&mut self.item, item);
         if old.transport() == Transport::Stopped {
             self.retire(old);
             return;
         }
         old.command(Command::Stop);
-        self.leave(old, Exit::Fixed(gain_in));
+        self.leave(old, old_item, Exit::Fixed(gain_in));
     }
 
-    fn leave(&mut self, player: Box<Player>, exit: Exit) {
+    fn leave(&mut self, player: Box<Player>, item: u64, exit: Exit) {
         if self.leaving.len() == MAX_LEAVING {
             let oldest = self.leaving.remove(0);
             self.retire(oldest.player);
         }
-        self.leaving.push(Leaving { player, exit });
+        self.leaving.push(Leaving { player, item, exit });
     }
 
     /// Frames to render before the next event: a blend starting or
@@ -487,7 +511,7 @@ impl Deck {
             len: to_end.max(1),
             played: 0,
         });
-        self.leave(outgoing.0, Exit::Blend);
+        self.leave(outgoing.0, outgoing.1, Exit::Blend);
     }
 
     /// Makes the cued item current and playing; returns the item it
@@ -656,27 +680,51 @@ impl DeckController {
     /// ([`DeckError::ChannelMismatch`]).
     pub fn cue(&mut self, player: Player, item: u64, handoff: Handoff) -> Result<(), DeckError> {
         self.check_channels(&player)?;
-        Ok(self.push(Message::Cue {
+        self.push(Message::Cue {
             player: Box::new(player),
             item,
             handoff,
-        })?)
+        })?;
+        self.cued = Some(item);
+        Ok(())
     }
 
-    /// Queues `command` for the cued item only, such as its stem gains
+    /// Queues `command` for the item cued last, such as its stem gains
     /// ([`Command::SetStemGain`]) after the bus or master volumes changed,
-    /// since its stems are not the current item's. It is dropped when no
-    /// item is cued by the time the deck takes it (a handoff may have made
-    /// the item current: send it the current item's way then).
+    /// since its stems are not the current item's: [`Self::send_to`] that
+    /// item, so it reaches it even when an AutoLink or Crossfade has made
+    /// it current by the time the deck takes the command. It is dropped
+    /// when no item is cued: none was, or it was sent back
+    /// ([`Self::uncue`]) or selected ([`Self::select_cued`]).
     pub fn send_cued(&mut self, command: Command) -> Result<(), SendError> {
         self.messages
-            .push(Message::CuedCommand(command))
+            .push(Message::ItemCommand {
+                item: self.cued,
+                command,
+            })
+            .map_err(|_| SendError::Full(command))
+    }
+
+    /// Queues `command` for item `item` wherever the deck holds it when it
+    /// takes the command: current, cued, or leaving under another item. It
+    /// is dropped when the deck no longer holds that item. A command meant
+    /// for one item's stems ([`Command::SetStemGain`],
+    /// [`Command::SetStemBus`]) goes this way, so a handoff the control
+    /// thread has not seen yet cannot give it to another item's stems.
+    pub fn send_to(&mut self, item: u64, command: Command) -> Result<(), SendError> {
+        self.messages
+            .push(Message::ItemCommand {
+                item: Some(item),
+                command,
+            })
             .map_err(|_| SendError::Full(command))
     }
 
     /// Sends the cued item back.
     pub fn uncue(&mut self) -> Result<(), DeckFull> {
-        self.push(Message::Uncue)
+        self.push(Message::Uncue)?;
+        self.cued = None;
+        Ok(())
     }
 
     /// Makes `player` the current item as `item`, stopped at its start; the
@@ -696,7 +744,9 @@ impl DeckController {
     /// the time the deck takes the message (an AutoLink or Crossfade may
     /// have started it already).
     pub fn select_cued(&mut self) -> Result<(), DeckFull> {
-        self.push(Message::SelectCued)
+        self.push(Message::SelectCued)?;
+        self.cued = None;
+        Ok(())
     }
 
     /// A player the deck no longer needs, to be dropped on this thread.

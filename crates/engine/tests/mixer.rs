@@ -15,8 +15,8 @@ use domain::{
     StemRole, Volume, effective_gains,
 };
 use engine::live::{
-    Command, Controller, Deck, GAIN_RAMP_MILLISECONDS, Gain, Handoff, Player, PlayerConfig, Routes,
-    memory_sources,
+    Command, Controller, Deck, GAIN_RAMP_MILLISECONDS, Gain, Handoff, LiveError, Player,
+    PlayerConfig, Routes, memory_sources,
 };
 use engine::{MixSettings, StemAudio, render_offline};
 
@@ -80,7 +80,7 @@ fn at(out: &[f32], channels: usize, frame: usize, channel: usize) -> f32 {
 fn routes(entries: &[(Bus, Destination)], master: Option<Destination>) -> Routes {
     let mut routes = Routes::STEREO;
     for &(bus, destination) in entries {
-        routes.buses[Bus::ALL.iter().position(|&b| b == bus).unwrap()] = destination;
+        routes.buses[bus.index()] = destination;
     }
     routes.master = master;
     routes
@@ -742,4 +742,335 @@ fn moving_a_stem_between_buses_both_on_1_2_changes_no_sample() {
     }
     out.extend(render(&mut player, 2, 24_000 - 5_150));
     assert_eq!(bits(&out), bits(&expected));
+}
+
+#[test]
+fn a_gain_that_is_not_a_finite_non_negative_number_is_silence() {
+    let steady = song(&[("drums", StemRole::Track), ("click", StemRole::Click)]);
+    let click = song(&[("drums", StemRole::Track)]);
+    for bad in [
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        -0.5,
+        -f32::MIN_POSITIVE,
+    ] {
+        assert_eq!(Gain::new(bad).get(), 0.0, "Gain::new({bad})");
+        let (mut stem, mut controller) = player(
+            &steady,
+            vec![dc("drums", StemRole::Track, 0.5), silent_click()],
+            2,
+        );
+        controller
+            .send(Command::SetStemGain {
+                stem: 0,
+                gain: Gain::new(bad),
+            })
+            .unwrap();
+        controller.send(Command::Play).unwrap();
+        assert!(
+            render(&mut stem, 2, 2_000).iter().all(|&s| s == 0.0),
+            "a stem at Gain::new({bad}) is silent"
+        );
+        let (mut generated, mut controller) =
+            player(&click, vec![dc("drums", StemRole::Track, 0.0)], 2);
+        controller
+            .send(Command::SetClickGain(Gain::new(bad)))
+            .unwrap();
+        controller.send(Command::Play).unwrap();
+        assert!(
+            render(&mut generated, 2, 16_000).iter().all(|&s| s == 0.0),
+            "the click at Gain::new({bad}) is silent"
+        );
+    }
+}
+
+#[test]
+fn a_player_renders_1_to_32_output_channels() {
+    let song = song(&[("drums", StemRole::Track)]);
+    let new = |channels: u16| {
+        Player::new(
+            &song,
+            "default",
+            &MixSettings::default(),
+            &PlayerConfig {
+                channels,
+                ..PlayerConfig::new(RATE, 256)
+            },
+            memory_sources(vec![dc("drums", StemRole::Track, 0.5)]).unwrap(),
+        )
+        .map(|(player, _controller)| player.channels())
+    };
+    for channels in [0, 33] {
+        assert_eq!(
+            new(channels).err(),
+            Some(LiveError::ChannelsOutOfRange { channels }),
+            "{channels} channels"
+        );
+    }
+    assert_eq!(new(1), Ok(1));
+    assert_eq!(new(32), Ok(32));
+}
+
+/// Drums steady at 0.5 under a silent click stem.
+fn steady_song() -> (Song, Vec<StemAudio>) {
+    let song = song(&[("drums", StemRole::Track), ("click", StemRole::Click)]);
+    (
+        song,
+        vec![dc("drums", StemRole::Track, 0.5), silent_click()],
+    )
+}
+
+/// A song whose only sound is the generated click.
+fn click_only() -> (Song, Vec<StemAudio>) {
+    let song = song(&[("drums", StemRole::Track)]);
+    (song, vec![dc("drums", StemRole::Track, 0.0)])
+}
+
+/// Keys steady at 0.25 and bass at 0.125 under a silent click stem: 0.375
+/// on outputs 1 and 2 at unity.
+fn two_stems() -> (Song, Vec<StemAudio>) {
+    let song = song(&[
+        ("keys", StemRole::Track),
+        ("bass", StemRole::Track),
+        ("click", StemRole::Click),
+    ]);
+    let stems = vec![
+        dc("keys", StemRole::Track, 0.25),
+        dc("bass", StemRole::Track, 0.125),
+        silent_click(),
+    ];
+    (song, stems)
+}
+
+/// Outputs 1 and 2 of every frame of `out` (eight channels).
+fn main_pair(out: &[f32]) -> Vec<[f32; 2]> {
+    out.chunks_exact(8)
+        .map(|frame| [frame[0], frame[1]])
+        .collect()
+}
+
+#[test]
+fn the_cued_item_follows_routing_and_click_gain_changes() {
+    let (a, b) = (steady_song(), click_only());
+    let routed = routes(&[(Bus::ClickGuide, Destination::Mono(5))], None);
+    let expected = {
+        let (mut player, mut controller) = player(&b.0, b.1.clone(), 8);
+        player.set_routes(routed);
+        player.set_click_gain(0.5);
+        controller.send(Command::Play).unwrap();
+        render(&mut player, 8, 16_000)
+    };
+    assert!(expected.iter().any(|&s| s != 0.0), "B's click plays");
+
+    let (mut deck, mut control) = Deck::new(deck_player(&a, Routes::STEREO), 1, 256);
+    control
+        .cue(deck_player(&b, Routes::STEREO), 2, Handoff::AutoLink)
+        .unwrap();
+    control.send(Command::Play).unwrap();
+    run_deck(&mut deck, 1_024);
+    // While A plays and B waits.
+    control.send(Command::SetRouting(routed)).unwrap();
+    control.send(Command::SetClickGain(Gain::new(0.5))).unwrap();
+    let out = run_deck(&mut deck, FRAMES as usize - 1_024 + 16_000);
+    assert_eq!(deck.status().item, 2, "B followed on");
+    assert_eq!(
+        bits(&out[8 * (FRAMES as usize - 1_024)..]),
+        bits(&expected),
+        "B starts on output 5 with its click at half"
+    );
+}
+
+#[test]
+fn an_item_leaving_in_a_crossfade_follows_routing_and_click_gain_changes() {
+    // A: drums at 0.5 and the generated click; B: silence.
+    let a = click_only();
+    let a = (a.0, vec![dc("drums", StemRole::Track, 0.5)]);
+    let b = (
+        steady_song().0,
+        vec![dc("drums", StemRole::Track, 0.0), silent_click()],
+    );
+    let (mut deck, mut control) = Deck::new(deck_player(&a, Routes::STEREO), 1, 256);
+    control
+        .cue(
+            deck_player(&b, Routes::STEREO),
+            2,
+            Handoff::Crossfade { frames: 8_000 },
+        )
+        .unwrap();
+    control.send(Command::Play).unwrap();
+    // The blend runs from 24 000 to A's end at 32 000.
+    let sent = 25_600;
+    run_deck(&mut deck, sent);
+    assert_eq!(deck.status().leaving, 1, "A is leaving under B");
+    control
+        .send(Command::SetRouting(routes(
+            &[(Bus::Drums, Destination::Stereo { left: 3, right: 4 })],
+            None,
+        )))
+        .unwrap();
+    control.send(Command::SetClickGain(Gain::new(0.0))).unwrap();
+    let out = run_deck(&mut deck, FRAMES as usize - sent);
+    for frame in RAMP..FRAMES as usize - sent {
+        let heard = &out[8 * frame..8 * frame + 8];
+        assert_eq!(
+            [heard[0], heard[1], heard[4], heard[5], heard[6], heard[7]],
+            [0.0; 6],
+            "frame {}: A's drums moved to 3/4 and its click went silent",
+            sent + frame
+        );
+    }
+    let frame = 28_000 - sent;
+    let drums = at(&out, 8, frame, 2);
+    assert!(drums > 0.0, "A's drums fade out on 3/4");
+    assert_eq!(at(&out, 8, frame, 3), drums);
+}
+
+#[test]
+fn a_command_for_the_cued_item_reaches_it_and_not_the_current_one() {
+    let (a, b) = (steady_song(), steady_song());
+    let (mut deck, mut control) = Deck::new(deck_player(&a, Routes::STEREO), 1, 256);
+    control
+        .cue(deck_player(&b, Routes::STEREO), 2, Handoff::AutoLink)
+        .unwrap();
+    control.send(Command::Play).unwrap();
+    let mut out = run_deck(&mut deck, 1_024);
+    control
+        .send_cued(Command::SetStemGain {
+            stem: 0,
+            gain: Gain::new(0.25),
+        })
+        .unwrap();
+    out.extend(run_deck(&mut deck, FRAMES as usize));
+    let heard = main_pair(&out);
+    assert!(
+        heard[..FRAMES as usize]
+            .iter()
+            .all(|&pair| pair == [0.5, 0.5]),
+        "A plays on at unity"
+    );
+    assert!(
+        heard[FRAMES as usize..]
+            .iter()
+            .all(|&pair| pair == [0.125, 0.125]),
+        "B starts at the gain it was sent"
+    );
+}
+
+#[test]
+fn a_command_for_the_cued_item_is_dropped_when_nothing_is_cued() {
+    let mute = Command::SetStemGain {
+        stem: 0,
+        gain: Gain::new(0.0),
+    };
+    let (mut deck, mut control) = Deck::new(deck_player(&steady_song(), Routes::STEREO), 1, 256);
+    // Nothing was ever cued.
+    control.send_cued(mute).unwrap();
+    // The cued item was sent back.
+    control
+        .cue(
+            deck_player(&steady_song(), Routes::STEREO),
+            2,
+            Handoff::AutoLink,
+        )
+        .unwrap();
+    control.uncue().unwrap();
+    control.send_cued(mute).unwrap();
+    // Neither waits for the next cue.
+    control
+        .cue(
+            deck_player(&steady_song(), Routes::STEREO),
+            3,
+            Handoff::AutoLink,
+        )
+        .unwrap();
+    control.send(Command::Play).unwrap();
+    let out = run_deck(&mut deck, FRAMES as usize + 1_024);
+    assert_eq!(deck.status().item, 3);
+    assert!(
+        main_pair(&out).iter().all(|&pair| pair == [0.5, 0.5]),
+        "the current item and item 3 play at unity"
+    );
+}
+
+#[test]
+fn a_cued_gain_change_sent_as_the_handoff_happens_reaches_the_item_it_was_for() {
+    // Sent once the deck made B current, before the control thread knew:
+    // just after an AutoLink, and inside a crossfade.
+    for (handoff, sent) in [
+        (Handoff::AutoLink, 32_256),
+        (Handoff::Crossfade { frames: 2_048 }, 30_976),
+    ] {
+        let (mut deck, mut control) =
+            Deck::new(deck_player(&steady_song(), Routes::STEREO), 1, 256);
+        control
+            .cue(deck_player(&two_stems(), Routes::STEREO), 2, handoff)
+            .unwrap();
+        control.send(Command::Play).unwrap();
+        run_deck(&mut deck, sent);
+        assert_eq!(deck.status().item, 2, "{handoff:?}: B is current");
+        control
+            .send_cued(Command::SetStemGain {
+                stem: 1,
+                gain: Gain::new(0.5),
+            })
+            .unwrap();
+        let out = run_deck(&mut deck, 2_048);
+        assert_eq!(
+            main_pair(&out).last(),
+            Some(&[0.3125, 0.3125]),
+            "{handoff:?}: B's bass went to half"
+        );
+    }
+}
+
+#[test]
+fn a_command_sent_to_an_item_reaches_it_wherever_the_deck_holds_it_and_no_other() {
+    let mute_drums = Command::SetStemGain {
+        stem: 0,
+        gain: Gain::new(0.0),
+    };
+    // Inside a crossfade, A (item 1) is leaving under B: muting A's drums
+    // leaves what a silent A would, and B untouched.
+    let silent_a = (
+        steady_song().0,
+        vec![dc("drums", StemRole::Track, 0.0), silent_click()],
+    );
+    let crossfade = Handoff::Crossfade { frames: 2_048 };
+    let deck_from = |a: &(Song, Vec<StemAudio>)| {
+        let (deck, mut control) = Deck::new(deck_player(a, Routes::STEREO), 1, 256);
+        control
+            .cue(deck_player(&two_stems(), Routes::STEREO), 2, crossfade)
+            .unwrap();
+        control.send(Command::Play).unwrap();
+        (deck, control)
+    };
+    let (mut reference, _control) = deck_from(&silent_a);
+    let expected = run_deck(&mut reference, 33_024);
+    let (mut deck, mut control) = deck_from(&steady_song());
+    let sent = 30_976;
+    let mut out = run_deck(&mut deck, sent);
+    assert_eq!(deck.status().leaving, 1, "A is leaving");
+    control.send_to(1, mute_drums).unwrap();
+    out.extend(run_deck(&mut deck, 2_048));
+    let from = 8 * (sent + RAMP);
+    assert_eq!(bits(&out[from..]), bits(&expected[from..]));
+
+    // After an AutoLink, A is gone: nothing else takes its command.
+    let (mut deck, mut control) = Deck::new(deck_player(&steady_song(), Routes::STEREO), 1, 256);
+    control
+        .cue(
+            deck_player(&two_stems(), Routes::STEREO),
+            2,
+            Handoff::AutoLink,
+        )
+        .unwrap();
+    control.send(Command::Play).unwrap();
+    run_deck(&mut deck, 32_256);
+    control.send_to(1, mute_drums).unwrap();
+    let out = run_deck(&mut deck, 1_024);
+    assert!(
+        main_pair(&out).iter().all(|&pair| pair == [0.375, 0.375]),
+        "B plays at unity"
+    );
 }

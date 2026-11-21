@@ -139,7 +139,7 @@ impl Eq for Gain {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Routes {
     /// Destination of each bus, in [`domain::Bus::ALL`] order.
-    pub buses: [domain::Destination; 6],
+    pub buses: [domain::Destination; domain::Bus::ALL.len()],
     /// Where the main mix also plays, if anywhere.
     pub master: Option<domain::Destination>,
 }
@@ -148,7 +148,7 @@ impl Routes {
     /// Every bus on outputs 1 and 2, no master: the routing that plays
     /// exactly what the players played before routing existed.
     pub const STEREO: Routes = Routes {
-        buses: [domain::Destination::MAIN; 6],
+        buses: [domain::Destination::MAIN; domain::Bus::ALL.len()],
         master: None,
     };
 
