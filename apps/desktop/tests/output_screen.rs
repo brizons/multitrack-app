@@ -149,6 +149,42 @@ impl Bench {
         }
     }
 
+    /// Plays the song until its transport runs.
+    fn play(&mut self) {
+        let show = self.show.as_mut().expect("a song is open");
+        show.send(openvamp_desktop::action::UiAction::TogglePlay);
+        for _ in 0..100 {
+            self.fake.render(256);
+            show.poll();
+            if show.snapshot().output_frame > 0 {
+                return;
+            }
+        }
+        panic!("the transport never started");
+    }
+
+    /// `buffers` audio callbacks, the song and the screen polled after
+    /// each, as the screen's timer does.
+    fn run(&mut self, buffers: usize) {
+        for _ in 0..buffers {
+            self.fake.render(256);
+            if let Some(show) = &mut self.show {
+                show.poll();
+            }
+            self.page.follow(self.show.as_mut(), &mut self.settings);
+        }
+    }
+
+    /// The routing saved for `device`, as the settings file holds it.
+    fn stored(&self, device: &str) -> Option<Routing> {
+        Self::store(self.dir.path())
+            .load_routing()
+            .routing
+            .devices
+            .get(device)
+            .cloned()
+    }
+
     fn view(&self) -> OutputScreen {
         self.page.view(self.show.as_ref(), &self.settings)
     }
@@ -552,4 +588,145 @@ fn a_mix_not_saved_yet_carries_onto_the_device_the_song_opens_again_on() {
     assert!(show.snapshot().mixer.mix_changed);
     let mixer = MixerPage::new().view(Some(show)).unwrap();
     assert!(mixer.can_save, "Save mix to arrangement stays offered");
+}
+
+#[test]
+fn a_buffer_size_refused_once_the_song_has_ramped_out_is_not_kept_and_says_why() {
+    let mut bench = Bench::on("fake:2");
+    bench.play();
+    bench.fake.set_buffer_range("fake:2", Some((256, 256)));
+
+    bench.act(OutputAction::Buffer(128));
+
+    let view = bench.view();
+    assert!(
+        view.applying,
+        "the song ramps out before the device opens again"
+    );
+    assert_eq!(view.notices, Vec::<String>::new());
+    assert_eq!(bench.settings.buffer_frames(), 256, "not kept yet");
+    bench.run(40);
+    let view = bench.view();
+    assert!(!view.applying);
+    assert_eq!(
+        notices_starting(&view, "The buffer size could not be changed: "),
+        1,
+        "{:?}",
+        view.notices
+    );
+    assert_eq!(bench.settings.buffer_frames(), 256);
+}
+
+#[test]
+fn a_buffer_size_taken_once_the_song_has_ramped_out_is_kept() {
+    let mut bench = Bench::on("fake:2");
+    bench.play();
+
+    bench.act(OutputAction::Buffer(512));
+
+    assert!(bench.view().applying);
+    assert_eq!(bench.settings.buffer_frames(), 256, "not kept yet");
+    bench.run(40);
+    let view = bench.view();
+    assert!(!view.applying);
+    assert_eq!((view.buffer, bench.settings.buffer_frames()), (512, 512));
+    assert_eq!(view.notices, Vec::<String>::new());
+}
+
+#[test]
+fn a_routing_needing_more_outputs_the_device_refuses_while_playing_is_not_saved() {
+    // Saved on outputs 1/2 only, so the stream opens with two channels.
+    let mut bench = Bench::with_saved("fake:2", Some(Routing::stereo(8)));
+    bench.play();
+    // The device refuses to open again, whatever it is asked.
+    bench.fake.set_rates("fake:2", Some(&[]));
+
+    // The preset needs all eight outputs: the stream opens again once the
+    // song has ramped out, and the device refuses it.
+    bench.act(OutputAction::Reset);
+
+    assert!(bench.view().applying);
+    assert_eq!(bench.stored("fake:2"), Some(Routing::stereo(8)));
+    bench.run(40);
+    let view = bench.view();
+    assert!(!view.applying);
+    assert_eq!(
+        notices_starting(&view, "The routing could not be applied: "),
+        1,
+        "{:?}",
+        view.notices
+    );
+    assert_eq!(bench.stored("fake:2"), Some(Routing::stereo(8)));
+}
+
+#[test]
+fn a_routing_needing_more_outputs_taken_while_playing_is_saved_once_it_plays() {
+    let mut bench = Bench::with_saved("fake:2", Some(Routing::stereo(8)));
+    bench.play();
+
+    bench.act(OutputAction::Reset);
+
+    assert!(bench.view().applying);
+    assert_eq!(bench.stored("fake:2"), Some(Routing::stereo(8)), "not yet");
+    bench.run(40);
+    assert!(!bench.view().applying);
+    assert_eq!(bench.view().notices, Vec::<String>::new());
+    assert_eq!(bench.stored("fake:2"), Some(Routing::preset(8)));
+}
+
+#[test]
+fn a_change_needing_no_reopen_is_kept_while_an_earlier_refusal_holds_the_device() {
+    let mut bench = Bench::on("fake:2");
+    bench.fake.set_buffer_range("fake:2", Some((256, 256)));
+    // Silent: the device is asked at once, refuses, and is held.
+    bench.act(OutputAction::Buffer(128));
+    assert_eq!(
+        notices_starting(&bench.view(), "The buffer size could not be changed: "),
+        1
+    );
+
+    bench.act(OutputAction::Cell {
+        bus: Bus::Vocals,
+        output: 3,
+    });
+
+    let view = bench.view();
+    assert_eq!(
+        notices_starting(&view, "The routing could not be applied: "),
+        0,
+        "{:?}",
+        view.notices
+    );
+    assert_eq!(
+        bench
+            .stored("fake:2")
+            .map(|routing| routing.destination(Bus::Vocals)),
+        Some(Destination::Mono(3))
+    );
+}
+
+#[test]
+fn a_routing_for_more_outputs_than_the_device_now_has_plays_refitted_and_is_saved() {
+    let mut bench = Bench::with_saved("fake:2", Some(Routing::stereo(8)));
+    bench.play();
+    // The interface now has two outputs, though the list still says eight.
+    bench.fake.set_channels("fake:2", 2);
+
+    bench.act(OutputAction::Reset);
+    bench.run(40);
+
+    let view = bench.view();
+    assert!(!view.applying, "the session took it, fitted to two outputs");
+    assert_eq!(
+        notices_starting(&view, "The routing could not be applied: "),
+        0,
+        "{:?}",
+        view.notices
+    );
+    assert_eq!(bench.routing().outputs, 2);
+    assert_eq!(
+        bench.stored("fake:2"),
+        Some(Routing::preset(8)),
+        "saved as asked, for when the device has its eight outputs again"
+    );
 }

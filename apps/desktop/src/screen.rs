@@ -268,6 +268,8 @@ impl Perform {
             show.send(UiAction::Panic);
         }
         show.poll();
+        // A buffer size or routing waiting for the stream to open again.
+        self.output.follow(Some(show), &mut self.settings);
         cx.notify();
     }
 

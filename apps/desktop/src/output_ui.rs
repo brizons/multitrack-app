@@ -84,7 +84,16 @@ pub fn output(view: &OutputScreen, cx: &mut Context<Perform>) -> impl IntoElemen
                         .text_size(px(14.))
                         .text_color(theme::text_muted())
                         .child("Saved per device · changes apply instantly"),
-                ),
+                )
+                .when(view.applying, |row| {
+                    row.child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::queued())
+                            .child("Applying…"),
+                    )
+                }),
         )
         .children(view.notices.iter().map(|notice| {
             div()
