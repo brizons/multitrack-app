@@ -8,28 +8,38 @@
 //!
 //! # The rules table
 //!
-//! The table is our own, written from scratch. It maps words to buses:
+//! The table is our own, written from scratch. It maps English and Spanish
+//! words to buses:
 //!
-//! | Bus | Words |
-//! |-----|-------|
-//! | Click & Guide | click, clk, metronome, guide, cue, count |
-//! | Drums | drum, kit, kick, kik, snare, snr, hat, hihat, hh, tom, overhead, cymbal, clap, snap, shaker, tamb, tambourine, perc, percussion, conga, bongo, cajon, timbale, cowbell, timpani; generic: room, loop, seq, sequence, beat |
-//! | Bass | bass, sub, synthbass, subbass, bassline |
-//! | Keys & Pads | keys, keyboard, kbd, piano, pno, rhodes, wurli, wurlitzer, organ, hammond, ep, clav, synth, pad, string, orchestra, orch, violin, viola, cello, brass, horn, trumpet, trombone, sax, saxophone, flute, woodwind, harp, bell, glock, glockenspiel, celesta, mellotron, accordion; generic: fx, sfx, riser, sweep, swell, ambient, ambience, atmos, atmosphere, texture, drone, arp, noise, impact |
-//! | Guitars | guitar, gtr, eg, ag, banjo, mandolin, mando, ukulele, uke, dobro; generic: acoustic, electric, steel, nylon |
-//! | Vocals | vocal, vox, voc, bgv, bv, choir, voice, singer; generic: harmony, harmonies, spoken, speech |
+//! | Bus | English words | Spanish words |
+//! |-----|---------------|---------------|
+//! | Click & Guide | click, clk, metronome, guide, cue, count | clic, metronomo, guia, cuenta |
+//! | Drums | drum, kit, kick, kik, snare, snr, hat, hihat, hh, tom, overhead, cymbal, clap, snap, shaker, tamb, tambourine, perc, percussion, conga, bongo, cajon, timbale, cowbell, timpani; generic: room, loop, seq, sequence, beat | bateria, bombo, caja, redoblante, platillo, percusion; generic: secuencia |
+//! | Bass | bass, sub, synthbass, subbass, bassline | bajo |
+//! | Keys & Pads | keys, keyboard, kbd, piano, pno, rhodes, wurli, wurlitzer, organ, hammond, ep, clav, synth, pad, string, orchestra, orch, violin, viola, cello, brass, horn, trumpet, trombone, sax, saxophone, flute, woodwind, harp, bell, glock, glockenspiel, celesta, mellotron, accordion; generic: fx, sfx, riser, sweep, swell, ambient, ambience, atmos, atmosphere, texture, drone, arp, noise, impact | teclado, organo, sintetizador, sintetizadores, sinte, colchon, colchones, cuerda, violines, chelo, viento, metales, trompeta, saxo, flauta, campana |
+//! | Guitars | guitar, gtr, eg, ag, banjo, mandolin, mando, ukulele, uke, dobro; generic: acoustic, electric, steel, nylon | guitarra, requinto, charango; generic: electrica, electrico, acustica, acustico |
+//! | Vocals | vocal, vox, voc, bgv, bv, choir, voice, singer; generic: harmony, harmonies, spoken, speech | voz, voces, coro; generic: armonia |
 //!
-//! Two-word instruments come first: "bass guitar" and "bass synth" go to Bass,
-//! "bass drum" to Drums.
+//! Words both languages share (piano, pad, sub, loop, violin) are listed once,
+//! in English. Plurals the final-`s` rule below cannot reach (voces, metales,
+//! violines, colchones, sintetizadores) are listed as they are.
+//!
+//! Two-word instruments come first: "bass guitar", "bass synth", "bajo sinte"
+//! and "bajo sintetizador" go to Bass, "bass drum" to Drums, and "voz guia"
+//! (a guide vocal, noun first) to Vocals.
 //!
 //! A name is split into words at every character that is not a letter
 //! (spaces, `_`, `-`, `.`, `/`, brackets, digits) and where a lowercase letter
 //! meets an uppercase one (`AcGtr` is "ac gtr"); words are compared in
-//! lowercase, and a word that is not in the table is also tried without a
-//! final `s` (`Toms`, `BGVs`). `EG 1`, `eg_1` and `Eg1` are all "eg".
+//! lowercase without accents (`Batería` is "bateria", `Colchón` is
+//! "colchon"), and a word that is not in the table is also tried without a
+//! final `s` (`Toms`, `BGVs`, `Teclados`). `EG 1`, `eg_1` and `Eg1` are all
+//! "eg".
 //!
 //! The **last** instrument word of a name decides, because file names often
-//! start with the song title ("Guide Me O Thou - Piano" goes to Keys & Pads).
+//! start with the song title ("Guide Me O Thou - Piano" goes to Keys & Pads,
+//! "Cuenta Conmigo - Bajo" to Bass). A title alone can still name an
+//! instrument ("Bajo Tu Gracia" goes to Bass), which a part overrides.
 //! Generic words (loop, fx, ambient, acoustic...) decide only when the name
 //! has no instrument word: "Gtr Loop" goes to Guitars, "Loop" to Drums.
 //!
@@ -176,6 +186,10 @@ const RULES: &[(&str, Bus, Weight)] = &[
     ("guide", Bus::ClickGuide, Instrument),
     ("cue", Bus::ClickGuide, Instrument),
     ("count", Bus::ClickGuide, Instrument),
+    ("clic", Bus::ClickGuide, Instrument),
+    ("metronomo", Bus::ClickGuide, Instrument),
+    ("guia", Bus::ClickGuide, Instrument),
+    ("cuenta", Bus::ClickGuide, Instrument),
     // Drums.
     ("drum", Bus::Drums, Instrument),
     ("kit", Bus::Drums, Instrument),
@@ -207,12 +221,20 @@ const RULES: &[(&str, Bus, Weight)] = &[
     ("seq", Bus::Drums, Generic),
     ("sequence", Bus::Drums, Generic),
     ("beat", Bus::Drums, Generic),
+    ("bateria", Bus::Drums, Instrument),
+    ("bombo", Bus::Drums, Instrument),
+    ("caja", Bus::Drums, Instrument),
+    ("redoblante", Bus::Drums, Instrument),
+    ("platillo", Bus::Drums, Instrument),
+    ("percusion", Bus::Drums, Instrument),
+    ("secuencia", Bus::Drums, Generic),
     // Bass.
     ("bass", Bus::Bass, Instrument),
     ("sub", Bus::Bass, Instrument),
     ("synthbass", Bus::Bass, Instrument),
     ("subbass", Bus::Bass, Instrument),
     ("bassline", Bus::Bass, Instrument),
+    ("bajo", Bus::Bass, Instrument),
     // Keys & Pads.
     ("keys", Bus::KeysPads, Instrument),
     ("keyboard", Bus::KeysPads, Instrument),
@@ -263,6 +285,22 @@ const RULES: &[(&str, Bus, Weight)] = &[
     ("arp", Bus::KeysPads, Generic),
     ("noise", Bus::KeysPads, Generic),
     ("impact", Bus::KeysPads, Generic),
+    ("teclado", Bus::KeysPads, Instrument),
+    ("organo", Bus::KeysPads, Instrument),
+    ("sintetizador", Bus::KeysPads, Instrument),
+    ("sintetizadores", Bus::KeysPads, Instrument),
+    ("sinte", Bus::KeysPads, Instrument),
+    ("colchon", Bus::KeysPads, Instrument),
+    ("colchones", Bus::KeysPads, Instrument),
+    ("cuerda", Bus::KeysPads, Instrument),
+    ("violines", Bus::KeysPads, Instrument),
+    ("chelo", Bus::KeysPads, Instrument),
+    ("viento", Bus::KeysPads, Instrument),
+    ("metales", Bus::KeysPads, Instrument),
+    ("trompeta", Bus::KeysPads, Instrument),
+    ("saxo", Bus::KeysPads, Instrument),
+    ("flauta", Bus::KeysPads, Instrument),
+    ("campana", Bus::KeysPads, Instrument),
     // Guitars.
     ("guitar", Bus::Guitars, Instrument),
     ("gtr", Bus::Guitars, Instrument),
@@ -278,6 +316,13 @@ const RULES: &[(&str, Bus, Weight)] = &[
     ("electric", Bus::Guitars, Generic),
     ("steel", Bus::Guitars, Generic),
     ("nylon", Bus::Guitars, Generic),
+    ("guitarra", Bus::Guitars, Instrument),
+    ("requinto", Bus::Guitars, Instrument),
+    ("charango", Bus::Guitars, Instrument),
+    ("electrica", Bus::Guitars, Generic),
+    ("electrico", Bus::Guitars, Generic),
+    ("acustica", Bus::Guitars, Generic),
+    ("acustico", Bus::Guitars, Generic),
     // Vocals.
     ("vocal", Bus::Vocals, Instrument),
     ("vox", Bus::Vocals, Instrument),
@@ -291,6 +336,10 @@ const RULES: &[(&str, Bus, Weight)] = &[
     ("harmonies", Bus::Vocals, Generic),
     ("spoken", Bus::Vocals, Generic),
     ("speech", Bus::Vocals, Generic),
+    ("voz", Bus::Vocals, Instrument),
+    ("voces", Bus::Vocals, Instrument),
+    ("coro", Bus::Vocals, Instrument),
+    ("armonia", Bus::Vocals, Generic),
 ];
 
 /// Two-word instruments, checked before the second word alone.
@@ -298,6 +347,9 @@ const PHRASES: &[(&str, &str, Bus)] = &[
     ("bass", "guitar", Bus::Bass),
     ("bass", "synth", Bus::Bass),
     ("bass", "drum", Bus::Drums),
+    ("bajo", "sinte", Bus::Bass),
+    ("bajo", "sintetizador", Bus::Bass),
+    ("voz", "guia", Bus::Vocals),
 ];
 
 fn rule(word: &str) -> Option<(Bus, Weight)> {
@@ -341,7 +393,7 @@ fn words(name: &str) -> Vec<String> {
         if previous_lowercase && c.is_uppercase() {
             push_word(&mut words, &mut current);
         }
-        current.extend(c.to_lowercase());
+        current.extend(c.to_lowercase().map(without_accent));
         previous_lowercase = c.is_lowercase();
     }
     push_word(&mut words, &mut current);
@@ -351,6 +403,20 @@ fn words(name: &str) -> Vec<String> {
 fn push_word(words: &mut Vec<String>, current: &mut String) {
     if !current.is_empty() {
         words.push(std::mem::take(current));
+    }
+}
+
+/// A lowercase letter without its accent: `á` is `a`, `ñ` is `n`.
+fn without_accent(c: char) -> char {
+    match c {
+        'á' | 'à' | 'â' | 'ä' | 'ã' => 'a',
+        'é' | 'è' | 'ê' | 'ë' => 'e',
+        'í' | 'ì' | 'î' | 'ï' => 'i',
+        'ó' | 'ò' | 'ô' | 'ö' | 'õ' => 'o',
+        'ú' | 'ù' | 'û' | 'ü' => 'u',
+        'ñ' => 'n',
+        'ç' => 'c',
+        _ => c,
     }
 }
 

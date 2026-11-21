@@ -167,3 +167,100 @@ fn unknown_parts_fall_to_the_default_bus() {
         DEFAULT_BUS
     );
 }
+
+#[test]
+fn spanish_parts_go_to_the_bus_of_their_instrument() {
+    assert_names(&[
+        ("Clic", Bus::ClickGuide),
+        ("Metrónomo", Bus::ClickGuide),
+        ("Guía", Bus::ClickGuide),
+        ("Cuenta", Bus::ClickGuide),
+        ("Batería", Bus::Drums),
+        ("Bombo", Bus::Drums),
+        ("Caja", Bus::Drums),
+        ("Redoblante", Bus::Drums),
+        ("Platillos", Bus::Drums),
+        ("Percusión", Bus::Drums),
+        ("Loop", Bus::Drums),
+        ("Secuencia", Bus::Drums),
+        ("Secuencias", Bus::Drums),
+        ("Bajo", Bus::Bass),
+        ("Bajo Eléctrico", Bus::Bass),
+        ("Sub", Bus::Bass),
+        ("Teclado", Bus::KeysPads),
+        ("Teclados", Bus::KeysPads),
+        ("Piano", Bus::KeysPads),
+        ("Órgano", Bus::KeysPads),
+        ("Sintetizador", Bus::KeysPads),
+        ("Sintetizadores", Bus::KeysPads),
+        ("Sinte", Bus::KeysPads),
+        ("Pad", Bus::KeysPads),
+        ("Colchón", Bus::KeysPads),
+        ("Colchones", Bus::KeysPads),
+        ("Cuerdas", Bus::KeysPads),
+        ("Violín", Bus::KeysPads),
+        ("Violines", Bus::KeysPads),
+        ("Chelo", Bus::KeysPads),
+        ("Vientos", Bus::KeysPads),
+        ("Metales", Bus::KeysPads),
+        ("Trompeta", Bus::KeysPads),
+        ("Saxo", Bus::KeysPads),
+        ("Flauta", Bus::KeysPads),
+        ("Campanas", Bus::KeysPads),
+        ("Guitarra", Bus::Guitars),
+        ("Guitarras", Bus::Guitars),
+        ("Guitarra Eléctrica", Bus::Guitars),
+        ("Guitarra Acústica", Bus::Guitars),
+        ("Eléctrica", Bus::Guitars),
+        ("Acústica", Bus::Guitars),
+        ("Requinto", Bus::Guitars),
+        ("Charango", Bus::Guitars),
+        ("Voz", Bus::Vocals),
+        ("Voces", Bus::Vocals),
+        ("Coro", Bus::Vocals),
+        ("Coros", Bus::Vocals),
+        ("Segunda Voz", Bus::Vocals),
+        ("Armonía", Bus::Vocals),
+        ("Armonías", Bus::Vocals),
+    ]);
+}
+
+#[test]
+fn accents_are_ignored() {
+    assert_names(&[
+        ("Bateria", Bus::Drums),
+        ("BATERÍA", Bus::Drums),
+        ("percusion", Bus::Drums),
+        ("Organo", Bus::KeysPads),
+        ("Colchon", Bus::KeysPads),
+        ("Violin", Bus::KeysPads),
+        ("Guia", Bus::ClickGuide),
+        ("Metronomo", Bus::ClickGuide),
+        ("Armonias", Bus::Vocals),
+        ("GUITARRA ELÉCTRICA", Bus::Guitars),
+    ]);
+}
+
+#[test]
+fn spanish_names_follow_the_same_precedence() {
+    assert_names(&[
+        // The last instrument word wins over a song title.
+        ("Bajo Tu Gracia - Piano", Bus::KeysPads),
+        ("Cuenta Conmigo - Bajo", Bus::Bass),
+        ("Guía Mis Pasos - Guitarra", Bus::Guitars),
+        ("Tu Voz - Teclado", Bus::KeysPads),
+        // Generic words never beat an instrument.
+        ("Guitarra Loop", Bus::Guitars),
+        ("Bajo Acústico", Bus::Bass),
+        ("Piano Eléctrico", Bus::KeysPads),
+        ("Voz Armonía", Bus::Vocals),
+        // Two-word instruments, with the noun first.
+        ("Voz Guía", Bus::Vocals),
+        ("Bajo Sinte", Bus::Bass),
+        ("Bajo Sintetizador", Bus::Bass),
+        // Spanish and English words mix.
+        ("Sinte Bass", Bus::Bass),
+        ("EG Requinto", Bus::Guitars),
+    ]);
+    assert_eq!(bus_for_stem(&track("", "stems/Batería 2.wav")), Bus::Drums);
+}
