@@ -442,6 +442,10 @@ pub struct Session {
     withdrawn_mix: Option<(u64, ItemMix)>,
     /// The generated click's gain, as the players have it.
     click_gain: f32,
+    /// The players do not have every gain the mix and the bus settings
+    /// give yet (the queue to the audio thread was full): every poll sends
+    /// what is missing until they do.
+    gains_pending: bool,
 }
 
 /// A song folder opened for streaming with its player built, ready to play
@@ -573,6 +577,7 @@ impl PreparedSong {
             cued_mix: None,
             withdrawn_mix: None,
             click_gain,
+            gains_pending: false,
         };
         match session.open_held(state) {
             Ok((stream, home)) => {
@@ -718,8 +723,9 @@ impl Session {
 
     /// Moves the session on and returns its state: starts a play that waited
     /// for the disk, notices a lost device (pausing the transport) and opens
-    /// it again when it is back, and records decode failures and waiting
-    /// jumps as [`Snapshot::last_error`]. Shells call it about 30 times a
+    /// it again when it is back, sends the players the gains a full queue
+    /// kept from them, and records decode failures and waiting jumps as
+    /// [`Snapshot::last_error`]. Shells call it about 30 times a
     /// second; nothing advances between calls.
     pub fn poll(&mut self) -> Snapshot {
         let (report, now) = self.begin_poll();
@@ -734,6 +740,11 @@ impl Session {
             drop(player);
         }
         self.watch_device(now);
+        if self.gains_pending {
+            // The queue was full; it may have room now. Still full, the
+            // rest waits for the next poll.
+            let _ = self.send_gains();
+        }
         (*self.reports.read(), now)
     }
 
@@ -787,7 +798,9 @@ impl Session {
 
     /// Changes the mix or the bus settings as `command`, a mixer command,
     /// says, then sends the players what that changes. A command refused
-    /// (an unknown stem, a volume out of range) changes nothing.
+    /// (an unknown stem, a volume out of range) changes nothing; one the
+    /// full queue refuses returns [`RuntimeError::QueueFull`] but stands,
+    /// and reaches the players from the next polls.
     fn mixer(&mut self, command: Command) -> Result<(), RuntimeError> {
         let valid = |volume: Volume| {
             if volume.is_valid() {
@@ -857,7 +870,10 @@ impl Session {
     /// Sends the current and the cued item the gains their mixes and the
     /// bus settings give, and every item the click's gain: only what
     /// changed, each item by its deck number, so a handoff on its way does
-    /// not give one item's gains to another's stems.
+    /// not give one item's gains to another's stems. What the queue to the
+    /// audio thread refuses stays to send: the mix and the bus settings
+    /// keep what was asked, and every poll sends the rest until the players
+    /// have it, so a burst of changes ends at the last one.
     fn send_gains(&mut self) -> Result<(), RuntimeError> {
         let mut result = Ok(());
         let current = self.item;
@@ -878,6 +894,7 @@ impl Session {
             }
         }
         self.apply_if_held();
+        self.gains_pending = result.is_err();
         result
     }
 

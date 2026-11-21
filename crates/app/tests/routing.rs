@@ -17,7 +17,7 @@ use app::{
 };
 use domain::{
     Arrangement, Bus, Destination, Routing, SectionMarker, SectionType, Setlist, SetlistItem,
-    SongItem, SongPackage, Stem, StemRole, TempoPoint, TimeSignaturePoint, Transition,
+    SongItem, SongPackage, Stem, StemRole, TempoPoint, TimeSignaturePoint, Transition, Volume,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use library::Library;
@@ -416,4 +416,114 @@ fn every_setlist_item_plays_with_the_routing_and_a_change_reaches_the_cued_one()
         "the second song plays with the new routing"
     );
     assert_eq!(fake.opened().len(), 1, "one stream for both songs");
+}
+
+#[test]
+fn a_mixer_command_the_queue_refuses_still_reaches_the_audio_or_changes_nothing() {
+    let dir = band();
+    let fake = device(8);
+    let mut session = open(dir.path(), &fake, Some(Routing::preset(8)));
+    play(&mut session, &fake, 512);
+    let refused = (0..64).find(|k| {
+        let db = if k % 2 == 0 { 12.0 } else { -40.0 };
+        session
+            .send(Command::SetMasterVolume(Volume::from_db(db)))
+            .is_err()
+    });
+    assert!(refused.is_some(), "the command queue filled");
+    run(&mut session, &fake, 4_096);
+    let snapshot = session.poll();
+    let master = snapshot.mixer.buses.master_volume.gain() as f32;
+    for stem in &snapshot.mixer.stems {
+        assert!(
+            (stem.gain - master).abs() < 1e-6,
+            "{} plays {} while the master shows {master}",
+            stem.id,
+            stem.gain
+        );
+    }
+}
+
+/// A setlist of two band songs linked by AutoLink, on `fake`.
+fn two_songs(dir: &Path, fake: &FakeOutput) -> SetlistSession {
+    write_band(&dir.join("first"));
+    write_band(&dir.join("second"));
+    let library = Library::new(dir);
+    let mut setlist = Setlist::new("Sunday");
+    setlist.items = ["first", "second"]
+        .into_iter()
+        .map(|path| {
+            SetlistItem::Song(SongItem {
+                transition: Transition::AutoLink,
+                ..SongItem::new(path)
+            })
+        })
+        .collect();
+    let file = library.save_setlist(&setlist).unwrap().file;
+    SetlistSession::open(&library, &file, Box::new(fake.clone()), options(None)).unwrap()
+}
+
+fn setlist_step(
+    session: &mut SetlistSession,
+    fake: &FakeOutput,
+) -> (Vec<f32>, app::SetlistSnapshot) {
+    for monitor in session.disk_monitors() {
+        assert!(monitor.wait_idle(Duration::from_secs(10)));
+    }
+    let out = fake.render(256).expect("a stream plays");
+    (out, session.poll())
+}
+
+#[test]
+fn a_refused_mixer_command_still_reaches_the_cued_setlist_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = FakeOutput::new();
+    let mut session = two_songs(dir.path(), &fake);
+    session.send(SetlistCommand::Item(Command::Play)).unwrap();
+    assert!(
+        (0..100).any(|_| setlist_step(&mut session, &fake).1.setlist.next_ready),
+        "the second song is cued"
+    );
+    let refused = (0..64).find(|k| {
+        let db = if k % 2 == 0 { 12.0 } else { -40.0 };
+        session
+            .send(SetlistCommand::Item(Command::SetMasterVolume(
+                Volume::from_db(db),
+            )))
+            .is_err()
+    });
+    assert!(refused.is_some(), "the command queue filled");
+    let master = session.bus_settings().master_volume.gain() as f32;
+    let mut out = Vec::new();
+    for _ in 0..16 {
+        out = setlist_step(&mut session, &fake).0;
+    }
+    assert!(
+        (last(&out, 2)[0] - ALL * master).abs() < 1e-5,
+        "the first song plays {:?}, the master shows {master}",
+        last(&out, 2)
+    );
+    let mut snapshot = session.poll();
+    for _ in 0..FRAMES / 256 + 16 {
+        let (frames, next) = setlist_step(&mut session, &fake);
+        out = frames;
+        snapshot = next;
+        if snapshot.setlist.current == 1 && snapshot.song.output_frame > 1_024 {
+            break;
+        }
+    }
+    assert_eq!(snapshot.setlist.current, 1, "the second song plays");
+    for stem in &snapshot.song.mixer.stems {
+        assert!(
+            (stem.gain - master).abs() < 1e-6,
+            "{} plays {} while the master shows {master}",
+            stem.id,
+            stem.gain
+        );
+    }
+    assert!(
+        (last(&out, 2)[0] - ALL * master).abs() < 1e-5,
+        "the second song plays {:?}, the master shows {master}",
+        last(&out, 2)
+    );
 }
