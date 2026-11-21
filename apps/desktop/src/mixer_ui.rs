@@ -9,7 +9,10 @@ use gpui::{
     AnyElement, ClickEvent, Context, Div, DragMoveEvent, ElementId, FontWeight, IntoElement,
     Render, SharedString, Stateful, Window, div, prelude::*, px, relative,
 };
-use openvamp_desktop::mixer::{BusStrip, Layer, MasterStrip, MixerAction, MixerScreen, StemStrip};
+use openvamp_desktop::mixer::{
+    BusStrip, FADER_CAP_HEIGHT, FADER_CAP_WIDTH, FADER_PADDING, Layer, MasterStrip, MixerAction,
+    MixerScreen, StemStrip, fader_drag_position,
+};
 
 use crate::screen::Perform;
 use crate::theme;
@@ -545,7 +548,7 @@ fn fader(
         .min_h(px(120.))
         .w(px(36.))
         // Room for the cap at both ends.
-        .py(px(7.))
+        .py(px(FADER_PADDING))
         .cursor_pointer()
         .on_drag(FaderDrag(target), |_, _, _, cx| cx.new(|_| NoPreview))
         .on_drag_move(
@@ -553,10 +556,12 @@ fn fader(
                 if event.drag(cx).0 != target {
                     return;
                 }
-                let top = f32::from(event.bounds.origin.y) + 7.0;
-                let height = (f32::from(event.bounds.size.height) - 14.0).max(1.0);
-                let from_top = (f32::from(event.event.position.y) - top) / height;
-                screen.mixer_act(target.moved(1.0 - from_top.clamp(0.0, 1.0)), cx);
+                let position = fader_drag_position(
+                    f32::from(event.bounds.origin.y),
+                    f32::from(event.bounds.size.height),
+                    f32::from(event.event.position.y),
+                );
+                screen.mixer_act(target.moved(position), cx);
             }),
         )
         .on_click(cx.listener(move |screen, event: &ClickEvent, _, cx| {
@@ -575,9 +580,9 @@ fn fader(
                     div()
                         .absolute()
                         .top(relative(1.0 - position.clamp(0.0, 1.0)))
-                        .mt(px(-7.))
-                        .w(px(26.))
-                        .h(px(14.))
+                        .mt(px(-FADER_PADDING))
+                        .w(px(FADER_CAP_WIDTH))
+                        .h(px(FADER_CAP_HEIGHT))
                         .rounded(px(4.))
                         .bg(cap),
                 ),

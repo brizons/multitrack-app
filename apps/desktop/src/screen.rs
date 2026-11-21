@@ -22,7 +22,7 @@ use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_req
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
 use openvamp_desktop::library_page::{Dragged, LibraryPage, Opened, library_to_open};
-use openvamp_desktop::mixer::{MixerAction, MixerPage};
+use openvamp_desktop::mixer::{MixerAction, MixerPage, restore_mix, unsaved_mix};
 use openvamp_desktop::output_page::{OutputAction, OutputPage};
 use openvamp_desktop::reorder::Half;
 use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
@@ -209,8 +209,8 @@ impl Perform {
         // The saved routing of the device it opens on, and the bus settings,
         // with the last bus changes in them.
         self.save_waiting_buses();
-        let devices = CpalOutput::new().devices().unwrap_or_default();
-        let options = self.settings.options(&devices);
+        let listed = CpalOutput::new().devices();
+        let (options, fallback) = self.settings.open_options(&listed);
         let replaced = replace(
             &mut self.loaded,
             source,
@@ -231,6 +231,11 @@ impl Perform {
                 self.problems
                     .insert(0, format!("Could not open {}:", source.describe()));
             }
+        }
+        // Not the device asked for: say which one plays instead.
+        if let Some(notice) = fallback {
+            eprintln!("warning: {notice}");
+            self.problems.push(notice);
         }
     }
 
@@ -433,8 +438,13 @@ impl Perform {
             .output
             .act(action, self.loaded.as_mut(), &mut self.settings);
         if reopen && let Some(show) = &self.loaded {
+            // A mix not saved yet carries onto the new device.
+            let unsaved = unsaved_mix(show);
             let source = show.source();
             self.open(&source);
+            if let (Some(show), Some(unsaved)) = (&mut self.loaded, &unsaved) {
+                restore_mix(show, unsaved);
+            }
         }
         if let Some(show) = &mut self.loaded {
             show.poll();

@@ -170,3 +170,77 @@ fn the_buffer_size_chosen_opens_the_next_session() {
     let options = settings.options(&devices(&FakeOutput::new()));
     assert_eq!(options.buffer_frames, 128);
 }
+
+fn interface() -> DeviceInfo {
+    DeviceInfo {
+        id: "usb:1".to_owned(),
+        name: "Interface".to_owned(),
+        output_channels: 8,
+        is_default: false,
+    }
+}
+
+fn laptop() -> DeviceInfo {
+    DeviceInfo {
+        id: "builtin:1".to_owned(),
+        name: "Laptop".to_owned(),
+        output_channels: 2,
+        is_default: true,
+    }
+}
+
+#[test]
+fn a_device_list_that_fails_opens_the_default_device_in_plain_stereo_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = AudioSettings::load(Some(store(&dir)));
+    settings.choose(&interface());
+    let error = app::OutputError::NoDevice;
+
+    let (options, notice) = settings.open_options(&Err(error.clone()));
+
+    assert_eq!((options.device, options.routing), (None, None));
+    assert_eq!(
+        notice.as_deref(),
+        Some(
+            format!(
+                "The output devices could not be listed ({error}), so \"Interface\" is not used: the system's default device plays in plain stereo"
+            )
+            .as_str()
+        )
+    );
+    settings.choose_device(None);
+    let (_, notice) = settings.open_options(&Err(error.clone()));
+    assert_eq!(
+        notice,
+        Some(format!(
+            "The output devices could not be listed ({error}), so the system's default device plays in plain stereo, without its saved routing"
+        ))
+    );
+}
+
+#[test]
+fn a_chosen_device_that_is_not_connected_says_which_one_plays_instead() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = AudioSettings::load(Some(store(&dir)));
+    settings.choose(&interface());
+
+    let (options, notice) = settings.open_options(&Ok(vec![laptop()]));
+    assert_eq!(options.device.as_deref(), Some("builtin:1"));
+    assert_eq!(
+        notice.as_deref(),
+        Some("\"Interface\" is not connected, so \"Laptop\" plays instead")
+    );
+
+    let (options, notice) = settings.open_options(&Ok(Vec::new()));
+    assert_eq!((options.device, options.routing), (None, None));
+    assert_eq!(
+        notice.as_deref(),
+        Some(
+            "\"Interface\" is not connected, so the system's default device plays in plain stereo"
+        )
+    );
+
+    let (options, notice) = settings.open_options(&Ok(vec![laptop(), interface()]));
+    assert_eq!(options.device.as_deref(), Some("usb:1"));
+    assert_eq!(notice, None, "the device chosen plays");
+}

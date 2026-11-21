@@ -463,3 +463,22 @@ fn a_bus_chip_opens_its_choices_and_a_choice_closes_them() {
     assert_eq!(view.bus_menu, None);
     assert_eq!(view.stems[1].bus, Bus::Bass);
 }
+
+#[test]
+fn a_fader_drag_reads_the_cap_centre_along_the_padded_track() {
+    use openvamp_desktop::mixer::{FADER_PADDING, fader_drag_position};
+
+    // 200 points of travel between the paddings.
+    let (top, height) = (100.0, 200.0 + 2.0 * FADER_PADDING);
+
+    assert_eq!(fader_drag_position(top, height, top + FADER_PADDING), 1.0);
+    assert_eq!(
+        fader_drag_position(top, height, top + height - FADER_PADDING),
+        0.0
+    );
+    assert_eq!(fader_drag_position(top, height, top + height / 2.0), 0.5);
+    assert_eq!(fader_drag_position(top, height, top - 50.0), 1.0, "above");
+    assert_eq!(fader_drag_position(top, height, top + height + 50.0), 0.0);
+    let squeezed = fader_drag_position(top, 2.0 * FADER_PADDING, top + 3.0);
+    assert!((0.0..=1.0).contains(&squeezed), "no travel: {squeezed}");
+}

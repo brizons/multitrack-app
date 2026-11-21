@@ -6,7 +6,7 @@
 //! defaults are played; with no configuration folder the settings last
 //! until the app closes.
 
-use app::{DeviceInfo, SessionOptions};
+use app::{DeviceInfo, OutputError, SessionOptions};
 use domain::{BusSettings, Routing, RoutingFile};
 use library::ConfigStore;
 
@@ -19,6 +19,8 @@ pub struct AudioSettings {
     buses: BusSettings,
     notices: Vec<String>,
     device: Option<String>,
+    /// The chosen device's name, for messages.
+    device_name: Option<String>,
     buffer_frames: u32,
 }
 
@@ -70,6 +72,7 @@ impl AudioSettings {
             buses,
             notices,
             device: None,
+            device_name: None,
             buffer_frames: SessionOptions::default().buffer_frames,
         }
     }
@@ -95,6 +98,44 @@ impl AudioSettings {
         }
     }
 
+    /// [`Self::options`] for the devices the system `listed`, and why the
+    /// session does not open where it was asked to, when it does not: the
+    /// list failed (the system's default device then plays in plain
+    /// stereo), or the chosen device is not connected.
+    pub fn open_options(
+        &self,
+        listed: &Result<Vec<DeviceInfo>, OutputError>,
+    ) -> (SessionOptions, Option<String>) {
+        let wanted = self
+            .device
+            .as_ref()
+            .map(|id| format!("\"{}\"", self.device_name.as_deref().unwrap_or(id)));
+        let devices = match listed {
+            Ok(devices) => devices,
+            Err(error) => {
+                let notice = match wanted {
+                    Some(wanted) => format!(
+                        "The output devices could not be listed ({error}), so {wanted} is not used: the system's default device plays in plain stereo"
+                    ),
+                    None => format!(
+                        "The output devices could not be listed ({error}), so the system's default device plays in plain stereo, without its saved routing"
+                    ),
+                };
+                return (self.options(&[]), Some(notice));
+            }
+        };
+        let options = self.options(devices);
+        let notice = wanted
+            .filter(|_| options.device != self.device)
+            .map(|wanted| match self.device(devices) {
+                Some(used) => format!("{wanted} is not connected, so \"{}\" plays instead", used.name),
+                None => format!(
+                    "{wanted} is not connected, so the system's default device plays in plain stereo"
+                ),
+            });
+        (options, notice)
+    }
+
     /// The device of `devices` a session opens on ([`Self::options`]).
     pub fn device<'a>(&self, devices: &'a [DeviceInfo]) -> Option<&'a DeviceInfo> {
         let chosen = self
@@ -116,6 +157,14 @@ impl AudioSettings {
     /// for the system's default.
     pub fn choose_device(&mut self, device: Option<&str>) {
         self.device = device.map(str::to_owned);
+        self.device_name = None;
+    }
+
+    /// Chooses `device` for the next sessions, by its id; its name names it
+    /// in messages.
+    pub fn choose(&mut self, device: &DeviceInfo) {
+        self.device = Some(device.id.clone());
+        self.device_name = Some(device.name.clone());
     }
 
     /// The buffer size, in frames, the next sessions open with.

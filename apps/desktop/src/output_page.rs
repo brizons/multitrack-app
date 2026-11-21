@@ -6,7 +6,7 @@
 //! device's id); with nothing playing, the chosen device's routing is
 //! edited and saved for the next session.
 
-use app::{DeviceInfo, DeviceStatus, OutputError, RuntimeError};
+use app::{DeviceInfo, DeviceStatus, LossReason, OutputError, RuntimeError};
 use domain::{Bus, Destination, Routing};
 
 use crate::audio_settings::AudioSettings;
@@ -51,6 +51,39 @@ pub fn problem_notice(error: &RuntimeError) -> Option<String> {
 /// [`OutputError::TooFewChannels`].
 pub fn output_notice(error: &OutputError) -> Option<String> {
     matches!(error, OutputError::TooFewChannels { .. }).then(|| error.to_string())
+}
+
+/// Why `show` did not take a change that `result` reports: an error other
+/// than a full queue (which still reaches the players), or a device that
+/// refused to open again with the new settings and is held as a lost one.
+fn refusal(result: Result<(), RuntimeError>, show: &mut Show) -> Option<String> {
+    if let Err(error) = result
+        && !matches!(error, RuntimeError::QueueFull { .. })
+    {
+        return Some(error.to_string());
+    }
+    show.poll();
+    match &show.snapshot().device {
+        DeviceStatus::Disconnected {
+            reason: LossReason::Reconfigured,
+            reopen_error,
+            device,
+        } => Some(reopen_error.as_ref().map_or_else(
+            || format!("{device} refuses the new settings"),
+            ToString::to_string,
+        )),
+        _ => None,
+    }
+}
+
+/// The preset `routing` is for a device with `outputs` outputs, such as
+/// "8 outputs" (the device's own first, then the Preset menu's), or
+/// "Custom" once it is none of them.
+fn preset_name(routing: &Routing, outputs: u16) -> String {
+    std::iter::once(outputs)
+        .chain(PRESETS)
+        .find(|&preset| Routing::preset(preset).fit(outputs) == *routing)
+        .map_or_else(|| "Custom".to_owned(), outputs_text)
 }
 
 /// "8 kHz", "44.1 kHz".
@@ -163,7 +196,6 @@ pub struct OutputPage {
     devices: Vec<DeviceInfo>,
     device_menu: bool,
     preset_menu: bool,
-    preset: Option<u16>,
     problem: Option<String>,
 }
 
@@ -228,17 +260,23 @@ impl OutputPage {
                     return false;
                 };
                 let changed = current.is_none_or(|current| current.id != device.id);
-                settings.choose_device(Some(&device.id));
-                self.preset = None;
+                settings.choose(device);
                 return changed && show.is_some();
             }
             OutputAction::Buffer(frames) => {
-                settings.set_buffer_frames(frames);
-                self.problem = show.and_then(|show| {
-                    show.set_buffer_frames(frames)
-                        .err()
-                        .map(|error| format!("The buffer size could not be changed: {error}"))
-                });
+                let refused = match show {
+                    Some(show) => refusal(show.set_buffer_frames(frames), show),
+                    None => (!(BUFFER_SIZES[0]..=BUFFER_SIZES[4]).contains(&frames))
+                        .then(|| RuntimeError::BufferSize { frames }.to_string()),
+                };
+                // The next sessions keep the size the device last took.
+                self.problem = match refused {
+                    Some(why) => Some(format!("The buffer size could not be changed: {why}")),
+                    None => {
+                        settings.set_buffer_frames(frames);
+                        None
+                    }
+                };
                 return false;
             }
             OutputAction::ToggleSplit => current.as_ref().map(|current| {
@@ -251,17 +289,13 @@ impl OutputPage {
                 .map(|current| click_cell(&current.routing, bus, output)),
             OutputAction::Preset(outputs) => {
                 self.preset_menu = false;
-                self.preset = Some(outputs);
                 current
                     .as_ref()
                     .map(|current| Routing::preset(outputs).fit(current.outputs))
             }
-            OutputAction::Reset => {
-                self.preset = None;
-                current
-                    .as_ref()
-                    .map(|current| Routing::preset(current.outputs))
-            }
+            OutputAction::Reset => current
+                .as_ref()
+                .map(|current| Routing::preset(current.outputs)),
         };
         if let (Some(current), Some(routing)) = (current, routing) {
             self.apply(&current.id, routing, show, settings);
@@ -277,11 +311,14 @@ impl OutputPage {
         show: Option<&mut Show>,
         settings: &mut AudioSettings,
     ) {
-        let applied = show.map_or(Ok(()), |show| show.set_routing(routing.clone()));
-        self.problem = match (applied, settings.save_routing(device, &routing)) {
-            (Err(error), _) => Some(format!("The routing could not be applied: {error}")),
-            (Ok(()), Err(error)) => Some(format!("The routing could not be saved: {error}")),
-            (Ok(()), Ok(())) => None,
+        // Only a routing the session took is saved.
+        let refused = show.and_then(|show| refusal(show.set_routing(routing.clone()), show));
+        self.problem = match refused {
+            Some(why) => Some(format!("The routing could not be applied: {why}")),
+            None => settings
+                .save_routing(device, &routing)
+                .err()
+                .map(|error| format!("The routing could not be saved: {error}")),
         };
     }
 
@@ -367,7 +404,7 @@ impl OutputPage {
             },
             outputs,
             rows,
-            preset: format!("Preset: {}", outputs_text(self.preset.unwrap_or(outputs))),
+            preset: format!("Preset: {}", preset_name(&routing, outputs)),
             preset_menu: self.preset_menu,
             presets,
             notices,

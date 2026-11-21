@@ -16,6 +16,7 @@ use domain::{
 use hound::{SampleFormat, WavSpec, WavWriter};
 use library::ConfigStore;
 use openvamp_desktop::audio_settings::AudioSettings;
+use openvamp_desktop::mixer::{MixerPage, restore_mix, unsaved_mix};
 use openvamp_desktop::output_page::{
     OutputAction, OutputPage, OutputScreen, click_cell, problem_notice,
 };
@@ -83,6 +84,11 @@ impl Bench {
     /// A laptop (2 outputs, `fake:1`) and an interface (8 outputs,
     /// `fake:2`), with the song open on `device`.
     fn on(device: &str) -> Self {
+        Self::with_saved(device, None)
+    }
+
+    /// [`Self::on`], with `saved` saved for `device` before the song opens.
+    fn with_saved(device: &str, saved: Option<Routing>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         write_song(&dir.path().join("Rivers Rise.song"));
         let fake = FakeOutput::without_devices()
@@ -90,6 +96,9 @@ impl Bench {
             .with_device("Interface", 8, None);
         let mut settings = AudioSettings::load(Some(Self::store(dir.path())));
         settings.choose_device(Some(device));
+        if let Some(saved) = saved {
+            settings.save_routing(device, &saved).unwrap();
+        }
         let mut bench = Self {
             dir,
             fake,
@@ -122,12 +131,18 @@ impl Bench {
     }
 
     /// Does `action`; reopens the song when the screen asks for it.
+    /// Does `action` as the screen does: a song opened again on another
+    /// device keeps the mix it had not saved.
     fn act(&mut self, action: OutputAction) {
+        let unsaved = self.show.as_ref().and_then(unsaved_mix);
         let reopen = self
             .page
             .act(action, self.show.as_mut(), &mut self.settings);
         if reopen {
             self.open();
+            if let (Some(show), Some(unsaved)) = (&mut self.show, &unsaved) {
+                restore_mix(show, unsaved);
+            }
         }
         if let Some(show) = &mut self.show {
             show.poll();
@@ -397,4 +412,144 @@ fn a_routing_refitted_and_a_device_with_too_few_outputs_read_as_notices() {
         openvamp_desktop::output_page::output_notice(&too_few),
         Some(too_few.to_string())
     );
+}
+
+fn notices_starting(view: &OutputScreen, start: &str) -> usize {
+    view.notices
+        .iter()
+        .filter(|notice| notice.starts_with(start))
+        .count()
+}
+
+#[test]
+fn a_routing_the_device_refuses_is_not_saved_and_says_why() {
+    // Saved on outputs 1/2 only, so the stream opens with two channels.
+    let mut bench = Bench::with_saved("fake:2", Some(Routing::stereo(8)));
+    bench.fake.set_rates("fake:2", Some(&[]));
+
+    // The preset needs all eight: the stream must open again, and cannot.
+    bench.act(OutputAction::Reset);
+
+    assert_eq!(
+        notices_starting(&bench.view(), "The routing could not be applied: "),
+        1,
+        "{:?}",
+        bench.view().notices
+    );
+    assert_eq!(bench.saved("fake:2"), Some(Routing::stereo(8)));
+}
+
+#[test]
+fn a_routing_a_full_queue_holds_back_still_arrives_and_is_saved() {
+    let mut bench = Bench::on("fake:2");
+    let show = bench.show.as_mut().unwrap();
+    let timing = app::Command::SetJumpTiming(app::JumpTiming::SectionEnd);
+    while show.send_mixer(timing).is_ok() {}
+
+    bench.act(OutputAction::Cell {
+        bus: Bus::Vocals,
+        output: 3,
+    });
+
+    assert_eq!(bench.view().notices, Vec::<String>::new());
+    let saved = bench.saved("fake:2").unwrap();
+    assert_eq!(saved.destination(Bus::Vocals), Destination::Mono(3));
+}
+
+#[test]
+fn a_buffer_size_refused_is_not_kept_and_says_why() {
+    let mut bench = Bench::on("fake:2");
+    bench.fake.set_buffer_range("fake:2", Some((256, 256)));
+
+    bench.act(OutputAction::Buffer(128));
+
+    assert_eq!(
+        bench.settings.buffer_frames(),
+        256,
+        "the size the device takes"
+    );
+    let view = bench.view();
+    assert_eq!(
+        notices_starting(&view, "The buffer size could not be changed: "),
+        1,
+        "{:?}",
+        view.notices
+    );
+
+    // A size out of range is refused before the device is asked.
+    let mut bench = Bench::on("fake:2");
+    bench.act(OutputAction::Buffer(32));
+    assert_eq!(bench.settings.buffer_frames(), 256);
+    assert_eq!(
+        notices_starting(&bench.view(), "The buffer size could not be changed: "),
+        1
+    );
+}
+
+#[test]
+fn the_preset_label_says_custom_once_the_routing_is_no_preset() {
+    let mut bench = Bench::on("fake:2");
+    assert_eq!(bench.view().preset, "Preset: 8 outputs");
+
+    bench.act(OutputAction::Cell {
+        bus: Bus::Vocals,
+        output: 3,
+    });
+    assert_eq!(bench.view().preset, "Preset: Custom");
+    // Back to the preset's own outputs, step by step.
+    for output in [7, 3, 8] {
+        bench.act(OutputAction::Cell {
+            bus: Bus::Vocals,
+            output,
+        });
+    }
+    assert_eq!(bench.view().preset, "Preset: 8 outputs");
+
+    bench.act(OutputAction::Preset(4));
+    assert_eq!(bench.view().preset, "Preset: 4 outputs");
+    bench.act(OutputAction::Cell {
+        bus: Bus::Drums,
+        output: 1,
+    });
+    assert_eq!(bench.view().preset, "Preset: Custom");
+
+    let mut laptop = Bench::on("fake:1");
+    assert_eq!(laptop.view().preset, "Preset: 2 outputs");
+    laptop.act(OutputAction::ToggleSplit);
+    assert_eq!(laptop.view().preset, "Preset: Custom");
+    laptop.act(OutputAction::ToggleSplit);
+    assert_eq!(laptop.view().preset, "Preset: 2 outputs");
+}
+
+#[test]
+fn a_mix_not_saved_yet_carries_onto_the_device_the_song_opens_again_on() {
+    let mut bench = Bench::on("fake:2");
+    let show = bench.show.as_mut().unwrap();
+    for command in [
+        app::Command::SetStemVolume {
+            stem: 0,
+            volume: domain::Volume::from_db(-6.0),
+        },
+        app::Command::SetStemMute {
+            stem: 0,
+            mute: true,
+        },
+        app::Command::SetStemBus {
+            stem: 0,
+            bus: Some(Bus::Vocals),
+        },
+    ] {
+        show.send_mixer(command).unwrap();
+    }
+    show.poll();
+    let mix = show.snapshot().mixer.mix.clone();
+
+    bench.act(OutputAction::ChooseDevice(0));
+
+    let show = bench.show.as_ref().unwrap();
+    assert_eq!(bench.view().device, "Laptop · 2 outputs");
+    assert_eq!(show.snapshot().mixer.mix, mix);
+    assert!(show.snapshot().mixer.mix_changed);
+    let mixer = MixerPage::new().view(Some(show)).unwrap();
+    assert!(mixer.can_save, "Save mix to arrangement stays offered");
 }

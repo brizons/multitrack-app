@@ -6,6 +6,7 @@
 //! on request; bus and master changes are global and saved to the
 //! configuration folder once they settle.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use app::Command;
@@ -17,6 +18,25 @@ use crate::show::Show;
 /// How long bus and master changes wait for the next one before they are
 /// saved: a fader drag is saved once, when it stops.
 pub const BUS_SAVE_DELAY: Duration = Duration::from_millis(500);
+
+/// A fader cap's height, in points.
+pub const FADER_CAP_HEIGHT: f32 = 14.0;
+
+/// A fader cap's width, in points.
+pub const FADER_CAP_WIDTH: f32 = 26.0;
+
+/// The room a fader leaves above and below its travel, half a cap, so the
+/// cap's centre runs from the top of the travel (+12 dB) to its bottom
+/// (silent) and the cap stays inside the fader.
+pub const FADER_PADDING: f32 = FADER_CAP_HEIGHT / 2.0;
+
+/// Where the pointer at height `y` puts the cap of a fader drawn from
+/// `top` and `height` points tall: 1.0 at the top of its travel, 0.0 at the
+/// bottom, held there beyond either end.
+pub fn fader_drag_position(top: f32, height: f32, y: f32) -> f32 {
+    let travel = (height - 2.0 * FADER_PADDING).max(1.0);
+    (1.0 - (y - top - FADER_PADDING) / travel).clamp(0.0, 1.0)
+}
 
 /// The fader's taper: decibels per decade of fader travel. The top is
 /// [`MAX_VOLUME_DB`]; 0 dB sits a little above the middle.
@@ -449,4 +469,74 @@ impl MixerPage {
             bus_menu: self.bus_menu,
         })
     }
+}
+
+/// A song's mix not saved yet, carried into a session that opens the same
+/// song again (on another device), so nothing is lost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnsavedMix {
+    folder: PathBuf,
+    arrangement: String,
+    mix: ArrangementMix,
+}
+
+/// The mix of the song `show` plays when it differs from its `mix.json`;
+/// `None` when it is saved, or the item has no mix file.
+pub fn unsaved_mix(show: &Show) -> Option<UnsavedMix> {
+    if !show.snapshot().mixer.mix_changed {
+        return None;
+    }
+    let (folder, _) = show.mix_file()?;
+    Some(UnsavedMix {
+        folder,
+        arrangement: show.song().arrangement.clone(),
+        mix: show.snapshot().mixer.mix.clone(),
+    })
+}
+
+/// Plays `unsaved` on the song `show` plays, when it is the same song and
+/// arrangement, through the mixer commands: it stays unsaved, so "Save mix
+/// to arrangement" stays offered.
+pub fn restore_mix(show: &mut Show, unsaved: &UnsavedMix) {
+    let same_song = show
+        .mix_file()
+        .is_some_and(|(folder, _)| folder == unsaved.folder);
+    if !same_song || show.song().arrangement != unsaved.arrangement {
+        return;
+    }
+    let mixer = show.snapshot().mixer.clone();
+    for (stem, view) in mixer.stems.iter().enumerate() {
+        let want = unsaved.mix.stem(&view.id);
+        let have = mixer.mix.stem(&view.id);
+        let mut commands = Vec::new();
+        if want.volume != have.volume {
+            commands.push(Command::SetStemVolume {
+                stem,
+                volume: want.volume,
+            });
+        }
+        if want.mute != have.mute {
+            commands.push(Command::SetStemMute {
+                stem,
+                mute: want.mute,
+            });
+        }
+        if want.solo != have.solo {
+            commands.push(Command::SetStemSolo {
+                stem,
+                solo: want.solo,
+            });
+        }
+        if want.bus_override() != have.bus_override() {
+            commands.push(Command::SetStemBus {
+                stem,
+                bus: want.bus_override(),
+            });
+        }
+        for command in commands {
+            // A full queue still reaches the players from the next polls.
+            let _ = show.send_mixer(command);
+        }
+    }
+    show.poll();
 }
