@@ -15,9 +15,10 @@ use hound::{SampleFormat, WavSpec, WavWriter};
 use library::Library;
 use openvamp_desktop::editor::{Edit, SetlistEditor};
 use openvamp_desktop::library_page::{
-    Choice, Field, LibraryAction, LibraryPage, RowDetails, SongDetails,
+    Choice, Dragged, Field, LibraryAction, LibraryPage, RowDetails, SongDetails,
 };
 use openvamp_desktop::line_edit::{LineEdit, LineKey, LineOutcome};
+use openvamp_desktop::reorder::Half;
 use openvamp_desktop::shelf::unique_name;
 
 const RATE: u32 = 8_000;
@@ -1233,4 +1234,182 @@ fn the_editor_meta_line_leaves_the_arrangement_to_its_column() {
     // which its column shows.
     assert_eq!(rows[1].meta, "—");
     assert_eq!(rows[1].arrangement, "default");
+}
+
+/// Every file of the setlists folder with its bytes.
+fn setlist_files(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fs::read_dir(root.join("Setlists"))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_type().unwrap().is_file())
+        .map(|entry| {
+            (
+                entry.file_name().into_string().unwrap(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// A library with one setlist of four items: Amazing, Bright, a click
+/// tile at 90 BPM and Amazing again, open in the editor.
+fn four_items() -> (tempfile::TempDir, LibraryPage) {
+    let dir = library();
+    let click = SetlistItem::Click(ClickItem::new(
+        90.0,
+        TimeSignature {
+            numerator: 3,
+            denominator: 4,
+        },
+    ));
+    let file = save(
+        dir.path(),
+        "Sunday",
+        vec![
+            SetlistItem::Song(SongItem::new("Songs/Amazing.song")),
+            SetlistItem::Song(SongItem::new("Songs/Bright.song")),
+            click,
+            SetlistItem::Song(SongItem {
+                fade_out: true,
+                ..SongItem::new("Songs/Amazing.song")
+            }),
+        ],
+    );
+    let page = LibraryPage::open(dir.path(), Some(&file)).unwrap();
+    (dir, page)
+}
+
+#[test]
+fn dropping_an_item_moves_it_as_the_arrows_do_and_saves_it() {
+    let (_by_drop_dir, mut by_drop) = four_items();
+    let (_by_arrows_dir, mut by_arrows) = four_items();
+
+    by_drop.act(LibraryAction::DropItem { from: 0, to: 2 });
+    by_arrows.act(LibraryAction::MoveDown(0));
+    by_arrows.act(LibraryAction::MoveDown(1));
+    assert_eq!(on_disk(&by_drop).items, on_disk(&by_arrows).items);
+
+    by_drop.act(LibraryAction::DropItem { from: 3, to: 0 });
+    for index in [3, 2, 1] {
+        by_arrows.act(LibraryAction::MoveUp(index));
+    }
+    assert_eq!(on_disk(&by_drop).items, on_disk(&by_arrows).items);
+    assert_eq!(by_drop.notice(), None);
+}
+
+#[test]
+fn a_drop_on_itself_or_out_of_the_list_saves_nothing() {
+    let (dir, mut page) = four_items();
+    let before = setlist_files(dir.path());
+
+    page.act(LibraryAction::DropItem { from: 1, to: 1 });
+    page.act(LibraryAction::DropItem { from: 9, to: 0 });
+    page.act(LibraryAction::DropItem { from: 0, to: 9 });
+    page.act(LibraryAction::DropSetlist { from: 0, to: 0 });
+    page.act(LibraryAction::DropSetlist { from: 0, to: 9 });
+
+    assert_eq!(setlist_files(dir.path()), before);
+    assert_eq!(page.notice(), None);
+}
+
+#[test]
+fn dragging_over_a_row_shows_where_the_item_lands_and_the_drop_moves_it_there() {
+    let (_dir, mut page) = four_items();
+    let insertion = |page: &LibraryPage| page.view(None).editor.unwrap().insertion;
+    let titles = |page: &LibraryPage| {
+        page.view(None)
+            .editor
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|row| row.meta)
+            .collect::<Vec<_>>()
+    };
+    let before = titles(&page);
+
+    page.drag_over(Dragged::Item(0), 2, Half::Lower);
+    assert_eq!(insertion(&page), Some(3), "the line goes after row 3");
+    // Right after itself: no line, a drop would change nothing.
+    page.drag_over(Dragged::Item(0), 0, Half::Lower);
+    assert_eq!(insertion(&page), None);
+    page.drop_dragged(Dragged::Item(0));
+    assert_eq!(titles(&page), before);
+
+    page.drag_over(Dragged::Item(0), 2, Half::Lower);
+    page.drop_dragged(Dragged::Item(0));
+    assert_eq!(insertion(&page), None, "the line goes when the drag ends");
+    assert_eq!(
+        titles(&page),
+        [&before[1], &before[2], &before[0], &before[3]].map(String::clone)
+    );
+    on_disk(&page);
+
+    // A drag that ends anywhere else moves nothing.
+    let moved = titles(&page);
+    page.drag_over(Dragged::Item(3), 0, Half::Upper);
+    assert_eq!(insertion(&page), Some(0));
+    assert!(page.cancel_drag(), "the line that showed goes");
+    assert_eq!(insertion(&page), None);
+    assert!(!page.cancel_drag(), "no line showed, nothing to redraw");
+    assert_eq!(titles(&page), moved);
+    // A setlist dropped while an item's line shows moves nothing either.
+    page.drag_over(Dragged::Item(3), 0, Half::Upper);
+    page.drop_dragged(Dragged::Setlist(0));
+    assert_eq!(titles(&page), moved);
+}
+
+#[test]
+fn dropping_a_setlist_moves_it_as_the_arrows_do_and_the_order_lasts() {
+    let (dir, mut page) = removable("A");
+
+    page.act(LibraryAction::DropSetlist { from: 0, to: 2 });
+    assert_eq!(setlist_names(&page), ["B", "C", "A"]);
+    assert_eq!(page.selected_file(), Some("A.setlist.json"));
+
+    page.drag_over(Dragged::Setlist(2), 0, Half::Upper);
+    assert_eq!(page.view(None).setlist_insertion, Some(0));
+    page.drop_dragged(Dragged::Setlist(2));
+    assert_eq!(page.view(None).setlist_insertion, None);
+    assert_eq!(setlist_names(&page), ["A", "B", "C"]);
+
+    let (_arrows_dir, mut by_arrows) = removable("A");
+    by_arrows.act(LibraryAction::MoveSetlistDown(0));
+    by_arrows.act(LibraryAction::MoveSetlistDown(1));
+    page.act(LibraryAction::DropSetlist { from: 0, to: 2 });
+    assert_eq!(setlist_names(&page), setlist_names(&by_arrows));
+
+    let reopened = LibraryPage::open_with_trash(dir.path(), None, test_trash).unwrap();
+    assert_eq!(setlist_names(&reopened), ["B", "C", "A"]);
+}
+
+#[test]
+fn a_drop_refused_by_a_newer_order_file_changes_no_file() {
+    let (dir, mut page) = removable("A");
+    fs::write(
+        dir.path().join("Setlists/order.json"),
+        r#"{"formatVersion": 2, "setlists": ["C.setlist.json"]}"#,
+    )
+    .unwrap();
+    let before = setlist_files(dir.path());
+
+    page.act(LibraryAction::DropSetlist { from: 0, to: 2 });
+
+    assert!(
+        page.notice()
+            .is_some_and(|notice| notice.contains("unsupported formatVersion 2")),
+        "{:?}",
+        page.notice()
+    );
+    assert_eq!(setlist_files(dir.path()), before);
+}
+
+#[test]
+fn a_drag_disarms_the_removal() {
+    let (_dir, mut page) = removable("B");
+    page.act(LibraryAction::RemoveSetlist);
+    assert_eq!(remove_label(&page), ARMED);
+
+    page.drag_over(Dragged::Setlist(0), 2, Half::Lower);
+
+    assert_eq!(remove_label(&page), "Remove");
 }

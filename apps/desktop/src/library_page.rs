@@ -14,6 +14,7 @@ use library::{ArrangementEntry, Library, SetlistError, SongEntry, TrashFn};
 use crate::catalog::Catalog;
 use crate::editor::{Edit, SetlistEditor};
 use crate::line_edit::{LineEdit, LineKey, LineOutcome};
+use crate::reorder::{Half, drop_index, drop_slot};
 use crate::shelf::Shelf;
 
 /// The label of an armed remove control. It does not repeat the name: the
@@ -50,6 +51,22 @@ pub enum LibraryAction {
     MoveSetlistUp(usize),
     /// Moves this setlist of the list one place down.
     MoveSetlistDown(usize),
+    /// Moves the item at `from` to index `to`: a drag dropped in the
+    /// editor ([`LibraryPage::drop_dragged`]).
+    DropItem {
+        /// The item dragged.
+        from: usize,
+        /// The index it ends up at.
+        to: usize,
+    },
+    /// Moves the setlist at row `from` of the list to row `to`: a drag
+    /// dropped in the list.
+    DropSetlist {
+        /// The setlist dragged.
+        from: usize,
+        /// The row it ends up at.
+        to: usize,
+    },
     /// Removes the setlist in the editor: the first press arms it, the
     /// second moves its file to the system trash; any other action
     /// disarms it.
@@ -107,6 +124,16 @@ impl LibraryAction {
     }
 }
 
+/// What is being dragged: an item of the editor or a setlist of the list,
+/// by its row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dragged {
+    /// An item of the setlist in the editor.
+    Item(usize),
+    /// A setlist of the list.
+    Setlist(usize),
+}
+
 /// Which field the keys type into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -138,6 +165,9 @@ pub struct LibraryPage {
     /// The setlist file of this library open on Perform, which cannot be
     /// removed.
     playing: Option<String>,
+    /// The drag under way and the gap it would land in, while dropping
+    /// there would move it.
+    insertion: Option<(Dragged, usize)>,
 }
 
 impl LibraryPage {
@@ -195,6 +225,7 @@ impl LibraryPage {
             moves: Vec::new(),
             armed: None,
             playing: None,
+            insertion: None,
         };
         let file = file
             .map(str::to_owned)
@@ -203,6 +234,49 @@ impl LibraryPage {
             page.select(&file);
         }
         Ok(page)
+    }
+
+    /// A drag of `dragged` is over row `over`, in its `half`: the
+    /// insertion line goes where it would land, or nowhere when dropping
+    /// there changes nothing. Dragging disarms the remove controls.
+    pub fn drag_over(&mut self, dragged: Dragged, over: usize, half: Half) {
+        self.armed = None;
+        let (from, len) = self.drag_source(dragged);
+        let slot = drop_slot(over, half);
+        self.insertion = drop_index(from, slot, len).map(|_| (dragged, slot));
+    }
+
+    /// The drag of `dragged` was dropped on its list: it moves to where
+    /// the insertion line shows ([`LibraryAction::DropItem`],
+    /// [`LibraryAction::DropSetlist`]), or nowhere without a line.
+    pub fn drop_dragged(&mut self, dragged: Dragged) {
+        let Some((shown, slot)) = self.insertion.take() else {
+            return;
+        };
+        if shown != dragged {
+            return;
+        }
+        let (from, len) = self.drag_source(dragged);
+        if let Some(to) = drop_index(from, slot, len) {
+            self.act(match dragged {
+                Dragged::Item(_) => LibraryAction::DropItem { from, to },
+                Dragged::Setlist(_) => LibraryAction::DropSetlist { from, to },
+            });
+        }
+    }
+
+    /// The drag ended anywhere else, or left its list: nothing moves and
+    /// the line goes. Whether a line was showing.
+    pub fn cancel_drag(&mut self) -> bool {
+        self.insertion.take().is_some()
+    }
+
+    /// The row `dragged` starts from and the length of its list.
+    fn drag_source(&self, dragged: Dragged) -> (usize, usize) {
+        match dragged {
+            Dragged::Item(from) => (from, self.items().len()),
+            Dragged::Setlist(from) => (from, self.shelf.setlists.len()),
+        }
     }
 
     /// Disarms the remove controls: the Library screen was left, or
@@ -277,6 +351,20 @@ impl LibraryPage {
                 .move_setlist(index, index + 1)
                 .map_err(|e| e.to_string())?,
             A::MoveSetlistUp(_) | A::MoveSetlistDown(_) => {}
+            A::DropItem { from, to } => {
+                let len = self.items().len();
+                if from != to && from < len && to < len {
+                    self.move_item(from, to)?;
+                }
+            }
+            A::DropSetlist { from, to } => {
+                let len = self.shelf.setlists.len();
+                if from != to && from < len && to < len {
+                    self.shelf
+                        .move_setlist(from, to)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
             A::RemoveSetlist => self.remove_selected()?,
             A::RemoveUnreadable(index) => self.remove_unreadable(index)?,
             A::DuplicateSetlist => {
@@ -572,11 +660,14 @@ impl LibraryPage {
 
     fn move_item(&mut self, from: usize, to: usize) -> Result<(), String> {
         self.edit(Edit::Move { from, to })?;
-        self.row = match self.row {
-            Some(row) if row == from => Some(to),
-            Some(row) if row == to => Some(from),
+        // The row shown keeps its item: the moved one goes with it, the
+        // ones it passed shift one place.
+        self.row = self.row.map(|row| match row {
+            row if row == from => to,
+            row if from < to && row > from && row <= to => row - 1,
+            row if to < from && row >= to && row < from => row + 1,
             row => row,
-        };
+        });
         Ok(())
     }
 
@@ -700,6 +791,10 @@ impl LibraryPage {
                 })
                 .collect(),
             order_problem: self.shelf.order_problem.clone(),
+            setlist_insertion: match self.insertion {
+                Some((Dragged::Setlist(_), slot)) => Some(slot),
+                _ => None,
+            },
             entry_problems: self.shelf.entry_problems.clone(),
             editor: self
                 .editor
@@ -760,6 +855,10 @@ impl LibraryPage {
                 "Remove".to_owned()
             },
             remove_armed: armed,
+            insertion: match self.insertion {
+                Some((Dragged::Item(_), slot)) => Some(slot),
+                _ => None,
+            },
         }
     }
 
@@ -1113,6 +1212,9 @@ pub struct EditorView {
     pub remove: String,
     /// Whether the next press of the remove control removes the setlist.
     pub remove_armed: bool,
+    /// Where a dragged item would land: before the row at this index, or
+    /// after the last row when it equals the row count.
+    pub insertion: Option<usize>,
 }
 
 /// One song of the library.
@@ -1146,6 +1248,9 @@ pub struct LibraryView {
     /// Why the stored order of the setlists cannot be used, so they are
     /// listed by name.
     pub order_problem: Option<String>,
+    /// Where a dragged setlist would land in the list, as
+    /// [`EditorView::insertion`].
+    pub setlist_insertion: Option<usize>,
     /// Entries of the setlists folder that could not be read at all; every
     /// other setlist is listed.
     pub entry_problems: Vec<String>,
