@@ -81,6 +81,11 @@ impl Ramp {
         };
     }
 
+    /// Lands on the target at once.
+    pub(crate) fn finish(&mut self) {
+        *self = Self::at(self.to);
+    }
+
     fn value(&self, pos: u64) -> f32 {
         if pos >= self.len {
             self.to

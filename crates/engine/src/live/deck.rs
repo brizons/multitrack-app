@@ -79,6 +79,7 @@ impl std::error::Error for DeckFull {}
 
 enum Message {
     Command(Command),
+    CuedCommand(Command),
     Cue {
         player: Box<Player>,
         item: u64,
@@ -179,6 +180,8 @@ pub struct Deck {
     retired: Vec<Box<Player>>,
     scratch: Vec<f32>,
     max_frames: usize,
+    /// Output channels of every player: the current one's.
+    channels: usize,
     applied: u64,
     finished: u64,
     finished_item: Option<u64>,
@@ -189,6 +192,8 @@ pub struct Deck {
 pub struct DeckController {
     messages: Producer<Message>,
     returns: Consumer<Box<Player>>,
+    /// The output channels every player of the deck renders.
+    channels: usize,
 }
 
 impl Deck {
@@ -198,6 +203,7 @@ impl Deck {
     /// leaving items in pieces of that size.
     pub fn new(player: Player, item: u64, max_frames: usize) -> (Self, DeckController) {
         let max_frames = max_frames.max(1);
+        let channels = player.channels();
         let (producer, messages) = RingBuffer::new(COMMAND_CAPACITY);
         let (returns, back) = RingBuffer::new(RETURN_CAPACITY);
         let deck = Self {
@@ -209,8 +215,9 @@ impl Deck {
             messages,
             returns,
             retired: Vec::with_capacity(RETURN_CAPACITY),
-            scratch: vec![0.0; 2 * max_frames],
+            scratch: vec![0.0; channels * max_frames],
             max_frames,
+            channels,
             applied: 0,
             finished: 0,
             finished_item: None,
@@ -218,6 +225,7 @@ impl Deck {
         let controller = DeckController {
             messages: producer,
             returns: back,
+            channels,
         };
         (deck, controller)
     }
@@ -229,7 +237,7 @@ impl Deck {
     pub fn process(&mut self, out: &mut [f32]) {
         self.take_messages();
         out.fill(0.0);
-        let frames = out.len() / 2;
+        let frames = out.len() / self.channels;
         if frames == 0 {
             // Lets the player take in what the messages changed.
             self.current.process(&mut []);
@@ -237,7 +245,8 @@ impl Deck {
         let mut done = 0;
         while done < frames {
             let n = self.piece(frames - done);
-            self.render_piece(&mut out[2 * done..2 * (done + n)]);
+            let channels = self.channels;
+            self.render_piece(&mut out[channels * done..channels * (done + n)]);
             done += n;
         }
         self.settle();
@@ -277,6 +286,11 @@ impl Deck {
             self.applied += 1;
             match message {
                 Message::Command(command) => self.apply(command),
+                Message::CuedCommand(command) => {
+                    if let Some(cued) = &mut self.cued {
+                        cued.player.command(command);
+                    }
+                }
                 Message::Cue {
                     player,
                     item,
@@ -323,6 +337,16 @@ impl Deck {
             Command::SetJumpTiming(_) | Command::SetFadeDuration { .. } | Command::SetClick(_) => {
                 if let Some(cued) = &mut self.cued {
                     cued.player.command(command);
+                }
+            }
+            // The device's routing and the Click & Guide bus are global:
+            // every item heard, and the cued one, follow them.
+            Command::SetRouting(_) | Command::SetClickGain(_) => {
+                if let Some(cued) = &mut self.cued {
+                    cued.player.command(command);
+                }
+                for leaving in &mut self.leaving {
+                    leaving.player.command(command);
                 }
             }
             _ => {}
@@ -444,7 +468,8 @@ impl Deck {
     /// runs, plus every leaving item; then hands over at the current item's
     /// end and moves the blend on.
     fn render_piece(&mut self, out: &mut [f32]) {
-        let n = out.len() / 2;
+        let channels = self.channels;
+        let n = out.len() / channels;
         let before = self.current.output_frame();
         let ends = self.current.ends();
         // Commands apply before the first piece, so a transport that plays
@@ -463,18 +488,19 @@ impl Deck {
         let blend = self.blend;
         let t = |i: usize| blend.map_or(0, |blend| blend.played + (i as u64).min(advanced));
         if let Some(blend) = blend {
-            for (i, frame) in out.chunks_exact_mut(2).enumerate() {
+            for (i, frame) in out.chunks_exact_mut(channels).enumerate() {
                 let gain = blend.gain(t(i)) as f32;
-                frame[0] *= gain;
-                frame[1] *= gain;
+                for sample in frame {
+                    *sample *= gain;
+                }
             }
         }
         for leaving in &mut self.leaving {
-            let scratch = &mut self.scratch[..2 * n];
+            let scratch = &mut self.scratch[..channels * n];
             leaving.player.process(scratch);
             for (i, (frame, heard)) in out
-                .chunks_exact_mut(2)
-                .zip(scratch.chunks_exact(2))
+                .chunks_exact_mut(channels)
+                .zip(scratch.chunks_exact(channels))
                 .enumerate()
             {
                 let gain = match (leaving.exit, blend) {
@@ -482,8 +508,9 @@ impl Deck {
                     (Exit::Blend, Some(blend)) => (1.0 - blend.gain(t(i))) as f32,
                     (Exit::Blend, None) => 0.0,
                 };
-                frame[0] += heard[0] * gain;
-                frame[1] += heard[1] * gain;
+                for (sample, heard) in frame.iter_mut().zip(heard) {
+                    *sample += heard * gain;
+                }
             }
         }
 
@@ -589,12 +616,28 @@ impl DeckController {
     /// `handoff`; a cued item already there comes back. The player should
     /// have the audio at its start buffered ([`Player::playhead_ready`]),
     /// since the deck starts it without waiting.
+    ///
+    /// # Panics
+    ///
+    /// When `player` renders another channel count than the deck's.
     pub fn cue(&mut self, player: Player, item: u64, handoff: Handoff) -> Result<(), DeckFull> {
+        self.check_channels(&player);
         self.push(Message::Cue {
             player: Box::new(player),
             item,
             handoff,
         })
+    }
+
+    /// Queues `command` for the cued item only, such as its stem gains
+    /// ([`Command::SetStemGain`]) after the bus or master volumes changed,
+    /// since its stems are not the current item's. It is dropped when no
+    /// item is cued by the time the deck takes it (a handoff may have made
+    /// the item current: send it the current item's way then).
+    pub fn send_cued(&mut self, command: Command) -> Result<(), SendError> {
+        self.messages
+            .push(Message::CuedCommand(command))
+            .map_err(|_| SendError::Full(command))
     }
 
     /// Sends the cued item back.
@@ -604,7 +647,12 @@ impl DeckController {
 
     /// Makes `player` the current item as `item`, stopped at its start; the
     /// current item leaves with its stop ramp.
+    ///
+    /// # Panics
+    ///
+    /// When `player` renders another channel count than the deck's.
     pub fn select(&mut self, player: Player, item: u64) -> Result<(), DeckFull> {
+        self.check_channels(&player);
         self.push(Message::Select {
             player: Box::new(player),
             item,
@@ -622,6 +670,14 @@ impl DeckController {
     /// A player the deck no longer needs, to be dropped on this thread.
     pub fn returned(&mut self) -> Option<Player> {
         self.returns.pop().ok().map(|player| *player)
+    }
+
+    fn check_channels(&self, player: &Player) {
+        assert_eq!(
+            player.channels(),
+            self.channels,
+            "every player of a deck renders the same output channels"
+        );
     }
 
     fn push(&mut self, message: Message) -> Result<(), DeckFull> {

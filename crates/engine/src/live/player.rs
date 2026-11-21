@@ -8,15 +8,20 @@
 //! at rest, so with no live command the samples are bit-identical. Seams use
 //! [`domain::seam_fade`], the rule `compile` uses.
 
-use domain::{BeatGrid, Song, StemRole, seam_fade};
+use std::mem;
+
+use domain::{
+    BeatGrid, Bus, DEFAULT_BUS, Destination, Song, StemGain, StemRole, bus_for_stem, seam_fade,
+};
 use rtrb::{Consumer, RingBuffer};
 
 use super::ramp::Ramp;
 use super::source::StemSource;
 use super::status::{ClickSource, FadeState, FadeStatus, JumpKind, QueuedJump, Status, Transport};
 use super::{
-    COMMAND_CAPACITY, Command, Controller, DECLICK_FRAMES, DEFAULT_FADE_SECONDS, JumpTiming,
-    LiveError, MAX_PREFETCH_TARGETS, PANIC_MILLISECONDS, PlayerConfig,
+    COMMAND_CAPACITY, Command, Controller, DECLICK_FRAMES, DEFAULT_FADE_SECONDS,
+    GAIN_RAMP_MILLISECONDS, Gain, JumpTiming, LiveError, MAX_CHANNELS, MAX_PREFETCH_TARGETS,
+    PANIC_MILLISECONDS, PlayerConfig, Routes,
 };
 use crate::click::ClickBursts;
 use crate::mix::Envelope;
@@ -92,14 +97,148 @@ struct Stem {
     gain: f32,
     /// Whether the fade applies: only `track` stems fade.
     fades: bool,
+    /// The mixer's gain on the stem ([`Command::SetStemGain`]); 1.0 at rest.
+    live: Ramp,
+    /// The bus the stem sums into.
+    bus: Bus,
 }
 
 impl Stem {
-    fn gain_at(&self, track_gain: &[f32], i: usize) -> f32 {
+    /// The stem's gain at frame `i` of a block: its static gain, the
+    /// mixer's (from `live`), and the fades for `track` stems. Each factor
+    /// is exactly 1.0 at unity, so the product is the static gain.
+    fn gain_at(&self, live: &[f32], track_gain: &[f32], i: usize) -> f32 {
+        let gain = self.gain * live[i];
         if self.fades {
-            self.gain * track_gain[i]
+            gain * track_gain[i]
         } else {
-            self.gain
+            gain
+        }
+    }
+}
+
+/// Number of buses: [`Bus::ALL`].
+const BUSES: usize = Bus::ALL.len();
+
+/// Index of `bus` in [`Bus::ALL`] and [`Routes::buses`].
+fn bus_index(bus: Bus) -> usize {
+    match bus {
+        Bus::ClickGuide => 0,
+        Bus::Drums => 1,
+        Bus::Bass => 2,
+        Bus::KeysPads => 3,
+        Bus::Guitars => 4,
+        Bus::Vocals => 5,
+    }
+}
+
+/// What every stem of a block shares when it is mixed.
+struct Block<'a> {
+    n: usize,
+    source: u64,
+    tails: &'a [Tail],
+    track_gain: &'a [f32],
+    envelope: Envelope,
+    envelope_start: u64,
+}
+
+/// Adds `stem`'s fading-out tails, then its current section, `block.n`
+/// frames, to the stereo buffer `out`, in that order: the order
+/// [`crate::render_offline`] sums in. `live` and `read` are scratch.
+fn add_stem(
+    stem: &mut Stem,
+    block: &Block<'_>,
+    live: &mut [f32],
+    read: &mut [f32],
+    out: &mut [f32],
+    underruns: &mut u64,
+) {
+    let n = block.n;
+    for value in &mut live[..n] {
+        *value = stem.live.next();
+    }
+    for tail in block.tails {
+        let k = (n as u64).min(tail.remaining()) as usize;
+        let read = &mut read[..2 * k];
+        if !stem.source.read(tail.src_pos, read) {
+            *underruns += 1;
+            continue;
+        }
+        for i in 0..k {
+            let gain = stem.gain_at(live, block.track_gain, i) * tail.gain(tail.played + i as u64);
+            out[2 * i] += read[2 * i] * gain;
+            out[2 * i + 1] += read[2 * i + 1] * gain;
+        }
+    }
+    let read = &mut read[..2 * n];
+    if !stem.source.read(block.source, read) {
+        *underruns += 1;
+        return;
+    }
+    for i in 0..n {
+        let gain = stem.gain_at(live, block.track_gain, i)
+            * block.envelope.at(block.envelope_start + i as u64);
+        out[2 * i] += read[2 * i] * gain;
+        out[2 * i + 1] += read[2 * i + 1] * gain;
+    }
+}
+
+/// How a routed signal is weighed frame by frame.
+#[derive(Clone, Copy)]
+enum Weight<'a> {
+    /// At full level.
+    Full,
+    /// The new side of a routing change: the fade's level.
+    Rising(&'a [f32]),
+    /// The old side: one minus the fade's level.
+    Falling(&'a [f32]),
+}
+
+impl Weight<'_> {
+    fn at(self, i: usize) -> f32 {
+        match self {
+            Self::Full => 1.0,
+            Self::Rising(fade) => fade[i],
+            Self::Falling(fade) => 1.0 - fade[i],
+        }
+    }
+}
+
+/// The channel index of output `output` (counted from 1), if the player
+/// has it.
+fn channel(output: u16, channels: usize) -> Option<usize> {
+    let index = usize::from(output).checked_sub(1)?;
+    (index < channels).then_some(index)
+}
+
+/// Adds the stereo `signal` (`n` frames) to `destination` of the
+/// `channels`-channel buffer `out`, weighed by `weight`: a stereo pair
+/// takes left and right, a mono output their mean.
+fn add_routed(
+    out: &mut [f32],
+    channels: usize,
+    signal: &[f32],
+    destination: Destination,
+    weight: Weight<'_>,
+) {
+    let n = signal.len() / 2;
+    match destination {
+        Destination::Stereo { left, right } => {
+            for (output, side) in [(left, 0), (right, 1)] {
+                if let Some(c) = channel(output, channels) {
+                    for i in 0..n {
+                        out[i * channels + c] += signal[2 * i + side] * weight.at(i);
+                    }
+                }
+            }
+        }
+        Destination::Mono(output) => {
+            if let Some(c) = channel(output, channels) {
+                for i in 0..n {
+                    let folded = (signal[2 * i] + signal[2 * i + 1]) * 0.5;
+                    out[i * channels + c] += folded * weight.at(i);
+                }
+            }
         }
     }
 }
@@ -202,6 +341,27 @@ pub struct Player {
     end_fading: bool,
     /// Whether the infinite loop is on after every return to the start.
     infinite_at_start: bool,
+
+    // Mixer and router.
+    channels: usize,
+    /// [`GAIN_RAMP_MILLISECONDS`] in frames.
+    gain_ramp: u64,
+    /// The generated click's gain ([`Command::SetClickGain`]).
+    click_level: Ramp,
+    routes: Routes,
+    /// The routing a change fades out of.
+    routes_from: Routes,
+    /// From 0.0 to 1.0 while a routing change crossfades; 1.0 at rest.
+    route_fade: Ramp,
+    /// Per-frame gain of the stem being mixed.
+    live: Vec<f32>,
+    /// Per-frame level of the routing crossfade.
+    route_gain: Vec<f32>,
+    /// A stereo mix: the stems on more than two channels with the stereo
+    /// routing, or the main mix for the master destination.
+    mix: Vec<f32>,
+    /// One stereo buffer per bus, in [`Bus::ALL`] order.
+    buses: Vec<f32>,
 }
 
 impl Player {
@@ -223,6 +383,7 @@ impl Player {
             sample_rate,
             max_frames,
             seam_crossfade,
+            channels,
         } = *config;
         let arrangement =
             song.arrangement(arrangement_id)
@@ -237,6 +398,9 @@ impl Player {
         }
         if max_frames == 0 {
             return Err(LiveError::ZeroBufferSize);
+        }
+        if !(1..=MAX_CHANNELS).contains(&channels) {
+            return Err(LiveError::ChannelsOutOfRange { channels });
         }
         if let Some(id) = settings
             .stem_gains
@@ -264,11 +428,22 @@ impl Player {
             .any(|source| source.role() == StemRole::Click);
         let bursts = (!has_click_stem).then(|| ClickBursts::new(sample_rate));
         let max_bursts = bursts.as_ref().map_or(0, |bursts| bursts.len() + 1);
+        let bus_of = |source: &dyn StemSource| match song
+            .stems()
+            .iter()
+            .find(|stem| stem.id == source.id())
+        {
+            Some(stem) => bus_for_stem(stem),
+            None if matches!(source.role(), StemRole::Click | StemRole::Guide) => Bus::ClickGuide,
+            None => DEFAULT_BUS,
+        };
         let stems = sources
             .into_iter()
             .map(|source| Stem {
                 gain: settings.stem_gain(source.id()),
                 fades: source.role() == StemRole::Track,
+                live: Ramp::at(1.0),
+                bus: bus_of(source.as_ref()),
                 source,
             })
             .collect();
@@ -321,6 +496,16 @@ impl Player {
             end_gain: Ramp::at(1.0),
             end_fading: false,
             infinite_at_start: false,
+            channels: usize::from(channels),
+            gain_ramp: (u64::from(sample_rate) * GAIN_RAMP_MILLISECONDS / 1_000).max(1),
+            click_level: Ramp::at(1.0),
+            routes: Routes::STEREO,
+            routes_from: Routes::STEREO,
+            route_fade: Ramp::at(1.0),
+            live: vec![0.0; max_frames],
+            route_gain: vec![0.0; max_frames],
+            mix: vec![0.0; 2 * max_frames],
+            buses: vec![0.0; BUSES * 2 * max_frames],
         };
         player.update_hints();
         Ok((
@@ -332,9 +517,9 @@ impl Player {
         ))
     }
 
-    /// Applies every pending command, then fills `out` with interleaved
-    /// stereo frames (a trailing odd sample is left at 0.0). Real-time safe:
-    /// no allocation, no lock, no I/O.
+    /// Applies every pending command, then fills `out` with frames of
+    /// [`PlayerConfig::channels`] interleaved channels (a trailing partial
+    /// frame is left at 0.0). Real-time safe: no allocation, no lock, no I/O.
     pub fn process(&mut self, out: &mut [f32]) {
         while let Ok(command) = self.commands.pop() {
             self.apply(command);
@@ -342,8 +527,8 @@ impl Player {
         }
         self.update_hints();
         out.fill(0.0);
-        let usable = out.len() - out.len() % 2;
-        let piece = 2 * self.max_frames;
+        let usable = out.len() - out.len() % self.channels;
+        let piece = self.channels * self.max_frames;
         for chunk in out[..usable].chunks_mut(piece) {
             self.render(chunk);
         }
@@ -417,6 +602,36 @@ impl Player {
     pub fn set_infinite_at_start(&mut self, on: bool) {
         self.infinite_at_start = on;
         self.infinite = on;
+    }
+
+    /// Sets every stem's effective gain and bus at once, with no ramp, in
+    /// the order of the sources the player was built with (the song's stem
+    /// order, as [`domain::effective_gains`] gives them): for a player that
+    /// is not playing yet, before it is handed to the audio thread. Extra
+    /// entries are ignored; stems without one keep theirs.
+    pub fn set_stem_gains(&mut self, gains: &[StemGain]) {
+        for (stem, gain) in self.stems.iter_mut().zip(gains) {
+            stem.live = Ramp::at(Gain::new(gain.gain).get());
+            stem.bus = gain.bus;
+        }
+    }
+
+    /// Sets the generated click's gain at once ([`Command::SetClickGain`]
+    /// without the ramp), for a player not playing yet.
+    pub fn set_click_gain(&mut self, gain: f32) {
+        self.click_level = Ramp::at(Gain::new(gain).get());
+    }
+
+    /// Sets the routing at once ([`Command::SetRouting`] without the
+    /// crossfade), for a player not playing yet.
+    pub fn set_routes(&mut self, routes: Routes) {
+        self.routes = routes;
+        self.route_fade = Ramp::at(1.0);
+    }
+
+    /// The output channels [`Self::process`] fills.
+    pub fn channels(&self) -> usize {
+        self.channels
     }
 
     /// Applies `command` at once, as if it had come through the queue: for
@@ -575,12 +790,29 @@ impl Player {
                 self.click
                     .retarget(if on { 1.0 } else { 0.0 }, DECLICK_FRAMES);
             }
+            Command::SetStemGain { stem, gain } => {
+                let (audible, frames) = (self.transport.is_running(), self.gain_ramp);
+                if let Some(stem) = self.stems.get_mut(stem) {
+                    ramp_to(&mut stem.live, gain.get(), audible, frames);
+                }
+            }
+            Command::SetStemBus { stem, bus } => {
+                if let Some(stem) = self.stems.get_mut(stem) {
+                    stem.bus = bus;
+                }
+            }
+            Command::SetClickGain(gain) => {
+                let audible = self.transport.is_running();
+                ramp_to(&mut self.click_level, gain.get(), audible, self.gain_ramp);
+            }
+            Command::SetRouting(routes) => self.route(routes),
         }
     }
 
     /// Renders `out`, splitting it at every boundary inside it.
     fn render(&mut self, out: &mut [f32]) {
-        let frames = out.len() / 2;
+        let channels = self.channels;
+        let frames = out.len() / channels;
         let mut done = 0;
         loop {
             self.handle_boundaries();
@@ -590,7 +822,7 @@ impl Player {
                 return;
             }
             let n = ((frames - done) as u64).min(self.frames_to_next_event()) as usize;
-            self.render_block(&mut out[2 * done..2 * (done + n)]);
+            self.render_block(&mut out[channels * done..channels * (done + n)]);
             self.advance(n as u64);
             done += n;
         }
@@ -874,50 +1106,181 @@ impl Player {
         self.fade_out = false;
         self.end_gain = Ramp::at(1.0);
         self.end_fading = false;
+        // Nothing is heard now: gain and routing changes under way land.
+        for stem in &mut self.stems {
+            stem.live.finish();
+        }
+        self.click_level.finish();
+        self.route_fade = Ramp::at(1.0);
     }
 
-    /// Renders `out.len() / 2` frames with no boundary inside them.
+    /// Switches to `routes`: a crossfade from the routing playing while the
+    /// transport runs, at once otherwise. A change during a crossfade starts
+    /// from the routing that crossfade was going to.
+    fn route(&mut self, routes: Routes) {
+        if routes == self.routes {
+            return;
+        }
+        if self.transport.is_running() {
+            self.routes_from = self.routes;
+            self.route_fade = Ramp::at(0.0);
+            self.route_fade.retarget_over(1.0, self.gain_ramp);
+        } else {
+            self.route_fade = Ramp::at(1.0);
+        }
+        self.routes = routes;
+    }
+
+    /// Whether the stems sum straight into outputs 1 and 2, as they did
+    /// before routing: every bus there, no master, no routing crossfade.
+    fn plain(&self) -> bool {
+        self.channels >= 2 && self.routes == Routes::STEREO && self.route_fade.is_done()
+    }
+
+    /// Renders the frames of `out` (interleaved channels) with no boundary
+    /// inside them.
     fn render_block(&mut self, out: &mut [f32]) {
-        let n = out.len() / 2;
+        let channels = self.channels;
+        let n = out.len() / channels;
         for i in 0..n {
             self.track_gain[i] = self.fade.next() * self.end_gain.next();
-            self.click_gain[i] = self.click.next();
+            self.click_gain[i] = self.click.next() * self.click_level.next();
             self.master[i] = self.master_gain * self.transport_gain.next();
         }
+        if !self.plain() {
+            self.render_buses(out, n);
+        } else if channels == 2 {
+            self.render_stereo(out);
+        } else {
+            let mut mix = mem::take(&mut self.mix);
+            let stereo = &mut mix[..2 * n];
+            stereo.fill(0.0);
+            self.render_stereo(stereo);
+            for (frame, pair) in out.chunks_exact_mut(channels).zip(stereo.chunks_exact(2)) {
+                frame[0] = pair[0];
+                frame[1] = pair[1];
+            }
+            self.mix = mix;
+        }
+    }
+
+    /// The stereo mix of every stem in stem order, then the click, then the
+    /// master gain, into the stereo buffer `out`: exactly what the player
+    /// played before routing.
+    fn render_stereo(&mut self, out: &mut [f32]) {
+        let n = out.len() / 2;
         let source = self.source_frame();
-        let main_envelope = Envelope::FadeIn(self.voice.fade_in);
+        let block = Block {
+            n,
+            source,
+            tails: &self.tails,
+            track_gain: &self.track_gain,
+            envelope: Envelope::FadeIn(self.voice.fade_in),
+            envelope_start: self.voice.envelope_position(),
+        };
         for stem in &mut self.stems {
-            for tail in &self.tails {
-                let k = (n as u64).min(tail.remaining()) as usize;
-                let read = &mut self.read[..2 * k];
-                if !stem.source.read(tail.src_pos, read) {
-                    self.underruns += 1;
-                    continue;
-                }
-                for i in 0..k {
-                    let gain =
-                        stem.gain_at(&self.track_gain, i) * tail.gain(tail.played + i as u64);
-                    out[2 * i] += read[2 * i] * gain;
-                    out[2 * i + 1] += read[2 * i + 1] * gain;
-                }
-            }
-            let read = &mut self.read[..2 * n];
-            if !stem.source.read(source, read) {
-                self.underruns += 1;
-                continue;
-            }
-            for i in 0..n {
-                let gain = stem.gain_at(&self.track_gain, i)
-                    * main_envelope.at(self.voice.envelope_position() + i as u64);
-                out[2 * i] += read[2 * i] * gain;
-                out[2 * i + 1] += read[2 * i + 1] * gain;
-            }
+            add_stem(
+                stem,
+                &block,
+                &mut self.live,
+                &mut self.read,
+                out,
+                &mut self.underruns,
+            );
         }
         self.add_clicks(out, source);
         for (frame, gain) in out.chunks_exact_mut(2).zip(&self.master) {
             frame[0] *= gain;
             frame[1] *= gain;
         }
+    }
+
+    /// Each stem into its bus, the click into Click & Guide, the master gain
+    /// on every bus, then the router: each bus to its outputs, and the main
+    /// mix to the master destination. During a routing change both
+    /// routings play, crossfading.
+    fn render_buses(&mut self, out: &mut [f32], n: usize) {
+        let channels = self.channels;
+        let stride = 2 * self.max_frames;
+        let mut buses = mem::take(&mut self.buses);
+        for bus in 0..BUSES {
+            buses[bus * stride..bus * stride + 2 * n].fill(0.0);
+        }
+        let source = self.source_frame();
+        let mut used = [false; BUSES];
+        let block = Block {
+            n,
+            source,
+            tails: &self.tails,
+            track_gain: &self.track_gain,
+            envelope: Envelope::FadeIn(self.voice.fade_in),
+            envelope_start: self.voice.envelope_position(),
+        };
+        for stem in &mut self.stems {
+            let bus = bus_index(stem.bus);
+            used[bus] = true;
+            let target = &mut buses[bus * stride..bus * stride + 2 * n];
+            add_stem(
+                stem,
+                &block,
+                &mut self.live,
+                &mut self.read,
+                target,
+                &mut self.underruns,
+            );
+        }
+        if self.bursts.is_some() {
+            let click = bus_index(Bus::ClickGuide);
+            used[click] = true;
+            self.add_clicks(&mut buses[click * stride..click * stride + 2 * n], source);
+        }
+        for bus in (0..BUSES).filter(|&bus| used[bus]) {
+            let signal = &mut buses[bus * stride..bus * stride + 2 * n];
+            for (frame, gain) in signal.chunks_exact_mut(2).zip(&self.master) {
+                frame[0] *= gain;
+                frame[1] *= gain;
+            }
+        }
+
+        let fading = !self.route_fade.is_done();
+        if fading {
+            for value in &mut self.route_gain[..n] {
+                *value = self.route_fade.next();
+            }
+        }
+        let fade = &self.route_gain[..n];
+        let (to, from) = (self.routes, self.routes_from);
+        let route = |out: &mut [f32], signal: &[f32], new: Destination, old: Destination| {
+            if !fading || new == old {
+                add_routed(out, channels, signal, new, Weight::Full);
+            } else {
+                add_routed(out, channels, signal, old, Weight::Falling(fade));
+                add_routed(out, channels, signal, new, Weight::Rising(fade));
+            }
+        };
+        for bus in (0..BUSES).filter(|&bus| used[bus]) {
+            let signal = &buses[bus * stride..bus * stride + 2 * n];
+            route(out, signal, to.buses[bus], from.buses[bus]);
+        }
+        let master = (to.master, if fading { from.master } else { to.master });
+        if master != (None, None) {
+            let main = &mut self.mix[..2 * n];
+            main.fill(0.0);
+            let click = bus_index(Bus::ClickGuide);
+            for bus in (0..BUSES).filter(|&bus| used[bus] && bus != click) {
+                let signal = &buses[bus * stride..bus * stride + 2 * n];
+                for (sum, value) in main.iter_mut().zip(signal) {
+                    *sum += value;
+                }
+            }
+            match master {
+                (Some(new), Some(old)) => route(out, main, new, old),
+                (Some(new), None) => add_routed(out, channels, main, new, Weight::Rising(fade)),
+                (None, Some(old)) => add_routed(out, channels, main, old, Weight::Falling(fade)),
+                (None, None) => {}
+            }
+        }
+        self.buses = buses;
     }
 
     /// Adds the bursts still sounding, then the bursts of the ticks in the
@@ -980,5 +1343,15 @@ fn add_burst(out: &mut [f32], table: &[f32], gain: f32, click_gain: &[f32]) {
         let value = sample * (gain * click);
         frame[0] += value;
         frame[1] += value;
+    }
+}
+
+/// Moves `ramp` to `to`: over `frames` frames while the transport is
+/// `audible`, at once otherwise.
+fn ramp_to(ramp: &mut Ramp, to: f32, audible: bool, frames: u64) {
+    if audible {
+        ramp.retarget_over(to, frames);
+    } else {
+        *ramp = Ramp::at(to);
     }
 }
