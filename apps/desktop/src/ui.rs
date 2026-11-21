@@ -272,9 +272,11 @@ fn header(
 /// The setlist's name and the current item's place; picks another
 /// setlist.
 fn setlist_chip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoElement {
+    // It gives way to the transport and the clock, but never below a width
+    // that keeps the start of the name readable.
     chip_button("setlist", cx, Intent::OpenSetlist)
         .flex_shrink()
-        .min_w_0()
+        .min_w(px(140.))
         .max_w(px(260.))
         .child(icon("setlist", theme::text_muted(), 20.))
         .child(
@@ -442,7 +444,7 @@ fn now_playing(view: &PerformView, cx: &mut Context<Perform>) -> impl IntoElemen
                 .child(
                     div()
                         .flex_1()
-                        .min_w_0()
+                        .min_w(px(160.))
                         .flex()
                         .flex_col()
                         .justify_center()
@@ -1093,7 +1095,15 @@ fn status(status: &StatusView, setlist: bool) -> impl IntoElement {
                 .gap(px(14.))
                 .child(icon("device", theme::text_muted(), 18.))
                 .child(div().size(px(8.)).rounded(px(4.)).bg(dot))
-                .child(div().min_w_0().truncate().child(status.device.clone()))
+                // The device keeps a readable width; the long key list
+                // gives way first.
+                .child(
+                    div()
+                        .flex_shrink()
+                        .min_w(px(160.))
+                        .truncate()
+                        .child(status.device.clone()),
+                )
                 .child(
                     div()
                         .flex_none()

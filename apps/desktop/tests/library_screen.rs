@@ -939,6 +939,11 @@ fn removable(selected: &str) -> (tempfile::TempDir, LibraryPage) {
     (dir, page)
 }
 
+/// The armed remove control's label: short, since the setlist's name is in
+/// the editor's header (or the file in the line above an unreadable one)
+/// and a long label squeezes the name out of the header.
+const ARMED: &str = "Click again to remove";
+
 fn remove_label(page: &LibraryPage) -> String {
     page.view(None)
         .editor
@@ -952,7 +957,7 @@ fn removing_a_setlist_takes_a_second_click_and_moves_it_to_the_trash() {
     assert_eq!(remove_label(&page), "Remove");
 
     page.act(LibraryAction::RemoveSetlist);
-    assert_eq!(remove_label(&page), "Click again to remove B");
+    assert_eq!(remove_label(&page), ARMED);
     assert!(page.view(None).editor.unwrap().remove_armed);
     assert_eq!(
         setlist_names(&page),
@@ -978,14 +983,15 @@ fn any_other_action_disarms_the_removal() {
     page.act(LibraryAction::AddClick);
     assert_eq!(remove_label(&page), "Remove");
     page.act(LibraryAction::RemoveSetlist);
-    assert_eq!(remove_label(&page), "Click again to remove B");
+    assert_eq!(remove_label(&page), ARMED);
     assert!(dir.path().join("Setlists/B.setlist.json").exists());
 
     // Changing the selection disarms too: the second click arms A.
     page.act(LibraryAction::SelectSetlist(0));
     assert_eq!(remove_label(&page), "Remove");
     page.act(LibraryAction::RemoveSetlist);
-    assert_eq!(remove_label(&page), "Click again to remove A");
+    assert_eq!(remove_label(&page), ARMED);
+    assert_eq!(page.selected_file(), Some("A.setlist.json"), "armed for A");
     assert_eq!(setlist_names(&page), ["A", "B", "C"]);
 
     // So does typing into a field.
@@ -1148,7 +1154,7 @@ fn a_setlist_file_that_cannot_be_read_is_removed_from_the_list_in_two_presses() 
 
     page.act(LibraryAction::RemoveUnreadable(0));
     let row = page.view(None).unreadable_setlists[0].clone();
-    assert_eq!(row.remove, "Click again to remove Broken.setlist.json");
+    assert_eq!(row.remove, ARMED, "the line above names the file");
     assert!(row.remove_armed);
     // The setlist in the editor is not armed by it.
     assert_eq!(remove_label(&page), "Remove");

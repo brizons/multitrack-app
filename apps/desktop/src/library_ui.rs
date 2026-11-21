@@ -169,7 +169,10 @@ fn remove_button(view: &EditorView, cx: &mut Context<Perform>) -> impl IntoEleme
     } else {
         (theme::raised(), theme::text(), theme::border())
     };
+    // It may shrink to its icon before the setlist's name does.
     button("remove-setlist", cx, act(LibraryAction::RemoveSetlist))
+        .flex_shrink()
+        .min_w(px(36.))
         .h(px(36.))
         .px(px(10.))
         .rounded(px(8.))
@@ -180,7 +183,7 @@ fn remove_button(view: &EditorView, cx: &mut Context<Perform>) -> impl IntoEleme
         .text_size(px(13.))
         .font_weight(FontWeight::SEMIBOLD)
         .child(icon("trash", fg, 18.))
-        .child(view.remove.clone())
+        .child(div().min_w_0().truncate().child(view.remove.clone()))
 }
 
 fn heading(name: &'static str, title: &'static str) -> impl IntoElement {
@@ -315,6 +318,8 @@ fn setlist_row(row: &SetlistRow, rows: usize, cx: &mut Context<Perform>) -> AnyE
         )
         .child(
             div()
+                .w_full()
+                .truncate()
                 .text_size(px(13.))
                 .text_color(theme::text_muted())
                 .child(meta),
@@ -377,7 +382,7 @@ fn unreadable_row(row: &UnreadableRow, cx: &mut Context<Perform>) -> AnyElement 
             .text_size(px(12.))
             .text_color(fg)
             .child(icon("trash", fg, 14.))
-            .child(row.remove.clone()),
+            .child(div().min_w_0().truncate().child(row.remove.clone())),
         )
         .into_any_element()
 }
@@ -407,16 +412,19 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                 .flex()
                 .items_end()
                 .gap(px(12.))
+                // The name keeps a readable share next to the buttons and is
+                // cut with an ellipsis rather than squeezed into a column.
                 .child(
                     div()
                         .flex_1()
-                        .min_w_0()
+                        .min_w(px(HEADER_NAME_MIN))
                         .flex()
                         .flex_col()
                         .gap(px(2.))
                         .child(title)
                         .child(
                             div()
+                                .truncate()
                                 .text_size(px(14.))
                                 .text_color(theme::text_muted())
                                 .child(view.summary.clone()),
@@ -466,12 +474,12 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                 .text_size(px(12.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme::text_muted())
-                .child(div().w(px(64.)).flex_none().child("#"))
-                .child(div().flex_1().child("Song"))
-                .child(div().w(px(150.)).flex_none().child("Arrangement"))
-                .child(div().w(px(150.)).flex_none().child("Transition out"))
-                .child(div().w(px(56.)).flex_none().child("Length"))
-                .child(div().w(px(32.)).flex_none()),
+                .child(number_column(div()).child("#"))
+                .child(song_column(div()).child("Song"))
+                .child(arrangement_column(div()).truncate().child("Arrangement"))
+                .child(transition_column(div()).truncate().child("Transition out"))
+                .child(length_column(div()).child("Length"))
+                .child(remove_column(div())),
         )
         .child(
             div()
@@ -533,6 +541,50 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
         )
 }
 
+/// Narrowest the setlist's name in the editor's header gets beside the
+/// header's buttons.
+const HEADER_NAME_MIN: f32 = 140.;
+/// Width of the move arrows and the number.
+const NUMBER_WIDTH: f32 = 56.;
+/// Gap between the columns of the item rows.
+const COLUMN_GAP: f32 = 10.;
+/// Where an item's problems and controls start: under its song.
+const DETAILS_INDENT: f32 = NUMBER_WIDTH + COLUMN_GAP;
+
+// The item rows' columns, shared by the column labels and every row so
+// they line up. The song takes the room left and never goes below a width
+// that shows a short title in full; the arrangement and the transition
+// start at their full width and give way down to a minimum, cutting their
+// text with an ellipsis; the number, length and remove stay fixed.
+
+fn number_column<E: Styled>(element: E) -> E {
+    element.w(px(NUMBER_WIDTH)).flex_none()
+}
+
+fn song_column<E: Styled>(element: E) -> E {
+    element
+        .flex_grow()
+        .flex_shrink_0()
+        .flex_basis(px(0.))
+        .min_w(px(150.))
+}
+
+fn arrangement_column<E: Styled>(element: E) -> E {
+    element.flex_shrink().flex_basis(px(140.)).min_w(px(72.))
+}
+
+fn transition_column<E: Styled>(element: E) -> E {
+    element.flex_shrink().flex_basis(px(140.)).min_w(px(104.))
+}
+
+fn length_column<E: Styled>(element: E) -> E {
+    element.w(px(48.)).flex_none()
+}
+
+fn remove_column<E: Styled>(element: E) -> E {
+    element.w(px(32.)).flex_none()
+}
+
 fn editor_row(row: &EditorRow, rows: usize, cx: &mut Context<Perform>) -> AnyElement {
     let index = row.index;
     let (badge, transition_icon) = (
@@ -572,9 +624,7 @@ fn editor_row(row: &EditorRow, rows: usize, cx: &mut Context<Perform>) -> AnyEle
             .items_center()
             .gap(px(10.))
             .child(
-                div()
-                    .w(px(64.))
-                    .flex_none()
+                number_column(div())
                     .flex()
                     .items_center()
                     .gap(px(2.))
@@ -599,13 +649,11 @@ fn editor_row(row: &EditorRow, rows: usize, cx: &mut Context<Perform>) -> AnyEle
                     ),
             )
             .child(
-                button(
+                song_column(button(
                     id(format!("row-{index}")),
                     cx,
                     act(LibraryAction::SelectRow(index)),
-                )
-                .flex_1()
-                .min_w_0()
+                ))
                 .gap(px(10.))
                 .child(
                     div()
@@ -620,6 +668,7 @@ fn editor_row(row: &EditorRow, rows: usize, cx: &mut Context<Perform>) -> AnyEle
                 )
                 .child(
                     div()
+                        .flex_1()
                         .min_w_0()
                         .flex()
                         .flex_col()
@@ -641,39 +690,38 @@ fn editor_row(row: &EditorRow, rows: usize, cx: &mut Context<Perform>) -> AnyEle
                 ),
             )
             .child(
-                div()
-                    .w(px(150.))
-                    .flex_none()
+                arrangement_column(div())
                     .truncate()
                     .text_size(px(13.))
                     .child(row.arrangement.clone()),
             )
             .child(
-                div()
-                    .w(px(150.))
-                    .flex_none()
+                transition_column(div())
                     .flex()
                     .items_center()
                     .gap(px(7.))
                     .text_size(px(13.))
                     .child(icon(transition_icon, theme::text_muted(), 16.))
-                    .child(transition_name(row.transition)),
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .child(transition_name(row.transition)),
+                    ),
             )
             .child(
-                div()
-                    .w(px(56.))
-                    .flex_none()
+                length_column(div())
                     .font_family(theme::MONO)
                     .text_size(px(13.))
                     .child(row.length.clone()),
             )
             .child(
-                button(
+                remove_column(button(
                     id(format!("remove-{index}")),
                     cx,
                     act(LibraryAction::Remove(index)),
-                )
-                .size(px(32.))
+                ))
+                .h(px(32.))
                 .justify_center()
                 .rounded(px(8.))
                 .child(icon("close", theme::text_muted(), 16.)),
@@ -681,7 +729,7 @@ fn editor_row(row: &EditorRow, rows: usize, cx: &mut Context<Perform>) -> AnyEle
     )
     .children(row.problems.iter().map(|problem| {
         div()
-            .pl(px(74.))
+            .pl(px(DETAILS_INDENT))
             .text_size(px(12.))
             .text_color(theme::danger())
             .child(problem.clone())
@@ -790,7 +838,7 @@ fn song_details(
         .flex()
         .flex_col()
         .gap(px(8.))
-        .pl(px(74.))
+        .pl(px(DETAILS_INDENT))
         .pb(px(4.))
         .child(
             control("Arrangement").children(song.arrangements.iter().enumerate().map(
@@ -845,7 +893,7 @@ fn click_details(
         .flex()
         .flex_col()
         .gap(px(8.))
-        .pl(px(74.))
+        .pl(px(DETAILS_INDENT))
         .pb(px(4.))
         .child(control("Tempo").child(stepper(
             "bpm",

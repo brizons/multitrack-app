@@ -16,6 +16,12 @@ use crate::editor::{Edit, SetlistEditor};
 use crate::line_edit::{LineEdit, LineKey, LineOutcome};
 use crate::shelf::Shelf;
 
+/// The label of an armed remove control. It does not repeat the name: the
+/// setlist's name is in the editor's header (an unreadable file's in the
+/// line above its control), and a long label next to the header's other
+/// buttons would leave the name no room.
+pub const ARMED_LABEL: &str = "Click again to remove";
+
 /// The meters a click-only tile offers, as (numerator, denominator).
 pub const METERS: [(u32, u32); 8] = [
     (2, 4),
@@ -685,7 +691,7 @@ impl LibraryPage {
                         index,
                         line: problem.line.clone(),
                         remove: if armed {
-                            format!("Click again to remove {}", problem.file)
+                            ARMED_LABEL.to_owned()
                         } else {
                             "Remove".to_owned()
                         },
@@ -749,7 +755,7 @@ impl LibraryPage {
                 .collect(),
             playing: playing == Some(editor.file()),
             remove: if armed {
-                format!("Click again to remove {}", setlist.name)
+                ARMED_LABEL.to_owned()
             } else {
                 "Remove".to_owned()
             },
@@ -986,7 +992,7 @@ pub struct UnreadableRow {
     pub index: usize,
     /// The file and why it cannot be read.
     pub line: String,
-    /// The remove control: "Remove", or "Click again to remove FILE".
+    /// The remove control: "Remove", or [`ARMED_LABEL`] once armed.
     pub remove: String,
     /// Whether the next press removes it.
     pub remove_armed: bool,
@@ -1102,8 +1108,7 @@ pub struct EditorView {
     /// Whether it is open on the Perform screen, which plays it as it was
     /// when opened.
     pub playing: bool,
-    /// The remove control: "Remove", or "Click again to remove NAME" once
-    /// armed.
+    /// The remove control: "Remove", or [`ARMED_LABEL`] once armed.
     pub remove: String,
     /// Whether the next press of the remove control removes the setlist.
     pub remove_armed: bool,
