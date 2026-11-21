@@ -14,6 +14,10 @@ pub fn bg() -> Rgba {
 pub fn surface() -> Rgba {
     rgb(0x16181D)
 }
+/// The side navigation and the tiles of played items.
+pub fn panel() -> Rgba {
+    rgb(0x121418)
+}
 /// Buttons and cards on a panel.
 pub fn raised() -> Rgba {
     rgb(0x1D2026)
@@ -41,6 +45,18 @@ pub fn brand() -> Rgba {
 /// Secondary text.
 pub fn text_muted() -> Rgba {
     rgb(0xA3AAB5)
+}
+/// Text on an upcoming item's badge.
+pub fn text_soft() -> Rgba {
+    rgb(0xC4C9D1)
+}
+/// Badges of upcoming items; the selected item of the side navigation.
+pub fn badge() -> Rgba {
+    rgb(0x262A31)
+}
+/// The dashed border of a transition chip.
+pub fn chip_border() -> Rgba {
+    rgb(0x3A3F48)
 }
 /// Tertiary text: units, counts.
 pub fn text_faint() -> Rgba {
@@ -124,28 +140,55 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/back-to-start.svg"),
     ),
     (
+        "icons/check.svg",
+        include_bytes!("../assets/icons/check.svg"),
+    ),
+    (
         "icons/close.svg",
         include_bytes!("../assets/icons/close.svg"),
     ),
+    ("icons/copy.svg", include_bytes!("../assets/icons/copy.svg")),
+    (
+        "icons/crossfade.svg",
+        include_bytes!("../assets/icons/crossfade.svg"),
+    ),
+    ("icons/cue.svg", include_bytes!("../assets/icons/cue.svg")),
     (
         "icons/device.svg",
         include_bytes!("../assets/icons/device.svg"),
     ),
+    ("icons/down.svg", include_bytes!("../assets/icons/down.svg")),
     ("icons/fade.svg", include_bytes!("../assets/icons/fade.svg")),
     (
         "icons/folder.svg",
         include_bytes!("../assets/icons/folder.svg"),
     ),
+    ("icons/grip.svg", include_bytes!("../assets/icons/grip.svg")),
     (
         "icons/infinite.svg",
         include_bytes!("../assets/icons/infinite.svg"),
     ),
     ("icons/jump.svg", include_bytes!("../assets/icons/jump.svg")),
+    (
+        "icons/library.svg",
+        include_bytes!("../assets/icons/library.svg"),
+    ),
+    ("icons/link.svg", include_bytes!("../assets/icons/link.svg")),
     ("icons/loop.svg", include_bytes!("../assets/icons/loop.svg")),
+    (
+        "icons/metronome.svg",
+        include_bytes!("../assets/icons/metronome.svg"),
+    ),
+    (
+        "icons/minus.svg",
+        include_bytes!("../assets/icons/minus.svg"),
+    ),
+    ("icons/next.svg", include_bytes!("../assets/icons/next.svg")),
     (
         "icons/next-bar.svg",
         include_bytes!("../assets/icons/next-bar.svg"),
     ),
+    ("icons/note.svg", include_bytes!("../assets/icons/note.svg")),
     (
         "icons/openvamp-loop.svg",
         include_bytes!("../assets/icons/openvamp-loop.svg"),
@@ -162,12 +205,39 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/pause.svg",
         include_bytes!("../assets/icons/pause.svg"),
     ),
+    (
+        "icons/pencil.svg",
+        include_bytes!("../assets/icons/pencil.svg"),
+    ),
+    (
+        "icons/perform.svg",
+        include_bytes!("../assets/icons/perform.svg"),
+    ),
     ("icons/play.svg", include_bytes!("../assets/icons/play.svg")),
+    ("icons/plus.svg", include_bytes!("../assets/icons/plus.svg")),
+    (
+        "icons/previous.svg",
+        include_bytes!("../assets/icons/previous.svg"),
+    ),
+    (
+        "icons/search.svg",
+        include_bytes!("../assets/icons/search.svg"),
+    ),
     (
         "icons/section-end.svg",
         include_bytes!("../assets/icons/section-end.svg"),
     ),
+    (
+        "icons/setlist.svg",
+        include_bytes!("../assets/icons/setlist.svg"),
+    ),
+    ("icons/stay.svg", include_bytes!("../assets/icons/stay.svg")),
     ("icons/stop.svg", include_bytes!("../assets/icons/stop.svg")),
+    (
+        "icons/trash.svg",
+        include_bytes!("../assets/icons/trash.svg"),
+    ),
+    ("icons/up.svg", include_bytes!("../assets/icons/up.svg")),
 ];
 
 impl AssetSource for Icons {

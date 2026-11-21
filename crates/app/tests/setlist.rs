@@ -1221,3 +1221,581 @@ fn a_late_autolink_or_crossfade_starts_the_next_item_once_buffered_and_says_so()
         );
     }
 }
+
+/// An output that keeps every renderer it was given, even after its stream
+/// closes, so a lost stream never hands the session's deck back: the
+/// session ends up without a player ([`app::RuntimeError::PlayerLost`]).
+#[derive(Clone, Default)]
+struct KeepsRenderers {
+    kept: std::sync::Arc<std::sync::Mutex<Vec<app::AudioRenderer>>>,
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct KeptStream {
+    info: app::StreamInfo,
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl app::AudioOutput for KeepsRenderers {
+    fn devices(&self) -> Result<Vec<app::DeviceInfo>, app::OutputError> {
+        Ok(Vec::new())
+    }
+
+    fn open(
+        &mut self,
+        request: &app::OutputRequest,
+        renderer: app::AudioRenderer,
+    ) -> Result<Box<dyn app::OutputStream>, app::OutputError> {
+        self.kept.lock().unwrap().push(renderer);
+        Ok(Box::new(KeptStream {
+            info: app::StreamInfo {
+                device: "Keeper".to_owned(),
+                device_id: "keeper".to_owned(),
+                sample_rate: request.sample_rate,
+                buffer_frames: request.buffer_frames,
+                channels: 2,
+            },
+            lost: std::sync::Arc::clone(&self.lost),
+        }))
+    }
+}
+
+impl app::OutputStream for KeptStream {
+    fn info(&self) -> &app::StreamInfo {
+        &self.info
+    }
+
+    fn health(&self) -> app::StreamHealth {
+        if self.lost.load(std::sync::atomic::Ordering::SeqCst) {
+            app::StreamHealth::Lost {
+                reason: app::LossReason::Unplugged,
+            }
+        } else {
+            app::StreamHealth::Running
+        }
+    }
+}
+
+#[test]
+fn a_reopen_with_no_player_left_sends_nothing_and_keeps_describing_the_item() {
+    let shelf = Shelf::new();
+    shelf
+        .song("Songs/A.song", RATE, 0)
+        .song("Songs/Hi.song", 2 * RATE, 10);
+    let mut setlist = Setlist::new("Sunday");
+    setlist.items = vec![
+        song("Songs/A.song", Transition::CueNext),
+        song("Songs/Hi.song", Transition::CueNext),
+    ];
+    let entry = shelf.library.save_setlist(&setlist).unwrap();
+    let output = KeepsRenderers::default();
+    let mut session = SetlistSession::open(
+        &shelf.library,
+        &entry.file,
+        Box::new(output.clone()),
+        options(),
+    )
+    .unwrap();
+    session.poll();
+    wait_disks(&session);
+    let monitors = session.disk_monitors();
+    assert_eq!(monitors.len(), 2, "A and Hi, prepared ahead");
+    let hi = monitors[1].clone();
+    assert!(hi.is_running());
+
+    // The stream is lost and the output keeps the deck: no player is left.
+    output.lost.store(true, std::sync::atomic::Ordering::SeqCst);
+    let lost = session.poll();
+    assert_eq!(lost.song.last_error, Some(app::RuntimeError::PlayerLost));
+
+    let error = session.send(SetlistCommand::Next).unwrap_err();
+    assert_eq!(
+        error,
+        SetlistCommandError::Runtime(app::RuntimeError::PlayerLost)
+    );
+    let snapshot = session.poll();
+    assert_eq!(snapshot.setlist.current, 0, "the session still describes A");
+    assert_eq!(session.song().sample_rate, RATE);
+    assert!(
+        !hi.is_running(),
+        "Hi was dropped here, not sent to a deck nobody plays"
+    );
+}
+
+#[test]
+fn a_first_item_that_cannot_be_built_is_reported_and_the_setlist_opens_at_the_next() {
+    let shelf = Shelf::new();
+    // 1 kHz is too low to stream, though the song itself is valid.
+    shelf
+        .song("Songs/Low.song", 1_000, 0)
+        .song("Songs/A.song", RATE, 10);
+    let fake = FakeOutput::new();
+    let mut session = shelf.open(
+        vec![
+            song("Songs/Low.song", Transition::CueNext),
+            song("Songs/A.song", Transition::CueNext),
+        ],
+        &fake,
+    );
+    let info = session.info().clone();
+    assert_eq!(info.unavailable(), [0], "Low is reported");
+    assert!(
+        info.items[0].problems.iter().any(|p| p.contains("too low")),
+        "{:?}",
+        info.items[0].problems
+    );
+    assert_eq!(info.sample_rate, RATE, "the device opens at A's rate");
+    assert_eq!(fake.opened()[0].sample_rate, RATE);
+    assert_eq!(session.poll().setlist.current, 1);
+    assert_eq!(
+        session.send(SetlistCommand::Previous),
+        Err(SetlistCommandError::NoPrevious),
+        "Low is skipped"
+    );
+}
+
+#[test]
+fn a_setlist_whose_items_all_fail_to_build_has_nothing_playable_with_every_reason() {
+    let shelf = Shelf::new();
+    shelf.song("Songs/Low.song", 1_000, 0);
+    let mut setlist = Setlist::new("Low");
+    setlist.items = vec![
+        song("Songs/Missing.song", Transition::CueNext),
+        song("Songs/Low.song", Transition::CueNext),
+    ];
+    let entry = shelf.library.save_setlist(&setlist).unwrap();
+    let fake = FakeOutput::new();
+    let result = SetlistSession::open(
+        &shelf.library,
+        &entry.file,
+        Box::new(fake.clone()),
+        options(),
+    );
+    let Err(app::SetlistOpenError::NothingPlayable { name, problems }) = result else {
+        panic!("nothing can play: {:?}", result.err());
+    };
+    assert_eq!(name, "Low");
+    assert!(problems[0].iter().any(|p| p.contains("Songs/Missing.song")));
+    assert!(
+        problems[1].iter().any(|p| p.contains("too low")),
+        "{problems:?}"
+    );
+    assert!(fake.opened().is_empty());
+}
+
+/// Tests wait on these monitors before each buffer: the item a crossfade
+/// fades out is still heard, so its disk is watched until the blend ends.
+#[test]
+fn the_item_a_crossfade_fades_out_stays_watched_until_the_blend_ends() {
+    let shelf = Shelf::new();
+    shelf
+        .steady("Songs/A.song", 7, PEAK, 0.0)
+        .steady("Songs/B.song", 7, PEAK, 0.0);
+    let fake = FakeOutput::new();
+    let mut session = shelf.open(
+        vec![
+            song("Songs/A.song", Transition::Crossfade),
+            song("Songs/B.song", Transition::CueNext),
+        ],
+        &fake,
+    );
+    wait_next(&mut session);
+    assert_eq!(session.disk_monitors().len(), 2, "A, and B cued");
+    let mut during = None;
+    let mut after = None;
+    let mut audio = start(&mut session, &fake);
+    while audio.len() < 2 * 14 * RATE as usize {
+        let (out, snapshot) = step(&mut session, &fake);
+        audio.extend(out);
+        let watched = session.disk_monitors().len();
+        if snapshot.setlist.blend.is_some() {
+            during.get_or_insert(watched);
+        } else if snapshot.setlist.current == 1 {
+            after.get_or_insert(watched);
+        }
+    }
+    assert_eq!(during, Some(2), "B, and A while it fades out");
+    assert_eq!(after, Some(1), "B alone once the blend is over");
+}
+
+#[test]
+fn a_link_into_another_rate_is_reported_as_the_cue_next_it_plays_as() {
+    use app::RateFallback;
+
+    let shelf = Shelf::new();
+    shelf
+        .song("Low.song", RATE, 0)
+        .song("High.song", 2 * RATE, 1)
+        .song("High2.song", 2 * RATE, 2)
+        .song("Low2.song", RATE, 3);
+    let fake = FakeOutput::new();
+    let mut session = shelf.open(
+        vec![
+            song("Low.song", Transition::AutoLink),
+            song("High.song", Transition::Crossfade),
+            // A click tile plays at the rate the device runs at.
+            click(Some(1), Transition::AutoLink),
+            song("High2.song", Transition::AutoLink),
+            song("Low2.song", Transition::AutoLink),
+        ],
+        &fake,
+    );
+
+    let info = session.info().clone();
+    let fallbacks: Vec<Option<RateFallback>> =
+        info.items.iter().map(|item| item.fallback).collect();
+    assert_eq!(
+        fallbacks,
+        [
+            Some(RateFallback {
+                next: 1,
+                next_rate: 2 * RATE,
+                device_rate: RATE,
+            }),
+            None,
+            None,
+            Some(RateFallback {
+                next: 4,
+                next_rate: RATE,
+                device_rate: 2 * RATE,
+            }),
+            None,
+        ]
+    );
+    assert_eq!(info.items[0].plays_as(), Transition::CueNext);
+    assert_eq!(info.items[1].plays_as(), Transition::Crossfade);
+    assert_eq!(info.items[4].plays_as(), Transition::AutoLink);
+
+    // The current item's, as the device runs now.
+    let state = session.poll().setlist;
+    assert_eq!(state.transition, Transition::AutoLink, "as written");
+    assert_eq!(state.fallback, info.items[0].fallback);
+    assert_eq!(state.plays_as(), Transition::CueNext);
+}
+
+// L46: reordering the setlist while it plays.
+
+/// Songs A to D, each with its transition, opened with B cued.
+fn shelf_abcd(transitions: [Transition; 4]) -> (Shelf, FakeOutput, SetlistSession) {
+    let shelf = Shelf::new();
+    shelf
+        .song("Songs/A.song", RATE, 0)
+        .song("Songs/B.song", RATE, 10)
+        .song("Songs/C.song", RATE, 20)
+        .song("Songs/D.song", RATE, 30);
+    let fake = FakeOutput::new();
+    let items = ["A", "B", "C", "D"]
+        .iter()
+        .zip(transitions)
+        .map(|(name, transition)| song(&format!("Songs/{name}.song"), transition))
+        .collect();
+    let mut session = shelf.open(items, &fake);
+    wait_next(&mut session);
+    (shelf, fake, session)
+}
+
+/// The songs of the session's items, in its order.
+fn order(session: &SetlistSession) -> Vec<String> {
+    session
+        .info()
+        .items
+        .iter()
+        .map(|item| match &item.item {
+            SetlistItem::Song(song) => song.song.clone(),
+            SetlistItem::Click(_) => "click".to_owned(),
+        })
+        .collect()
+}
+
+fn moved(from: usize, to: usize) -> SetlistCommand {
+    SetlistCommand::Move { from, to }
+}
+
+#[test]
+fn an_item_moved_right_after_the_current_one_plays_next_and_autolink_lands_on_it() {
+    use Transition::{AutoLink, CueNext};
+    let (shelf, fake, mut session) = shelf_abcd([AutoLink, CueNext, CueNext, CueNext]);
+    let cued_b = session.disk_monitors()[1].clone();
+
+    session.send(moved(3, 1)).expect("the move is taken");
+
+    assert_eq!(
+        order(&session),
+        [
+            "Songs/A.song",
+            "Songs/D.song",
+            "Songs/B.song",
+            "Songs/C.song"
+        ]
+    );
+    wait_next(&mut session);
+    let state = session.poll().setlist;
+    assert_eq!((state.current, state.next), (0, Some(1)));
+    let (a, d) = (shelf.offline("Songs/A.song"), shelf.offline("Songs/D.song"));
+    let (la, ld) = (a.len() / 2, d.len() / 2);
+    let (played, snapshot) = play(&mut session, &fake, la + ld + 1_000);
+    assert_eq!(bits(&played[..2 * la]), bits(&a));
+    assert_eq!(
+        bits(&played[2 * la..2 * (la + ld)]),
+        bits(&d),
+        "D starts on the frame after A's last"
+    );
+    assert!(played[2 * (la + ld)..].iter().all(|&s| s == 0.0));
+    assert_eq!(
+        (snapshot.setlist.current, snapshot.song.transport),
+        (2, TransportState::Stopped),
+        "D ended as Cue next, B is selected"
+    );
+    assert!(!cued_b.is_running(), "the B cued before the move is gone");
+}
+
+#[test]
+fn moving_the_cued_next_item_away_cues_the_new_next() {
+    use Transition::{AutoLink, CueNext};
+    let (shelf, fake, mut session) = shelf_abcd([AutoLink, CueNext, CueNext, CueNext]);
+
+    session.send(moved(1, 3)).expect("the move is taken");
+
+    assert_eq!(
+        order(&session),
+        [
+            "Songs/A.song",
+            "Songs/C.song",
+            "Songs/D.song",
+            "Songs/B.song"
+        ]
+    );
+    wait_next(&mut session);
+    assert_eq!(session.poll().setlist.next, Some(1));
+    let (a, c) = (shelf.offline("Songs/A.song"), shelf.offline("Songs/C.song"));
+    let (la, lc) = (a.len() / 2, c.len() / 2);
+    let (played, snapshot) = play(&mut session, &fake, la + lc + 1_000);
+    assert_eq!(bits(&played[..2 * la]), bits(&a));
+    assert_eq!(bits(&played[2 * la..2 * (la + lc)]), bits(&c));
+    assert_eq!(
+        (snapshot.setlist.current, snapshot.song.transport),
+        (2, TransportState::Stopped),
+        "C ended as Cue next, D is selected"
+    );
+}
+
+#[test]
+fn moving_the_item_playing_keeps_it_playing_without_a_cut() {
+    use Transition::CueNext;
+    // The item playing, selected at `from`, moved down to the end, then up
+    // to the start.
+    for (from, to) in [(0, 3), (3, 0)] {
+        let run = |moves: bool| {
+            let (_shelf, fake, mut session) = shelf_abcd([CueNext; 4]);
+            if from != 0 {
+                session.send(SetlistCommand::Select(from)).unwrap();
+            }
+            let mut audio = start(&mut session, &fake);
+            for _ in 0..20 {
+                audio.extend(step(&mut session, &fake).0);
+            }
+            if moves {
+                session.send(moved(from, to)).expect("the move is taken");
+                let snapshot = session.poll();
+                assert_eq!(snapshot.setlist.current, to, "the index follows the item");
+                assert_eq!(snapshot.song.transport, TransportState::Playing);
+            }
+            while audio.len() < 2 * (14 * RATE as usize + 2_000) {
+                audio.extend(step(&mut session, &fake).0);
+            }
+            audio
+        };
+        assert_eq!(
+            bits(&run(true)),
+            bits(&run(false)),
+            "item {from} moved to {to}"
+        );
+    }
+}
+
+#[test]
+fn moving_items_before_the_current_one_leaves_what_plays_and_what_follows() {
+    use Transition::{AutoLink, CueNext};
+    let (shelf, fake, mut session) = shelf_abcd([CueNext, CueNext, AutoLink, CueNext]);
+    session.send(SetlistCommand::Select(2)).unwrap();
+    wait_next(&mut session);
+    let cued_d = session.disk_monitors()[1].clone();
+
+    session.send(moved(0, 1)).expect("the move is taken");
+
+    assert_eq!(
+        order(&session),
+        [
+            "Songs/B.song",
+            "Songs/A.song",
+            "Songs/C.song",
+            "Songs/D.song"
+        ]
+    );
+    let state = session.poll().setlist;
+    assert_eq!(
+        (state.current, state.next, state.next_ready),
+        (2, Some(3), true)
+    );
+    assert_eq!(session.disk_monitors().len(), 2, "C and the D cued before");
+    let (c, d) = (shelf.offline("Songs/C.song"), shelf.offline("Songs/D.song"));
+    let (lc, ld) = (c.len() / 2, d.len() / 2);
+    let (played, snapshot) = play(&mut session, &fake, lc + ld + 1_000);
+    assert_eq!(bits(&played[..2 * lc]), bits(&c));
+    assert_eq!(bits(&played[2 * lc..2 * (lc + ld)]), bits(&d));
+    assert_eq!(snapshot.setlist.current, 3);
+    assert!(
+        cued_d.is_running(),
+        "the D that plays is the one cued first"
+    );
+}
+
+#[test]
+fn a_move_during_a_crossfade_is_refused_and_changes_nothing() {
+    let shelf = Shelf::new();
+    shelf
+        .steady("Songs/A.song", 12, PEAK, 0.0)
+        .steady("Songs/B.song", 12, PEAK, 0.0)
+        .steady("Songs/C.song", 12, -PEAK, 0.0);
+    let fake = FakeOutput::new();
+    let mut session = shelf.open(
+        vec![
+            song("Songs/A.song", Transition::Crossfade),
+            song("Songs/B.song", Transition::CueNext),
+            song("Songs/C.song", Transition::CueNext),
+        ],
+        &fake,
+    );
+    wait_next(&mut session);
+    start(&mut session, &fake);
+    while step(&mut session, &fake).1.setlist.blend.is_none() {}
+    let before = session.info().clone();
+
+    assert_eq!(
+        session.send(moved(2, 0)),
+        Err(SetlistCommandError::HandingOver)
+    );
+
+    assert_eq!(session.info(), &before);
+    let state = step(&mut session, &fake).1.setlist;
+    assert_eq!((state.current, state.next), (1, Some(2)));
+    while step(&mut session, &fake).1.setlist.blend.is_some() {}
+    session
+        .send(moved(2, 0))
+        .expect("taken once the blend ended");
+    assert_eq!(session.poll().setlist.current, 2, "B follows its own move");
+}
+
+#[test]
+fn a_move_right_after_an_autolink_hand_over_is_refused_until_the_session_follows_it() {
+    let (shelf, fake, mut session) = shelf_abc();
+    let la = shelf.offline("Songs/A.song").len() / 2;
+    let mut frames = start(&mut session, &fake).len() / 2;
+    // Rendered with no poll: the deck hands over to B on its own.
+    while frames < la + 2 * BUFFER {
+        wait_disks(&session);
+        frames += fake.render(BUFFER).unwrap().len() / 2;
+    }
+    let before = session.info().clone();
+
+    assert_eq!(
+        session.send(moved(2, 0)),
+        Err(SetlistCommandError::HandingOver)
+    );
+
+    assert_eq!(session.info(), &before);
+    assert_eq!(session.poll().setlist.current, 1, "the session follows B");
+    session.send(moved(2, 0)).expect("taken once followed");
+    assert_eq!(session.poll().setlist.current, 2);
+}
+
+#[test]
+fn a_move_out_of_range_is_refused_and_one_to_the_same_place_changes_nothing() {
+    let (_shelf, _fake, mut session) = shelf_abc();
+    let before = session.info().clone();
+    let cued_b = session.disk_monitors()[1].clone();
+    let out_of_range = Err(SetlistCommandError::OutOfRange { item: 3, items: 3 });
+
+    assert_eq!(session.send(moved(3, 0)), out_of_range);
+    assert_eq!(session.send(moved(0, 3)), out_of_range);
+    assert_eq!(session.send(moved(1, 1)), Ok(()));
+
+    assert_eq!(session.info(), &before);
+    let state = session.poll().setlist;
+    assert_eq!(
+        (state.current, state.next, state.next_ready),
+        (0, Some(1), true)
+    );
+    assert_eq!(session.disk_monitors().len(), 2, "A and the B cued");
+    assert!(cued_b.is_running());
+}
+
+#[test]
+fn next_and_previous_follow_the_new_order() {
+    let (shelf, fake, mut session) = shelf_abc();
+
+    session.send(moved(2, 0)).expect("the move is taken");
+    assert_eq!(
+        order(&session),
+        ["Songs/C.song", "Songs/A.song", "Songs/B.song"]
+    );
+    assert_eq!(session.poll().setlist.current, 1, "A is still current");
+
+    session.send(SetlistCommand::Next).unwrap();
+    assert_eq!(session.poll().setlist.current, 2);
+    let b = shelf.offline("Songs/B.song");
+    assert_eq!(bits(&start(&mut session, &fake)), bits(&b[..2 * BUFFER]));
+
+    session.send(SetlistCommand::Previous).unwrap();
+    assert_eq!(session.poll().setlist.current, 1);
+    session.send(SetlistCommand::Previous).unwrap();
+    assert_eq!(session.poll().setlist.current, 0);
+    for _ in 0..20 {
+        step(&mut session, &fake);
+    }
+    let c = shelf.offline("Songs/C.song");
+    assert_eq!(bits(&start(&mut session, &fake)), bits(&c[..2 * BUFFER]));
+}
+
+#[test]
+fn a_song_at_another_rate_moved_next_plays_as_the_cue_next_it_falls_back_to() {
+    use app::RateFallback;
+
+    let shelf = Shelf::new();
+    shelf
+        .song("Songs/A.song", RATE, 0)
+        .song("Songs/B.song", RATE, 10)
+        .song("Songs/Hi.song", 2 * RATE, 20);
+    let fake = FakeOutput::new();
+    let mut session = shelf.open(
+        vec![
+            song("Songs/A.song", Transition::AutoLink),
+            song("Songs/B.song", Transition::CueNext),
+            song("Songs/Hi.song", Transition::CueNext),
+        ],
+        &fake,
+    );
+    wait_next(&mut session);
+
+    session.send(moved(2, 1)).expect("the move is taken");
+
+    let fallback = Some(RateFallback {
+        next: 1,
+        next_rate: 2 * RATE,
+        device_rate: RATE,
+    });
+    assert_eq!(session.info().items[0].fallback, fallback);
+    assert_eq!(session.info().items[2].fallback, None, "B ends the setlist");
+    assert_eq!(session.info().other_rate(), [1]);
+    let state = session.poll().setlist;
+    assert_eq!((state.next, state.fallback), (Some(1), fallback));
+    let la = shelf.offline("Songs/A.song").len() / 2;
+    let (played, _) = play(&mut session, &fake, la + 4_000);
+    assert!(
+        played[2 * la..].iter().all(|&s| s == 0.0),
+        "A stops at its end: nothing links into the other rate"
+    );
+    let snapshot = session.poll();
+    assert_eq!(snapshot.setlist.current, 1, "Hi is selected");
+    assert_eq!(snapshot.song.transport, TransportState::Stopped);
+}

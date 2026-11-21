@@ -10,7 +10,7 @@ use domain::{
     CROSSFADE_SECONDS, ClickItem, SetlistItem, SetlistValidationError, SongItem, SongLookup,
     Transition,
 };
-use engine::live::Handoff;
+use engine::live::{DeckStatus, Handoff};
 use library::{DiskMonitor, Library, SetlistError, SetlistSongs};
 use thiserror::Error;
 
@@ -71,9 +71,35 @@ pub struct ItemInfo {
     pub sample_rate: Option<u32>,
     /// Why the item cannot play, every reason; empty when it can.
     pub problems: Vec<String>,
+    /// How its AutoLink or Crossfade plays as Cue next when the setlist
+    /// plays in order, because the item it leads into runs at another rate
+    /// than the device then; `None` when it plays as written.
+    pub fallback: Option<RateFallback>,
+}
+
+/// An AutoLink or Crossfade that plays as Cue next: the next playable item
+/// runs at another rate than the device while this one plays, and nothing
+/// resamples, so the device reopens between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateFallback {
+    /// Index of the item it leads into.
+    pub next: usize,
+    /// That item's rate.
+    pub next_rate: u32,
+    /// The device's rate while this item plays.
+    pub device_rate: u32,
 }
 
 impl ItemInfo {
+    /// The transition the item plays with: Cue next under a
+    /// [`Self::fallback`], else its own.
+    pub fn plays_as(&self) -> Transition {
+        match self.fallback {
+            Some(_) => Transition::CueNext,
+            None => self.item.transition(),
+        }
+    }
+
     /// Whether the item can play.
     pub fn is_playable(&self) -> bool {
         self.problems.is_empty()
@@ -93,6 +119,19 @@ pub enum SetlistCommand {
     /// Selects the item at this index of [`SetlistInfo::items`]; selecting
     /// the current item stops it at its start.
     Select(usize),
+    /// Moves the item at index `from` of [`SetlistInfo::items`] to `to`,
+    /// while the setlist plays too: the item playing plays on without a
+    /// cut, every index follows its item, and when the item after the
+    /// current one changes, the one cued is dropped and the new next item
+    /// is prepared and cued as any next item is. Moving an item to its own
+    /// place does nothing. The session writes no file: the shell saves the
+    /// new order, which [`SetlistSession::info`] holds.
+    Move {
+        /// Index of the item moved.
+        from: usize,
+        /// Its index once moved.
+        to: usize,
+    },
 }
 
 /// The state of a setlist session, for a shell to draw;
@@ -119,11 +158,25 @@ pub struct SetlistState {
     /// Whether the next item is prepared and its start buffered, so its
     /// transition will not wait for the disk.
     pub next_ready: bool,
+    /// How the current item's AutoLink or Crossfade plays as Cue next, at
+    /// the rate the device runs now; `None` when it plays as written.
+    pub fallback: Option<RateFallback>,
     /// The crossfade under way, if any.
     pub blend: Option<BlendView>,
     /// The most recent setlist problem; an operator's next, previous or
     /// select clears it.
     pub problem: Option<SetlistProblem>,
+}
+
+impl SetlistState {
+    /// The transition the current item plays with: Cue next under a
+    /// [`Self::fallback`], else [`Self::transition`].
+    pub fn plays_as(&self) -> Transition {
+        match self.fallback {
+            Some(_) => Transition::CueNext,
+            None => self.transition,
+        }
+    }
 }
 
 /// A crossfade under way.
@@ -159,6 +212,14 @@ pub enum SetlistProblem {
         /// Why.
         error: String,
     },
+    /// A move changed the item after the current one, but the deck had
+    /// already started handing over to the item cued before it took that
+    /// item back: that item played, and the setlist follows it.
+    #[error("item {} played: the move came after its hand-over had started", .item + 1)]
+    MovedLate {
+        /// Index of the item that played.
+        item: usize,
+    },
     /// An AutoLink or Crossfade found the next item not buffered in time;
     /// it started as soon as it was.
     #[error("item {} was not loaded in time to follow on; it started once it was", .item + 1)]
@@ -186,7 +247,10 @@ pub enum SetlistOpenError {
     /// opened.
     #[error(transparent)]
     Library(#[from] SetlistError),
-    /// No item can play; [`SetlistInfo`] would list why for each.
+    /// No item can play: each one either breaks a rule, names a song the
+    /// library cannot provide, or does not build (its song does not stream,
+    /// say). `problems` lists why for each item, as [`ItemInfo::problems`]
+    /// would.
     #[error("setlist \"{name}\" has no item that can play")]
     NothingPlayable {
         /// The setlist's name.
@@ -194,19 +258,13 @@ pub enum SetlistOpenError {
         /// Why each item cannot play, in item order.
         problems: Vec<Vec<String>>,
     },
-    /// The first playable item or the device could not be opened.
+    /// The buffer size is refused, the device could not be opened, or
+    /// building the first item met an error every item would meet (the
+    /// disk thread could not start, say). An item that does not build for a
+    /// reason of its own is not this error: it is reported with the items
+    /// that cannot play, and the setlist opens at the next one.
     #[error(transparent)]
     Open(#[from] OpenError),
-    /// The first playable item could not be built although its folder
-    /// opened: its song changed after the setlist was checked and no longer
-    /// has the item's start and end positions.
-    #[error("item {} could not be prepared: {error}", .item + 1)]
-    FirstItem {
-        /// Index of the item.
-        item: usize,
-        /// Why.
-        error: String,
-    },
 }
 
 /// Why [`SetlistSession::send`] refused a command; nothing changed.
@@ -244,6 +302,12 @@ pub enum SetlistCommandError {
         /// Why.
         error: String,
     },
+    /// A move came while an item hands over to the next one: a crossfade
+    /// runs, or the deck started the next item and the session has not
+    /// followed it yet ([`SetlistSession::poll`] does). Try again once it
+    /// has.
+    #[error("the setlist is moving on to the next item; it can be reordered once it has")]
+    HandingOver,
 }
 
 /// How a playable item is built.
@@ -280,6 +344,14 @@ struct Staged {
     tag: u64,
     info: SongInfo,
     monitor: DiskMonitor,
+}
+
+/// A cued item the session sent back, until a report shows the deck took
+/// that message: the deck may have handed over to it first.
+struct Withdrawn {
+    staged: Staged,
+    /// Messages sent once the withdrawal was.
+    sent: u64,
 }
 
 /// An item prepared on the control thread, not handed over yet.
@@ -329,12 +401,14 @@ impl PreparedSetlist {
             options,
             current: first,
             cued: None,
+            withdrawn: None,
             pending: None,
             reopen: None,
             play_after_reopen: false,
             halted: false,
             failed: None,
             blend_from: None,
+            fading: None,
             finished_seen: 0,
             next_tag: 1,
             problem: None,
@@ -401,6 +475,11 @@ impl PreparedSetlist {
 /// off ends it at the bar line, and its transition follows. The jump timing
 /// and fade duration the operator chose carry over to the items that
 /// follow.
+///
+/// [`SetlistCommand::Move`] reorders the setlist while it plays: the item
+/// playing goes on, and the next item is cued again when it changed. A move
+/// is refused while a crossfade runs or the deck has started the next item
+/// before a poll followed it ([`SetlistCommandError::HandingOver`]).
 pub struct SetlistSession {
     session: Session,
     info: SetlistInfo,
@@ -408,6 +487,8 @@ pub struct SetlistSession {
     options: SessionOptions,
     current: usize,
     cued: Option<Staged>,
+    /// The item cued last, sent back; never set while one is cued.
+    withdrawn: Option<Withdrawn>,
     pending: Option<Pending>,
     /// An item at another rate waiting for the current one to stop before
     /// the device reopens.
@@ -421,6 +502,8 @@ pub struct SetlistSession {
     failed: Option<usize>,
     /// The item a crossfade under way fades out.
     blend_from: Option<usize>,
+    /// Its disk, still read while it fades out.
+    fading: Option<DiskMonitor>,
     finished_seen: u64,
     next_tag: u64,
     problem: Option<SetlistProblem>,
@@ -453,39 +536,26 @@ impl SetlistSession {
         let setlist = library.load_setlist(file)?;
         let songs = library.setlist_songs(&setlist)?;
         let errors = setlist.validate(&songs).err().unwrap_or_default();
-        let (items, plans): (Vec<ItemInfo>, Vec<Option<Plan>>) = setlist
+        let (mut items, mut plans): (Vec<ItemInfo>, Vec<Option<Plan>>) = setlist
             .items
             .iter()
             .enumerate()
             .map(|(index, item)| plan_item(library, &songs, &errors, index, item))
             .unzip();
-        let sample_rate = plans
-            .iter()
-            .find_map(|plan| match plan {
-                Some(Plan::Song { sample_rate, .. }) => Some(*sample_rate),
-                _ => None,
-            })
-            .unwrap_or(CLICK_ONLY_SAMPLE_RATE);
-        let Some(first) = plans.iter().position(Option::is_some) else {
+        let built = first_buildable(&mut plans, &mut items, |plan, rate| {
+            build(plan, rate, &options)
+        })?;
+        let Some((first, item, sample_rate)) = built else {
             return Err(SetlistOpenError::NothingPlayable {
                 name: setlist.name,
                 problems: items.into_iter().map(|item| item.problems).collect(),
             });
         };
+        predict_fallbacks(&plans, &mut items, sample_rate);
         let info = SetlistInfo {
             name: setlist.name,
             sample_rate,
             items,
-        };
-        let item = match build(plans[first].as_ref(), sample_rate, &options) {
-            Ok(item) => item,
-            Err(BuildError::Item(ItemError::Open(error))) => return Err(error.into()),
-            Err(error) => {
-                return Err(SetlistOpenError::FirstItem {
-                    item: first,
-                    error: error.to_string(),
-                });
-            }
         };
         Ok(PreparedSetlist {
             prepared: PreparedSong::new(item, 0, &options),
@@ -512,11 +582,18 @@ impl SetlistSession {
         self.session.devices()
     }
 
-    /// Watches the disk threads of the current item and the items prepared
-    /// ahead; for tests and diagnostics.
+    /// Watches the disk threads of the current item, the item a crossfade
+    /// fades out while it does, and the items prepared ahead; for tests and
+    /// diagnostics.
     pub fn disk_monitors(&self) -> Vec<DiskMonitor> {
         let mut monitors = vec![self.session.disk_monitor()];
+        monitors.extend(self.fading.clone());
         monitors.extend(self.cued.iter().map(|staged| staged.monitor.clone()));
+        monitors.extend(
+            self.withdrawn
+                .iter()
+                .map(|withdrawn| withdrawn.staged.monitor.clone()),
+        );
         monitors.extend(
             self.pending
                 .iter()
@@ -561,6 +638,7 @@ impl SetlistSession {
             SetlistCommand::Previous => self
                 .previous_playable(target)
                 .ok_or(SetlistCommandError::NoPrevious)?,
+            SetlistCommand::Move { from, to } => return self.move_item(from, to),
             SetlistCommand::Select(item) => {
                 if item >= self.plans.len() {
                     return Err(SetlistCommandError::OutOfRange {
@@ -586,7 +664,11 @@ impl SetlistSession {
     /// [`crate::Session::poll`] does for the current item.
     pub fn poll(&mut self) -> SetlistSnapshot {
         let (report, now) = self.session.begin_poll();
-        self.follow_deck(&report.deck, report.status().transport.is_running());
+        self.follow_deck(
+            &report.deck,
+            report.applied,
+            report.status().transport.is_running(),
+        );
         self.keep_next_ready();
         let song = self.session.end_poll(&report, now);
         let next = self.next_playable(self.current);
@@ -597,6 +679,14 @@ impl SetlistSession {
                 current: self.current,
                 next,
                 transition: self.transition(self.current),
+                fallback: next.and_then(|next| {
+                    rate_fallback(
+                        self.transition(self.current),
+                        self.session.sample_rate(),
+                        next,
+                        self.rate_of(next),
+                    )
+                }),
                 next_ready,
                 blend: report.deck.blend.map(|blend| BlendView {
                     from: self.blend_from.unwrap_or(self.current),
@@ -609,22 +699,33 @@ impl SetlistSession {
         }
     }
 
-    /// Follows what the deck did since the last poll: a handoff to the cued
-    /// item, an item that played to its end, a stop that a reopen waits
-    /// for.
-    fn follow_deck(&mut self, deck: &engine::live::DeckStatus, running: bool) {
+    /// Follows what the deck did since the last poll, with `applied`
+    /// messages taken: a handoff to the cued item, an item that played to
+    /// its end, a stop that a reopen waits for.
+    fn follow_deck(&mut self, deck: &DeckStatus, applied: u64, running: bool) {
         if self
             .cued
             .as_ref()
             .is_some_and(|staged| staged.tag == deck.item)
             && let Some(staged) = self.cued.take()
         {
-            self.blend_from = deck.blend.map(|_| self.current);
-            self.session.bind(staged.info, staged.monitor, staged.tag);
-            self.current = staged.index;
+            self.follow_hand_over(staged, deck);
+        }
+        // The deck handed over to the item sent back before it took that
+        // message: that item plays, and the setlist follows it. Once the
+        // deck took the message, nothing hands over to it any more.
+        if let Some(withdrawn) = self.withdrawn.take() {
+            if withdrawn.staged.tag == deck.item {
+                let item = withdrawn.staged.index;
+                self.follow_hand_over(withdrawn.staged, deck);
+                self.problem = Some(SetlistProblem::MovedLate { item });
+            } else if applied < withdrawn.sent {
+                self.withdrawn = Some(withdrawn);
+            }
         }
         if deck.blend.is_none() {
             self.blend_from = None;
+            self.fading = None;
         }
         if deck.finished > self.finished_seen {
             self.finished_seen = deck.finished;
@@ -638,11 +739,22 @@ impl SetlistSession {
             let tag = self.tag();
             if self.session.reopen_with(pending.item, tag).is_ok() {
                 self.current = index;
+                self.withdrawn = None;
                 if play {
                     let _ = self.session.send(Command::Play);
                 }
             }
         }
+    }
+
+    /// The deck plays `staged` now, at the end of the current item: the
+    /// setlist follows it, and a crossfade under way fades the current item
+    /// out.
+    fn follow_hand_over(&mut self, staged: Staged, deck: &DeckStatus) {
+        self.blend_from = deck.blend.map(|_| self.current);
+        self.fading = deck.blend.map(|_| self.session.disk_monitor());
+        self.session.bind(staged.info, staged.monitor, staged.tag);
+        self.current = staged.index;
     }
 
     /// The current item played to its end: its transition decides what
@@ -656,11 +768,13 @@ impl SetlistSession {
         let Some(next) = self.next_playable(self.current) else {
             return;
         };
-        let late = match self.transition(self.current) {
+        let transition = self.transition(self.current);
+        let late = match transition {
             Transition::Stay => return,
             Transition::CueNext => false,
             Transition::AutoLink | Transition::Crossfade => {
-                !self.halted && self.rate_of(next) == self.session.sample_rate()
+                let rate = self.session.sample_rate();
+                !self.halted && rate_fallback(transition, rate, next, self.rate_of(next)).is_none()
             }
         };
         match self.select(next, late) {
@@ -721,11 +835,69 @@ impl SetlistSession {
                 self.current = target;
             }
         }
+        // The deck plays the item selected, whatever it handed over to.
+        self.withdrawn = None;
         self.blend_from = None;
         if play {
             self.session.send(Command::Play)?;
         }
         Ok(())
+    }
+
+    /// Moves item `from` to `to` ([`SetlistCommand::Move`]): every index
+    /// follows its item, and the next item is cued again if it changed.
+    fn move_item(&mut self, from: usize, to: usize) -> Result<(), SetlistCommandError> {
+        let items = self.plans.len();
+        if let Some(item) = [from, to].into_iter().find(|&item| item >= items) {
+            return Err(SetlistCommandError::OutOfRange { item, items });
+        }
+        if from == to {
+            return Ok(());
+        }
+        if self.handing_over() {
+            return Err(SetlistCommandError::HandingOver);
+        }
+        let plan = self.plans.remove(from);
+        self.plans.insert(to, plan);
+        let item = self.info.items.remove(from);
+        self.info.items.insert(to, item);
+        predict_fallbacks(&self.plans, &mut self.info.items, self.info.sample_rate);
+        let indexes = [
+            Some(&mut self.current),
+            self.cued.as_mut().map(|staged| &mut staged.index),
+            self.withdrawn
+                .as_mut()
+                .map(|withdrawn| &mut withdrawn.staged.index),
+            self.pending.as_mut().map(|pending| &mut pending.index),
+            self.reopen.as_mut().map(|pending| &mut pending.index),
+            self.failed.as_mut(),
+            self.blend_from.as_mut(),
+            self.problem.as_mut().map(|problem| match problem {
+                SetlistProblem::Prepare { item, .. }
+                | SetlistProblem::MovedLate { item }
+                | SetlistProblem::LateLink { item }
+                | SetlistProblem::Transition { item, .. } => item,
+            }),
+        ];
+        for index in indexes.into_iter().flatten() {
+            *index = moved_index(*index, from, to);
+        }
+        self.keep_next_ready();
+        Ok(())
+    }
+
+    /// Whether an item is handing over to the next one: a crossfade runs,
+    /// or the deck plays an item cued (or just sent back) that the session
+    /// has not followed yet.
+    fn handing_over(&mut self) -> bool {
+        let deck = self.session.newest_deck();
+        let unfollowed = self
+            .cued
+            .as_ref()
+            .into_iter()
+            .chain(self.withdrawn.as_ref().map(|withdrawn| &withdrawn.staged))
+            .any(|staged| staged.tag == deck.item);
+        self.blend_from.is_some() || deck.blend.is_some() || unfollowed
     }
 
     /// Prepares the next playable item ahead and cues it once its start is
@@ -740,14 +912,17 @@ impl SetlistSession {
             self.failed = None;
         }
         // A refused uncue keeps the record, so the setlist still follows
-        // that item and cues no second one; the next poll tries again.
+        // that item and cues no second one; the next poll tries again. One
+        // the deck took is kept as withdrawn until a report shows the deck
+        // applied it, since the deck may hand over to the item first.
         if self
             .cued
             .as_ref()
             .is_some_and(|staged| Some(staged.index) != want)
             && self.session.uncue().is_ok()
         {
-            self.cued = None;
+            let sent = self.session.sent();
+            self.withdrawn = self.cued.take().map(|staged| Withdrawn { staged, sent });
         }
         if let Some(pending) = &self.pending
             && (Some(pending.index) != want
@@ -770,6 +945,10 @@ impl SetlistSession {
                     return;
                 }
             }
+        }
+        // Nothing is cued until the deck took the last item sent back.
+        if self.withdrawn.is_some() {
+            return;
         }
         let rate = self.session.sample_rate();
         let ready = self.pending.as_mut().is_some_and(|pending| {
@@ -875,6 +1054,121 @@ impl fmt::Debug for SetlistSession {
     }
 }
 
+/// The index of the item at `index` once item `from` moved to `to`.
+fn moved_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < to && index > from && index <= to {
+        index - 1
+    } else if to < from && index >= to && index < from {
+        index + 1
+    } else {
+        index
+    }
+}
+
+/// The rate the device opens at: the first playable song's, or
+/// [`CLICK_ONLY_SAMPLE_RATE`] when only click-only tiles can play.
+fn device_rate(plans: &[Option<Plan>]) -> u32 {
+    plans
+        .iter()
+        .find_map(|plan| match plan {
+            Some(Plan::Song { sample_rate, .. }) => Some(*sample_rate),
+            _ => None,
+        })
+        .unwrap_or(CLICK_ONLY_SAMPLE_RATE)
+}
+
+/// The first item that builds (`build` builds it at a device rate), the
+/// item built, and the rate the device opens at. One that passed the check
+/// but does not build for a reason of its own (its song does not stream,
+/// say) is reported like any item that cannot play, and the next one is
+/// tried. An open error every item would meet the same way (the buffer
+/// size, the disk thread) ends the search with that error, as one setlist
+/// problem rather than the same reason for every item. `None` when no item
+/// builds.
+fn first_buildable<T>(
+    plans: &mut [Option<Plan>],
+    items: &mut [ItemInfo],
+    mut build: impl FnMut(Option<&Plan>, u32) -> Result<T, BuildError>,
+) -> Result<Option<(usize, T, u32)>, OpenError> {
+    loop {
+        let sample_rate = device_rate(plans);
+        let Some(first) = plans.iter().position(Option::is_some) else {
+            return Ok(None);
+        };
+        match build(plans[first].as_ref(), sample_rate) {
+            Ok(item) => return Ok(Some((first, item, sample_rate))),
+            Err(BuildError::Item(ItemError::Open(error))) if is_session_wide(&error) => {
+                return Err(error);
+            }
+            Err(error) => {
+                items[first].problems.push(error.to_string());
+                plans[first] = None;
+            }
+        }
+    }
+}
+
+/// Whether `error`, from building one item, would stop every item the same
+/// way: it comes from the session's settings or the system, not the item.
+/// Output errors are not among them: building an item never opens the
+/// device, and the device opens at the first item's own rate, so a refusal
+/// there belongs to that item.
+fn is_session_wide(error: &OpenError) -> bool {
+    matches!(
+        error,
+        OpenError::BufferSize { .. }
+            | OpenError::Load(library::LoadError::DiskThread { .. })
+            | OpenError::Live(engine::live::LiveError::ZeroBufferSize)
+    )
+}
+
+/// How `transition`, from an item played while the device runs at
+/// `device_rate`, leads into item `next` at `next_rate`: an AutoLink or
+/// Crossfade into another rate plays as Cue next, since the device reopens
+/// between the two. The one rule the session plays by and reports.
+fn rate_fallback(
+    transition: Transition,
+    device_rate: u32,
+    next: usize,
+    next_rate: u32,
+) -> Option<RateFallback> {
+    let links = matches!(transition, Transition::AutoLink | Transition::Crossfade);
+    (links && next_rate != device_rate).then_some(RateFallback {
+        next,
+        next_rate,
+        device_rate,
+    })
+}
+
+/// Fills each playable item's [`ItemInfo::fallback`] for the setlist played
+/// in order from a device opened at `sample_rate`: a song runs the device
+/// at its own rate, a click-only tile at the rate the device runs at.
+fn predict_fallbacks(plans: &[Option<Plan>], items: &mut [ItemInfo], sample_rate: u32) {
+    let mut device = sample_rate;
+    let rates: Vec<Option<u32>> = plans
+        .iter()
+        .map(|plan| match plan {
+            Some(Plan::Song { sample_rate, .. }) => {
+                device = *sample_rate;
+                Some(device)
+            }
+            Some(Plan::Click(_)) => Some(device),
+            None => None,
+        })
+        .collect();
+    for (index, rate) in rates.iter().enumerate() {
+        let Some(rate) = *rate else {
+            continue;
+        };
+        let next = (index + 1..rates.len()).find_map(|next| rates[next].map(|r| (next, r)));
+        items[index].fallback = next.and_then(|(next, next_rate)| {
+            rate_fallback(items[index].item.transition(), rate, next, next_rate)
+        });
+    }
+}
+
 /// What `item` (at `index`) is, whether it can play, and how to build it.
 fn plan_item(
     library: &Library,
@@ -892,6 +1186,7 @@ fn plan_item(
                 item: item.clone(),
                 sample_rate: None,
                 problems,
+                fallback: None,
             };
             return (info, plan);
         }
@@ -920,6 +1215,7 @@ fn plan_item(
         item: item.clone(),
         sample_rate,
         problems,
+        fallback: None,
     };
     (info, plan)
 }
@@ -1000,5 +1296,195 @@ fn problem(index: usize, error: SetlistCommandError) -> SetlistProblem {
     match error {
         SetlistCommandError::Prepare { item, error } => SetlistProblem::Prepare { item, error },
         error => SetlistProblem::Transition { item: index, error },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use domain::TimeSignature;
+    use engine::live::LiveError;
+
+    use super::*;
+
+    fn click_plans(count: usize) -> (Vec<Option<Plan>>, Vec<ItemInfo>) {
+        let click = ClickItem::new(
+            120.0,
+            TimeSignature {
+                numerator: 4,
+                denominator: 4,
+            },
+        );
+        let plans = (0..count).map(|_| Some(Plan::Click(click))).collect();
+        let items = (0..count)
+            .map(|_| ItemInfo {
+                item: SetlistItem::Click(click),
+                sample_rate: None,
+                problems: Vec::new(),
+                fallback: None,
+            })
+            .collect();
+        (plans, items)
+    }
+
+    fn open_error(error: OpenError) -> BuildError {
+        BuildError::Item(ItemError::Open(error))
+    }
+
+    #[test]
+    fn an_item_that_does_not_build_for_its_own_reason_is_skipped_and_reported() {
+        let (mut plans, mut items) = click_plans(3);
+        let mut tries = 0;
+
+        let first = first_buildable(&mut plans, &mut items, |_, _| {
+            tries += 1;
+            match tries {
+                1 => Err(open_error(OpenError::RateTooLow {
+                    sample_rate: 1_000,
+                    ahead_frames: 1_000,
+                })),
+                _ => Ok(tries),
+            }
+        })
+        .unwrap();
+
+        let (index, built, _) = first.expect("item 2 builds");
+        assert_eq!((index, built), (1, 2));
+        assert_eq!(items[0].problems.len(), 1, "{:?}", items[0].problems);
+        assert!(items[0].problems[0].contains("too low to stream"));
+        assert!(plans[0].is_none());
+        assert!(items[1].problems.is_empty() && items[2].problems.is_empty());
+    }
+
+    #[test]
+    fn an_open_error_every_item_would_meet_ends_the_search_with_it() {
+        for error in [
+            OpenError::BufferSize { frames: 3 },
+            OpenError::Live(LiveError::ZeroBufferSize),
+            OpenError::Load(library::LoadError::DiskThread {
+                source: std::io::Error::other("no threads left"),
+            }),
+        ] {
+            let (mut plans, mut items) = click_plans(3);
+            let message = error.to_string();
+            let mut error = Some(error);
+            let mut tries = 0;
+
+            let result = first_buildable(&mut plans, &mut items, |_, _| {
+                tries += 1;
+                match error.take() {
+                    Some(error) => Err::<(), _>(open_error(error)),
+                    None => Ok(()),
+                }
+            });
+
+            assert_eq!(result.err().map(|e| e.to_string()), Some(message));
+            assert_eq!(tries, 1, "no other item is tried");
+            assert!(items.iter().all(|item| item.problems.is_empty()));
+        }
+    }
+
+    #[test]
+    fn an_output_error_from_the_first_item_is_its_own_problem_and_the_search_goes_on() {
+        let (mut plans, mut items) = click_plans(2);
+        let mut tries = 0;
+
+        let first = first_buildable(&mut plans, &mut items, |_, _| {
+            tries += 1;
+            match tries {
+                1 => Err(open_error(OpenError::Output(
+                    crate::output::OutputError::NoDevice,
+                ))),
+                _ => Ok(()),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(first.map(|(index, ..)| index), Some(1));
+        assert_eq!(
+            items[0].problems,
+            ["no audio output device is available"],
+            "recorded as item 1's problem"
+        );
+        assert!(plans[0].is_none());
+    }
+
+    /// The one-callback race no fake output can stage: the deck hands over
+    /// to a cue the session already sent back after a move, before it takes
+    /// that message. The cued record is moved to `withdrawn` by hand and no
+    /// uncue is sent, so the deck still hands over to it.
+    #[test]
+    fn a_hand_over_that_beats_the_cue_sent_back_is_followed_and_explained() {
+        use crate::testing::FakeOutput;
+        use domain::Setlist;
+
+        let dir = tempfile::tempdir().unwrap();
+        let library = Library::new(dir.path());
+        let click = |transition| {
+            SetlistItem::Click(ClickItem {
+                bars: Some(1),
+                transition,
+                ..ClickItem::new(
+                    120.0,
+                    TimeSignature {
+                        numerator: 4,
+                        denominator: 4,
+                    },
+                )
+            })
+        };
+        let mut setlist = Setlist::new("Sunday");
+        setlist.items = vec![
+            click(Transition::AutoLink),
+            click(Transition::CueNext),
+            click(Transition::CueNext),
+        ];
+        let file = library.save_setlist(&setlist).unwrap().file;
+        let fake = FakeOutput::new();
+        let options = SessionOptions {
+            buffer_frames: 256,
+            ..SessionOptions::default()
+        };
+        let mut session =
+            SetlistSession::open(&library, &file, Box::new(fake.clone()), options).unwrap();
+        for _ in 0..100 {
+            session.poll();
+            if session.cued.is_some() {
+                break;
+            }
+        }
+        let staged = session.cued.take().expect("item 2 is cued");
+        session.withdrawn = Some(Withdrawn {
+            staged,
+            sent: u64::MAX,
+        });
+
+        session.send(SetlistCommand::Item(Command::Play)).unwrap();
+        // One bar at 120 BPM is two seconds.
+        let bar = 2 * CLICK_ONLY_SAMPLE_RATE as usize;
+        let mut state = session.poll().setlist;
+        for _ in 0..(bar + 4_096) / 256 {
+            fake.render(256);
+            state = session.poll().setlist;
+        }
+
+        assert_eq!(state.current, 1, "the setlist follows the item that plays");
+        let problem = state.problem.expect("the setlist says why");
+        assert_eq!(problem, SetlistProblem::MovedLate { item: 1 });
+        assert_eq!(
+            problem.to_string(),
+            "item 2 played: the move came after its hand-over had started"
+        );
+        assert!(session.withdrawn.is_none());
+    }
+
+    #[test]
+    fn no_item_that_builds_is_none() {
+        let (mut plans, mut items) = click_plans(2);
+        let first = first_buildable(&mut plans, &mut items, |_, _| {
+            Err::<(), _>(BuildError::Click)
+        })
+        .unwrap();
+        assert!(first.is_none());
+        assert!(items.iter().all(|item| item.problems.len() == 1));
     }
 }

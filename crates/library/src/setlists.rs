@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use domain::{Setlist, SetlistEditError, SetlistFileError};
 use thiserror::Error;
 
+use crate::setlist_order::{apply_order, read_order, update_order, write_order};
 use crate::{OpenFileError, Temporary, open_regular_file, resolve_inside, same_file};
 
 /// Name of the folder, inside the library folder, that holds the setlists.
@@ -16,6 +17,14 @@ pub const SETLISTS_FOLDER: &str = "Setlists";
 
 /// Ending of every setlist file name.
 pub const SETLIST_EXTENSION: &str = ".setlist.json";
+
+/// Name of the file, inside the [`SETLISTS_FOLDER`], that holds the order
+/// of the setlist list (see [the setlist order](Library#the-setlist-order)).
+pub const SETLIST_ORDER_FILE: &str = "order.json";
+
+/// The only `formatVersion` of the [`SETLIST_ORDER_FILE`] this version
+/// reads and writes.
+pub const SETLIST_ORDER_FORMAT_VERSION: u32 = 1;
 
 /// Largest setlist file read, in bytes. A setlist of a few hundred items is
 /// well under 1 MiB; anything larger is refused before it is read.
@@ -63,6 +72,27 @@ const WINDOWS_RESERVED_NAMES: [&str; 30] = [
 /// default). Saving, renaming or duplicating never overwrites a file that
 /// holds another setlist: it returns [`SetlistError::FileTaken`].
 ///
+/// # The setlist order
+///
+/// The order of the setlist list (F5.1) is stored in the
+/// [`SETLIST_ORDER_FILE`] of the [`SETLISTS_FOLDER`], format v1: the setlist
+/// file names in order ([`Library::move_setlist`] writes it). Setlists it
+/// does not name follow in name order, and names of files that no longer
+/// exist are ignored. An order file that cannot be read or is not a valid
+/// order is reported in [`SetlistListing::order_error`] and the list falls
+/// back to name order; no setlist is hidden or lost because of it. While
+/// an order is stored, a new setlist goes at the end, a renamed one keeps
+/// its place, a duplicate goes right after its original, and a removed one
+/// leaves it ([`Library::remove_setlist`]); without one,
+/// nothing writes an order file but a move. No setlist file changes when
+/// the order does.
+///
+/// # Removing
+///
+/// [`Library::remove_setlist`] takes a setlist out of the list by moving
+/// its file to the system trash (through the `trash` crate), where it can
+/// be restored; no setlist file is ever deleted.
+///
 /// # Writing
 ///
 /// Every write goes to a temporary file in the [`SETLISTS_FOLDER`], which is
@@ -70,9 +100,50 @@ const WINDOWS_RESERVED_NAMES: [&str; 30] = [
 /// is always either complete or untouched. Between checking that a file name
 /// is free and the rename, another program could create that file; this
 /// library assumes one writer per library folder.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Library {
     root: PathBuf,
+    /// What moves a removed setlist's file to the trash.
+    trash: TrashFn,
+}
+
+/// Two libraries are the same when they are the same folder; the trash
+/// they use does not count.
+impl PartialEq for Library {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+    }
+}
+
+impl Eq for Library {}
+
+/// Moves the file at a path to the trash; [`Library::remove_setlist`] calls
+/// it. [`move_to_trash`] unless replaced with [`Library::with_trash`].
+pub type TrashFn = fn(&Path) -> io::Result<()>;
+
+/// Moves the file at `path` to the system trash (the `trash` crate: the
+/// Trash on macOS, the Recycle Bin on Windows, the freedesktop.org trash on
+/// Linux), where the person can restore it.
+///
+/// On macOS it asks `NSFileManager` directly. The crate's default there
+/// asks the Finder through AppleScript, which can bring up a permission
+/// prompt for automating the Finder while the calling thread (the screen's,
+/// in the desktop app) waits for it. `NSFileManager` needs no permission;
+/// what it gives up is the Finder's sound and its "Put Back" for the file,
+/// which the person can still restore by dragging it out of the Trash.
+/// Elsewhere the crate's default is used: a setlist file is a few KiB, so
+/// moving it is quick.
+pub fn move_to_trash(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let context = {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut context = trash::TrashContext::new();
+        context.set_delete_method(DeleteMethod::NsFileManager);
+        context
+    };
+    #[cfg(not(target_os = "macos"))]
+    let context = trash::TrashContext::new();
+    context.delete(path).map_err(io::Error::other)
 }
 
 /// A setlist file that [`Library::list_setlists`] could read.
@@ -99,12 +170,21 @@ pub struct UnreadableSetlist {
 /// What [`Library::list_setlists`] found.
 #[derive(Debug, Default)]
 pub struct SetlistListing {
-    /// Readable setlists, sorted by name ignoring case, then by name, then by
+    /// Readable setlists in the stored order (see
+    /// [the setlist order](Library#the-setlist-order)); those it does not
+    /// name follow, sorted by name ignoring case, then by name, then by
     /// file.
     pub setlists: Vec<SetlistEntry>,
     /// Setlist files that cannot be read, sorted by file name; one broken
     /// file hides no other setlist.
     pub unreadable: Vec<UnreadableSetlist>,
+    /// Why the [`SETLIST_ORDER_FILE`] could not be used, when it is there
+    /// but cannot be read or is not a valid order: the setlists are then
+    /// listed by name.
+    pub order_error: Option<SetlistError>,
+    /// Entries of the [`SETLISTS_FOLDER`] that could not be read at all, so
+    /// not even their names are known; every other setlist is listed.
+    pub entry_errors: Vec<SetlistError>,
 }
 
 /// Why a setlist could not be listed, read or written. Nothing on disk is
@@ -190,12 +270,95 @@ pub enum SetlistError {
     /// the original's name).
     #[error(transparent)]
     Edit(#[from] SetlistEditError),
+    /// The [`SETLIST_ORDER_FILE`] is not a valid order: malformed JSON, or
+    /// not the v1 shape.
+    #[error("{} is not a valid setlist order: {reason}", path.display())]
+    OrderFormat {
+        /// The order file.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: String,
+    },
+    /// The [`SETLIST_ORDER_FILE`] declares a `formatVersion` this version
+    /// cannot read; it is never written over.
+    #[error(
+        "{}: unsupported formatVersion {found}; this version reads formatVersion {SETLIST_ORDER_FORMAT_VERSION}",
+        path.display()
+    )]
+    OrderVersion {
+        /// The order file.
+        path: PathBuf,
+        /// The version in the file.
+        found: u32,
+    },
+    /// The setlist was written, but its place in the stored order could
+    /// not be: until it is moved, it is listed after the setlists the order
+    /// names. Only its place is missing; the save itself succeeded.
+    #[error(
+        "setlist \"{}\" was saved as {}, but its place in the list could not be stored: {reason}",
+        saved.name,
+        saved.file
+    )]
+    OrderNotUpdated {
+        /// The setlist as saved.
+        saved: SetlistEntry,
+        /// Why its place could not be stored.
+        reason: String,
+    },
+    /// No setlist file of the [`SETLISTS_FOLDER`] is listed with exactly
+    /// this name; names are compared as the folder lists them, case
+    /// included, also where the disk ignores case.
+    #[error(
+        "no setlist file is listed as \"{file}\" in the {SETLISTS_FOLDER} folder (names are compared exactly, case included)"
+    )]
+    NotListed {
+        /// The name asked for.
+        file: String,
+    },
+    /// The trash refused the setlist file, which stays where it was.
+    #[error("cannot move {} to the trash: {source}", path.display())]
+    Trash {
+        /// The setlist file.
+        path: PathBuf,
+        /// Why the trash refused it.
+        source: io::Error,
+    },
+    /// The setlist file was moved to the trash, but the stored order could
+    /// not be updated: the name it keeps names no file, so it is ignored.
+    #[error(
+        "setlist \"{}\" was moved to the trash, but the order of the list could not be updated: {reason}",
+        removed.name
+    )]
+    RemovedOrderNotUpdated {
+        /// The setlist removed.
+        removed: SetlistEntry,
+        /// Why the order could not be updated.
+        reason: String,
+    },
+    /// A setlist was asked to move past the end of the list.
+    #[error("cannot move a setlist to place {}: the library lists {len} setlists", .to.saturating_add(1))]
+    MoveOutOfRange {
+        /// The place asked for, counted from 0.
+        to: usize,
+        /// How many setlists the library lists.
+        len: usize,
+    },
 }
 
 impl Library {
-    /// The library at the folder `root`.
+    /// The library at the folder `root`, removing setlists to the system
+    /// trash ([`move_to_trash`]).
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            trash: move_to_trash,
+        }
+    }
+
+    /// The same library, moving removed setlists with `trash` instead of to
+    /// the system trash: tests use it so they never fill a real trash.
+    pub fn with_trash(self, trash: TrashFn) -> Self {
+        Self { trash, ..self }
     }
 
     /// The library folder, as given to [`Library::new`].
@@ -213,18 +376,16 @@ impl Library {
         let Some(folder) = self.setlists_folder()? else {
             return Ok(SetlistListing::default());
         };
-        let folder_error = |source| SetlistError::Folder {
-            path: folder.clone(),
-            source,
-        };
         let mut listing = SetlistListing::default();
-        for found in fs::read_dir(&folder).map_err(folder_error)? {
-            let Ok(file) = found.map_err(folder_error)?.file_name().into_string() else {
-                continue;
-            };
-            if !is_setlist_file_name(&file) {
-                continue;
-            }
+        let (files, errors) = read_setlist_names(&folder)?;
+        listing.entry_errors = errors
+            .into_iter()
+            .map(|source| SetlistError::Folder {
+                path: folder.clone(),
+                source,
+            })
+            .collect();
+        for file in files {
             match read_setlist(&folder, &file) {
                 Ok(setlist) => listing.setlists.push(SetlistEntry {
                     name: setlist.name,
@@ -235,7 +396,125 @@ impl Library {
         }
         listing.setlists.sort_by(by_name);
         listing.unreadable.sort_by(|a, b| a.file.cmp(&b.file));
+        match read_order(&folder) {
+            Ok(Some(order)) => {
+                listing.setlists = apply_order(std::mem::take(&mut listing.setlists), &order);
+            }
+            Ok(None) => {}
+            Err(error) => listing.order_error = Some(error),
+        }
         Ok(listing)
+    }
+
+    /// Moves the setlist in `file` to place `to` (counted from 0) of the
+    /// list [`Library::list_setlists`] returns, and stores the whole order
+    /// in the [`SETLIST_ORDER_FILE`] (F5.1). No setlist file changes.
+    ///
+    /// The setlist must be readable. An order file that cannot be used is
+    /// replaced, except one with a newer `formatVersion`, which is refused
+    /// with [`SetlistError::OrderVersion`] and left as it is. Setlists that
+    /// cannot be read but are named in the stored order stay in it, after
+    /// the others.
+    pub fn move_setlist(&self, file: &str, to: usize) -> Result<(), SetlistError> {
+        check_file_name(file)?;
+        let folder = self.existing_setlists_folder(file)?;
+        read_setlist(&folder, file)?;
+        let mut listing = self.list_setlists()?;
+        if let Some(error @ SetlistError::OrderVersion { .. }) = listing.order_error.take() {
+            return Err(error);
+        }
+        let mut files: Vec<String> = listing.setlists.into_iter().map(|e| e.file).collect();
+        let from = files
+            .iter()
+            .position(|listed| listed == file)
+            .ok_or_else(|| SetlistError::Read {
+                path: folder.join(file),
+                source: io::Error::from(io::ErrorKind::NotFound),
+            })?;
+        if to >= files.len() {
+            return Err(SetlistError::MoveOutOfRange {
+                to,
+                len: files.len(),
+            });
+        }
+        let moved = files.remove(from);
+        files.insert(to, moved);
+        if let Ok(Some(stored)) = read_order(&folder) {
+            for name in stored {
+                let unreadable = listing.unreadable.iter().any(|u| u.file == name);
+                if unreadable && !files.contains(&name) {
+                    files.push(name);
+                }
+            }
+        }
+        write_order(&folder, &files)
+    }
+
+    /// Removes the setlist in `file` from the library's list (F5.1, L33) by
+    /// moving its file to the system trash, where it can be restored; it is
+    /// never deleted. `file` must be a setlist file name as for
+    /// [`Library::load_setlist`], spelled exactly as the folder lists it
+    /// ([`SetlistError::NotListed`] otherwise, also where the disk ignores
+    /// case), and the file must resolve inside the [`SETLISTS_FOLDER`],
+    /// links included, and be a regular file; otherwise nothing moves. It
+    /// need not read as a setlist: a broken file, listed as unreadable, can
+    /// be removed too, and is then named by its file. A stored order loses its entry and keeps the
+    /// rest. When the file is in the trash but the order cannot be written,
+    /// [`SetlistError::RemovedOrderNotUpdated`] says so; the name left in
+    /// the order names no file, so it is ignored.
+    pub fn remove_setlist(&self, file: &str) -> Result<SetlistEntry, SetlistError> {
+        check_file_name(file)?;
+        let folder = self.existing_setlists_folder(file)?;
+        // Exactly as listed: on a disk that ignores case another spelling
+        // would reach the same file under a name the order does not hold.
+        if !listed_file_names(&folder)?.iter().any(|name| name == file) {
+            return Err(SetlistError::NotListed {
+                file: file.to_owned(),
+            });
+        }
+        check_regular_inside(&folder, file)?;
+        // A file that does not read as a setlist is removed all the same,
+        // named by its file.
+        let name = read_setlist(&folder, file).map_or_else(|_| file.to_owned(), |s| s.name);
+        let path = folder.join(file);
+        (self.trash)(&path).map_err(|source| SetlistError::Trash { path, source })?;
+        let removed = SetlistEntry {
+            name,
+            file: file.to_owned(),
+        };
+        match update_order(&folder, |order| order.retain(|listed| listed != file)) {
+            Ok(()) => Ok(removed),
+            Err(error) => Err(SetlistError::RemovedOrderNotUpdated {
+                removed,
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    /// The name the [`SETLISTS_FOLDER`] lists for the setlist file `file`:
+    /// `file` itself when it is listed so, else the listed name of the
+    /// same file spelled otherwise (another case, or another Unicode
+    /// normalization, on a file system that ignores them), or `None` when
+    /// no listed setlist file is that file.
+    pub fn listed_setlist_file(&self, file: &str) -> Result<Option<String>, SetlistError> {
+        check_file_name(file)?;
+        let Some(folder) = self.setlists_folder()? else {
+            return Ok(None);
+        };
+        let listed = listed_file_names(&folder)?;
+        if listed.iter().any(|name| name == file) {
+            return Ok(Some(file.to_owned()));
+        }
+        let path = folder.join(file);
+        if !entry_exists(&path)? {
+            return Ok(None);
+        }
+        for name in listed {
+            if same_entry(file, &path, &name, &folder.join(&name))? {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
     }
 
     /// Reads the setlist file `file`, a file name inside the
@@ -257,6 +536,9 @@ impl Library {
     /// The file is replaced only when it holds a setlist with the same name;
     /// one holding another setlist is left as it was and
     /// [`SetlistError::FileTaken`] is returned. A blank name is refused.
+    /// A new setlist goes at the end of a stored order; when that place
+    /// cannot be written, the setlist is saved all the same and
+    /// [`SetlistError::OrderNotUpdated`] says so.
     pub fn save_setlist(&self, setlist: &Setlist) -> Result<SetlistEntry, SetlistError> {
         if setlist.name.trim().is_empty() {
             return Err(SetlistEditError::EmptyName.into());
@@ -268,23 +550,34 @@ impl Library {
         })?;
         let folder = self.create_setlists_folder()?;
         let path = folder.join(&file);
-        if entry_exists(&path)? {
+        let created = !entry_exists(&path)?;
+        if !created {
             let existing = read_setlist(&folder, &file)?;
             if existing.name != setlist.name {
                 return Err(file_taken(&setlist.name, file));
             }
         }
         write_atomically(&path, &json)?;
-        Ok(SetlistEntry {
+        let saved = SetlistEntry {
             name: setlist.name.clone(),
             file,
-        })
+        };
+        if created {
+            let placed = update_order(&folder, |order| {
+                order.retain(|listed| *listed != saved.file);
+                order.push(saved.file.clone());
+            });
+            return placed_or_saved(placed, saved);
+        }
+        Ok(saved)
     }
 
     /// Renames the setlist in `file` to `name` (F5.1), moving it to the file
     /// the new name maps to. A file already holding another setlist is never
     /// overwritten. Changing only the case of the name also works on a file
-    /// system that ignores case.
+    /// system that ignores case. It keeps its place in a stored order; when
+    /// that cannot be written, [`SetlistError::OrderNotUpdated`] says the
+    /// rename was made all the same.
     pub fn rename_setlist(&self, file: &str, name: &str) -> Result<SetlistEntry, SetlistError> {
         check_file_name(file)?;
         let folder = self.existing_setlists_folder(file)?;
@@ -316,7 +609,7 @@ impl Library {
                 path: target_path,
                 source,
             })?;
-            return Ok(renamed);
+            return placed_or_saved(keep_place(&folder, file, &target), renamed);
         }
         // Move first, then rewrite: an interruption in between leaves the
         // setlist under its new file name with its old name, never two
@@ -329,12 +622,14 @@ impl Library {
             let _ = fs::rename(&target_path, &source_path);
             return Err(error);
         }
-        Ok(renamed)
+        placed_or_saved(keep_place(&folder, file, &target), renamed)
     }
 
     /// Copies the setlist in `file` to a new setlist named `name` (F5.1), in
     /// the file that name maps to; an existing file there is never
-    /// overwritten.
+    /// overwritten. The copy goes right after the original in a stored
+    /// order; when that cannot be written, [`SetlistError::OrderNotUpdated`]
+    /// says the copy was made all the same.
     pub fn duplicate_setlist(&self, file: &str, name: &str) -> Result<SetlistEntry, SetlistError> {
         check_file_name(file)?;
         let folder = self.existing_setlists_folder(file)?;
@@ -349,10 +644,19 @@ impl Library {
             return Err(file_taken(name, target));
         }
         write_atomically(&target_path, &json)?;
-        Ok(SetlistEntry {
-            name: copy.name,
-            file: target,
-        })
+        let placed = update_order(&folder, |order| {
+            order.retain(|listed| *listed != target);
+            if let Some(original) = order.iter().position(|listed| listed == file) {
+                order.insert(original + 1, target.clone());
+            }
+        });
+        placed_or_saved(
+            placed,
+            SetlistEntry {
+                name: copy.name,
+                file: target,
+            },
+        )
     }
 
     /// The canonical library folder.
@@ -445,9 +749,90 @@ fn check_file_name(file: &str) -> Result<(), SetlistError> {
     }
 }
 
+/// Entry errors after which [`setlist_file_names`] stops reading a folder,
+/// so a folder whose reads keep failing cannot keep a listing going.
+const MAX_ENTRY_ERRORS: usize = 100;
+
+/// The setlist file names among `entries`, the names a folder lists, and
+/// why the entries that could not be read could not: those are skipped,
+/// so one bad entry hides no setlist (after [`MAX_ENTRY_ERRORS`] the rest
+/// of the folder is left).
+fn setlist_file_names(
+    entries: impl Iterator<Item = io::Result<std::ffi::OsString>>,
+) -> (Vec<String>, Vec<io::Error>) {
+    let mut names = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(name) => {
+                if let Ok(name) = name.into_string()
+                    && is_setlist_file_name(&name)
+                {
+                    names.push(name);
+                }
+            }
+            Err(error) => {
+                errors.push(error);
+                if errors.len() == MAX_ENTRY_ERRORS {
+                    break;
+                }
+            }
+        }
+    }
+    (names, errors)
+}
+
+/// The names `folder` (canonical) lists, the setlist files among them and
+/// why the entries that could not be read could not ([`setlist_file_names`]);
+/// only a folder that cannot be opened is an error.
+fn read_setlist_names(folder: &Path) -> Result<(Vec<String>, Vec<io::Error>), SetlistError> {
+    let entries = fs::read_dir(folder).map_err(|source| SetlistError::Folder {
+        path: folder.to_owned(),
+        source,
+    })?;
+    Ok(setlist_file_names(
+        entries.map(|found| found.map(|entry| entry.file_name())),
+    ))
+}
+
+/// The setlist file names the folder `folder` (canonical) lists, as
+/// [`Library::list_setlists`] takes them: valid setlist file names in UTF-8.
+fn listed_file_names(folder: &Path) -> Result<Vec<String>, SetlistError> {
+    Ok(read_setlist_names(folder)?.0)
+}
+
+/// Checks that `file` (already checked by [`check_file_name`]) resolves
+/// inside `folder` (canonical), links included, and is a regular file,
+/// without opening it, so a FIFO cannot block.
+fn check_regular_inside(folder: &Path, file: &str) -> Result<(), SetlistError> {
+    let path = folder.join(file);
+    let resolved = match resolve_inside(folder, file) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return Err(SetlistError::OutsideLibrary { path }),
+        Err(source) => return Err(SetlistError::Read { path, source }),
+    };
+    match fs::metadata(&resolved) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(SetlistError::NotAFile { path }),
+        Err(source) => Err(SetlistError::Read { path, source }),
+    }
+}
+
 /// Reads and parses the setlist file `file` (already checked by
 /// [`check_file_name`]) inside `folder` (canonical).
 fn read_setlist(folder: &Path, file: &str) -> Result<Setlist, SetlistError> {
+    let json = read_folder_file(folder, file)?;
+    Setlist::from_json(&json).map_err(|source| SetlistError::Format {
+        path: folder.join(file),
+        source,
+    })
+}
+
+/// Reads the file `file` inside `folder` (canonical) as text: it must
+/// resolve inside `folder`, symlinks included, be a regular file (a FIFO is
+/// refused without being opened) and hold at most
+/// [`MAX_SETLIST_FILE_BYTES`].
+pub(crate) fn read_folder_file(folder: &Path, file: &str) -> Result<String, SetlistError> {
     let path = folder.join(file);
     let resolved = match resolve_inside(folder, file) {
         Ok(Some(resolved)) => resolved,
@@ -472,13 +857,41 @@ fn read_setlist(folder: &Path, file: &str) -> Result<Setlist, SetlistError> {
     if metadata.len() > MAX_SETLIST_FILE_BYTES {
         return Err(too_large());
     }
-    let json = read_at_most(opened, MAX_SETLIST_FILE_BYTES)
+    read_at_most(opened, MAX_SETLIST_FILE_BYTES)
         .map_err(|source| SetlistError::Read {
             path: path.clone(),
             source,
         })?
-        .ok_or_else(too_large)?;
-    Setlist::from_json(&json).map_err(|source| SetlistError::Format { path, source })
+        .ok_or_else(too_large)
+}
+
+/// `saved`, or [`SetlistError::OrderNotUpdated`] when `placed` says its
+/// place in the stored order could not be written.
+fn placed_or_saved(
+    placed: Result<(), SetlistError>,
+    saved: SetlistEntry,
+) -> Result<SetlistEntry, SetlistError> {
+    match placed {
+        Ok(()) => Ok(saved),
+        Err(error) => Err(SetlistError::OrderNotUpdated {
+            saved,
+            reason: error.to_string(),
+        }),
+    }
+}
+
+/// After the setlist in `file` was renamed to `target`, puts `target` in
+/// its place in the stored order.
+fn keep_place(folder: &Path, file: &str, target: &str) -> Result<(), SetlistError> {
+    update_order(folder, |order| {
+        if !order.iter().any(|listed| listed == file) {
+            return;
+        }
+        order.retain(|listed| listed != target);
+        if let Some(place) = order.iter().position(|listed| listed == file) {
+            order[place] = target.to_owned();
+        }
+    })
 }
 
 /// Reads all of `file` as UTF-8, or `None` when it holds more than
@@ -537,7 +950,7 @@ fn file_taken(name: &str, file: String) -> SetlistError {
 /// Writes `contents` to a temporary file beside `path`, flushes it to disk,
 /// and renames it over `path`; on failure the temporary file is removed and
 /// an existing file at `path` is left as it was.
-fn write_atomically(path: &Path, contents: &str) -> Result<(), SetlistError> {
+pub(crate) fn write_atomically(path: &Path, contents: &str) -> Result<(), SetlistError> {
     let write = || -> io::Result<()> {
         let (temporary, mut file) = Temporary::create_beside(path)?;
         file.write_all(contents.as_bytes())?;
@@ -598,4 +1011,35 @@ fn is_windows_reserved(stem: &str) -> bool {
     WINDOWS_RESERVED_NAMES
         .iter()
         .any(|reserved| base.eq_ignore_ascii_case(reserved))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_entry_that_cannot_be_read_hides_no_setlist() {
+        let entries = [
+            Ok("A.setlist.json".into()),
+            Err(io::Error::other("the disk said no")),
+            Ok("B.setlist.json".into()),
+            Ok("notes.txt".into()),
+            Ok(".hidden.setlist.json".into()),
+            Ok(SETLIST_ORDER_FILE.into()),
+        ];
+
+        let (names, errors) = setlist_file_names(entries.into_iter());
+
+        assert_eq!(names, ["A.setlist.json", "B.setlist.json"]);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].to_string(), "the disk said no");
+    }
+
+    #[test]
+    fn a_folder_whose_entries_keep_failing_is_left() {
+        let (names, errors) =
+            setlist_file_names(std::iter::repeat_with(|| Err(io::Error::other("again"))));
+        assert!(names.is_empty());
+        assert_eq!(errors.len(), MAX_ENTRY_ERRORS);
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "play-cli"
-description = "Headless live player for development and hardware spikes: plays a song package on an audio device with single-key controls."
+description = "Headless live player for development and hardware spikes: plays a song package or a setlist on an audio device with single-key controls."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,9 +11,10 @@ license.workspace = true
 app.workspace = true
 clap.workspace = true
 crossterm.workspace = true
+domain.workspace = true
 io-cpal.workspace = true
+library.workspace = true
 
 [dev-dependencies]
-domain.workspace = true
 hound.workspace = true
 tempfile.workspace = true

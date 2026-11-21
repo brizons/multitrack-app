@@ -1,6 +1,6 @@
 //! What a shell shows about the open song.
 
-use domain::{BeatGrid, SectionType, Song};
+use domain::{BeatGrid, Song};
 
 /// One position of the arrangement being played: a section in play order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +47,7 @@ impl SongInfo {
             .filter_map(|id| song.section(id))
             .map(|section| PositionInfo {
                 section_id: section.id.clone(),
-                label: section_label(section.section_type, section.number),
+                label: section.section_type.label(section.number),
                 start_frame: section.start,
                 length_frames: section.length(),
                 start_bar: grid.bar_and_beat(section.start).bar,
@@ -69,30 +69,5 @@ impl SongInfo {
         self.positions
             .get(position)
             .map_or("", |position| position.label.as_str())
-    }
-}
-
-/// "Verse 2", "Pre-chorus", "Count-off".
-fn section_label(section_type: SectionType, number: Option<u32>) -> String {
-    let name = match section_type {
-        SectionType::CountOff => "Count-off",
-        SectionType::Intro => "Intro",
-        SectionType::Verse => "Verse",
-        SectionType::PreChorus => "Pre-chorus",
-        SectionType::Chorus => "Chorus",
-        SectionType::PostChorus => "Post-chorus",
-        SectionType::Bridge => "Bridge",
-        SectionType::Instrumental => "Instrumental",
-        SectionType::Interlude => "Interlude",
-        SectionType::Tag => "Tag",
-        SectionType::Vamp => "Vamp",
-        SectionType::Turnaround => "Turnaround",
-        SectionType::Breakdown => "Breakdown",
-        SectionType::Outro => "Outro",
-        SectionType::Ending => "Ending",
-    };
-    match number {
-        Some(number) => format!("{name} {number}"),
-        None => name.to_owned(),
     }
 }

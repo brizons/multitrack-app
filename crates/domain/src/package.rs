@@ -136,6 +136,38 @@ pub enum SectionType {
     Ending,
 }
 
+impl SectionType {
+    /// The type as players and lists show it: "Count-off", "Pre-chorus".
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::CountOff => "Count-off",
+            Self::Intro => "Intro",
+            Self::Verse => "Verse",
+            Self::PreChorus => "Pre-chorus",
+            Self::Chorus => "Chorus",
+            Self::PostChorus => "Post-chorus",
+            Self::Bridge => "Bridge",
+            Self::Instrumental => "Instrumental",
+            Self::Interlude => "Interlude",
+            Self::Tag => "Tag",
+            Self::Vamp => "Vamp",
+            Self::Turnaround => "Turnaround",
+            Self::Breakdown => "Breakdown",
+            Self::Outro => "Outro",
+            Self::Ending => "Ending",
+        }
+    }
+
+    /// A section of this type with `number` as players and lists show it:
+    /// "Verse 2", or "Pre-chorus" without a number.
+    pub fn label(self, number: Option<u32>) -> String {
+        match number {
+            Some(number) => format!("{} {number}", self.name()),
+            None => self.name().to_owned(),
+        }
+    }
+}
+
 /// A named order of sections.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

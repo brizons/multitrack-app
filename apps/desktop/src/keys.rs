@@ -2,6 +2,7 @@
 //! driven without a mouse.
 
 use crate::action::UiAction;
+use crate::line_edit::LineKey;
 
 /// The panic key: held for [`crate::hold::PANIC_HOLD`], it fires panic; its
 /// release ends the hold. Letters work in either case.
@@ -86,12 +87,49 @@ pub fn key_down(press: &KeyPress<'_>) -> Option<KeyAction> {
         "i" => ui(UiAction::ToggleInfinite),
         "f" => ui(UiAction::ToggleFade),
         "c" | "escape" => ui(UiAction::CancelJump),
+        "." => ui(UiAction::NextSong),
+        "," => ui(UiAction::PreviousSong),
         PANIC_KEY => Some(KeyAction::PanicDown),
         digit => match digit.as_bytes() {
             &[byte @ b'1'..=b'9'] => ui(UiAction::QueueSection(usize::from(byte - b'1'))),
             _ => None,
         },
     }
+}
+
+/// What a key does while a text field has the focus ([`typed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Typed<'a> {
+    /// It goes to the field.
+    Line(LineKey<'a>),
+    /// The secondary modifier with V: paste into the field.
+    Paste,
+    /// A shortcut with the secondary modifier, such as Quit.
+    Key(KeyAction),
+    /// Nothing.
+    Ignored,
+}
+
+/// What `press`, typing `key_char`, does while a text field has the focus:
+/// every key types into the field (Space, `x` and digits too, so typing
+/// never plays, panics or queues), except the secondary modifier's
+/// shortcuts: paste, open and quit.
+pub fn typed<'a>(press: &KeyPress<'_>, key_char: Option<&'a str>) -> Typed<'a> {
+    let secondary = if SECONDARY_IS_PLATFORM {
+        press.mods.platform
+    } else {
+        press.mods.control
+    };
+    if secondary {
+        if press.key.eq_ignore_ascii_case("v") {
+            return Typed::Paste;
+        }
+        return match key_down(press) {
+            Some(action @ (KeyAction::Quit | KeyAction::OpenSong)) => Typed::Key(action),
+            _ => Typed::Ignored,
+        };
+    }
+    LineKey::from_key(&press.key.to_ascii_lowercase(), key_char).map_or(Typed::Ignored, Typed::Line)
 }
 
 /// Whether `key` is the panic key, whose release ends a hold.

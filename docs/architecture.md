@@ -147,6 +147,7 @@ Render transposed and time-stretched stems **offline**, into a cache keyed by ke
 | `rtrb` (ring buffer) | 0.4.1 | MIT or Apache-2.0 | Yes |
 | `triple_buffer` | 9.0.1 | MPL-2.0 | Yes |
 | `crossterm` (`play-cli` key input only) | 0.29.0 | MIT | Yes |
+| `trash` (removed setlists go to the system trash) | 5.4.0 | MIT (permissive) | Yes |
 | ASIO SDK (Windows) | — | GPLv3 or proprietary | Opt-in feature only |
 | Ableton Link (`rusty_link`) | 0.4.9 | GPL-2.0-or-later | Opt-in feature only, if ever |
 

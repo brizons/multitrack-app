@@ -7,10 +7,14 @@
 //! [`write_wav_stereo_f32`] writes a rendered mix. A [`Library`] keeps the
 //! setlists of a library folder as `*.setlist.json` files in its
 //! [`SETLISTS_FOLDER`]: it lists, loads, saves, renames and duplicates them,
-//! never leaving a half-written file or overwriting another setlist.
+//! never leaving a half-written file or overwriting another setlist, and
+//! keeps the order of the list in its [`SETLIST_ORDER_FILE`]
+//! ([`Library::move_setlist`]); a setlist removed from the list
+//! ([`Library::remove_setlist`]) goes to the system trash, never deleted.
 //! [`Library::setlist_songs`] reads the songs a setlist names, so
 //! [`domain::Setlist::validate`] can report the ones the library lacks while
-//! the rest of the setlist stays usable.
+//! the rest of the setlist stays usable. [`Library::list_songs`] lists every
+//! song folder in the library, from the manifest and stem headers only.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -31,15 +35,19 @@ use engine::StemAudio;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use thiserror::Error;
 
+mod setlist_order;
 mod setlist_songs;
 mod setlists;
+mod songs;
 mod stream;
 
 pub use setlist_songs::{SetlistSongs, SongUnavailable};
 pub use setlists::{
-    Library, MAX_SETLIST_FILE_BYTES, SETLIST_EXTENSION, SETLISTS_FOLDER, SetlistEntry,
-    SetlistError, SetlistListing, UnreadableSetlist,
+    Library, MAX_SETLIST_FILE_BYTES, SETLIST_EXTENSION, SETLIST_ORDER_FILE,
+    SETLIST_ORDER_FORMAT_VERSION, SETLISTS_FOLDER, SetlistEntry, SetlistError, SetlistListing,
+    TrashFn, UnreadableSetlist, move_to_trash,
 };
+pub use songs::{ArrangementEntry, PositionEntry, SongEntry, SongListing, UnreadableSong};
 pub use stream::{DiskMonitor, Gate, StreamCapacity, StreamConfig, StreamingSong, open_streaming};
 
 /// Name of the manifest inside a song folder.
@@ -70,6 +78,19 @@ pub enum LoadError {
     /// `song.json` is not a valid v1 manifest.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    /// `song.json` is a folder, FIFO, device or anything but a regular
+    /// file; it was not opened, so a FIFO cannot block the reader.
+    #[error("{} is not a regular file", path.display())]
+    ManifestNotAFile {
+        /// Path of the manifest.
+        path: PathBuf,
+    },
+    /// `song.json` was replaced by another file while it was being opened.
+    #[error("{} changed while it was being opened", path.display())]
+    ManifestChanged {
+        /// Path of the manifest.
+        path: PathBuf,
+    },
     /// The song folder could not be resolved.
     #[error("cannot open song folder {}: {source}", path.display())]
     SongFolder {
@@ -212,7 +233,15 @@ fn open_package(dir: &Path) -> Result<(Validated, Vec<(Stem, OpenedStem)>), Load
         path: manifest_path,
         source,
     })?;
-    let package = SongPackage::from_json(&json)?;
+    open_package_json(dir, &json)
+}
+
+/// [`open_package`] for the manifest text `json` already read from `dir`.
+fn open_package_json(
+    dir: &Path,
+    json: &str,
+) -> Result<(Validated, Vec<(Stem, OpenedStem)>), LoadError> {
+    let package = SongPackage::from_json(json)?;
     let folder = fs::canonicalize(dir).map_err(|source| LoadError::SongFolder {
         path: dir.to_owned(),
         source,

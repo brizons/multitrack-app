@@ -87,7 +87,7 @@ pub use session::{
     TransportState,
 };
 pub use setlist::{
-    BlendView, CLICK_ONLY_SAMPLE_RATE, ItemInfo, PreparedSetlist, SetlistCommand,
+    BlendView, CLICK_ONLY_SAMPLE_RATE, ItemInfo, PreparedSetlist, RateFallback, SetlistCommand,
     SetlistCommandError, SetlistInfo, SetlistOpenError, SetlistProblem, SetlistSession,
     SetlistSnapshot, SetlistState,
 };
