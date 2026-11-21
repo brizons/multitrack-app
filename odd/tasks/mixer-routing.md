@@ -1,7 +1,7 @@
 # Feature: mixer, buses and output routing
 
 Objective: mix stems through buses with per-stem, per-bus and master levels, and route each bus to the interface's outputs, saved per arrangement and per device, in the engine, the `app` API and the desktop app.
-Branch: `feat/mixer-routing` (from `setlists/apps` at a3b3e12 while PR #14 waits for CI; PRs stack on #14 until it merges) · Delivery: work-unit commits, stacked PRs to `main` · Test runner: `cargo test --workspace` with Rust 1.93.0 (`rust-toolchain.toml`).
+Branch: `feat/mixer-routing` (from `setlists/apps` at a3b3e12, now in `main` through PR #14) · Delivery: work-unit commits, stacked PRs to `main` · Test runner: `cargo test --workspace` with Rust 1.93.0 (`rust-toolchain.toml`).
 
 ## Specs
 
@@ -29,7 +29,7 @@ Requirements quote `docs/mvp-spec.md` verbatim. Items marked **Assumption** are 
 - Acceptance: "Unplugging the device pauses playback with a clear message; plugging it back in restores the routing."
 - **Decision (user, L2):** routing is saved per device in the app's configuration folder.
 - **Assumption:** a mono output receives the bus's left and right summed; several buses may share an output (they are summed), as the design's bus layer shows.
-- **Assumption:** default presets by output count follow the design (2 outputs: split mode on; 4, 8, 16+: Click & Guide on its own pair and the other buses spread over the rest); buses beyond the device's outputs fall back to outputs 1/2.
+- **Assumption (rewritten in L3 from the design data):** default presets by output count: 1 output all on 1; 2 outputs split mode on; 3 outputs Click & Guide on 1 and the rest on 2/3; 4-5 outputs Click & Guide on 1/2 and the rest on 3/4; 6-7 outputs one mono output per bus; 8-32 outputs Click & Guide 1, Drums 2, Bass 3, Guitars 4, Keys & Pads 5/6, Vocals 7/8; destinations that do not fit the device fall back to outputs 1/2.
 - **Assumption:** at unity gain with the stereo routing on outputs 1/2, the output stays bit-identical to today's (offline renders, `render-cli`, live null tests unchanged).
 
 ### S3 — In the apps
@@ -42,7 +42,7 @@ Out of scope: MIDI (F9), guide-voice cues (F4), per-song buses (F7.5's opt-in), 
 
 | ID | Specs | Route | Status | Commit |
 |----|-------|-------|--------|--------|
-| T1 | S1, S2 | delegated (context backstop) | in progress | — |
+| T1 | S1, S2 | delegated (context backstop) | built (L3); Spanish rules follow-up | 4ff89e8, 107f8e9, 3b3c432, 0884c85, 650ef50 |
 | T2 | S1, S2 | delegated (context backstop) | pending | — |
 | T3 | S1, S2 | delegated (context backstop) | pending | — |
 | T4 | S1, S2 | delegated (context backstop) | pending | — |
@@ -56,3 +56,4 @@ Route evidence: the parent session is long and past the ~150k-token backstop. Or
 
 - **L1** (2026-11-20, user, verbatim): "ahora si está bien, creo que podemos pasar a la siguiente fase". Asked which phase follows the setlists merge, the user chose verbatim "Mezcla + ruteo (F7+F8) (Recommended)". The parent merged PRs #11, #12 and #13 into `main` in order (merge commits; CI green on Linux, macOS and Windows), retargeted #14 to `main` and waits for its CI (the repository does not allow auto-merge). A read-only explorer mapped the code: the engine, the `AudioRenderer` port and `io-cpal` carry one interleaved stereo pair and `write_interleaved` writes silence above output 2; `io-cpal::choose_config` opens the fewest channels at or above two (pinned by tests); `domain::Stem.part` is unvalidated free text and the package has no bus, mix or routing fields; the app persists no settings; summing through buses would reorder float additions and break the bit-exact tests unless the stereo mixdown keeps a stem-order sum with effective gains.
 - **L2** (2026-11-20, user, verbatim): asked where the mix of each arrangement and the per-device routing are saved, the user chose "mix.json en la carpeta (Recommended)": the mix per arrangement in a `mix.json` beside `song.json` in the song folder (`song.json` is never rewritten); global bus settings and per-device routing in the app's configuration folder.
+- **L3** (2026-11-21): T1 by its writer in five commits (+2,847, about half tests; no existing code, format or test changed): 4ff89e8 (`Bus` with camelCase ids and names; `bus_for_stem`: click/guide roles go to Click & Guide, then the `part` text, then the file name, then `DEFAULT_BUS` = Keys & Pads; normalization splits at non-letters and case changes, the last instrument word wins, generic words decide only without one, two-word phrases first), 107f8e9 (`Volume` in dB with `"-inf"` silent and +12 dB max, exactly 1.0 at 0 dB; `StemMix`, `ArrangementMix`, `MixFile` = `mix.json` v1 with every validation problem reported at once, defaults for missing entries), 3b3c432 (`BusSettings` with bus levels and master; `effective_gains` in stem order: stem × bus × master in f64 cast to f32, bit-exact 1.0 at unity; mute wins over solo; click/guide role or Click & Guide bus never silenced by solo; a muted bus silences its stems and restores them on unmute), 0884c85 (`Destination` mono or stereo pair from output 1; `Routing` with output count, split mode, bus destinations and an optional master destination; presets by output count as rewritten in S2; `stereo()` = every bus on 1/2 as today; `fit` sends what does not fit to 1/2; `RoutingFile` per device), 650ef50 (docs/architecture.md lists the three files). RED then GREEN per rule; 592 tests pass, 6 ignored; fmt, clippy and rustdoc with `-D warnings` clean; the parent re-ran fmt and the suite (592). Writer's readings to confirm later: master destination as an optional extra output carrying the main mix without Click & Guide; split mode needs 2+ outputs. The rules table is English only; Spanish words (batería, bajo, voz, coro, guitarra, teclado...) sent as a follow-up because the library's songs may be named in Spanish. PR #14 CI went green and the parent merged it into `main` (a3599dd), closing the setlists feature. Risk: item 3 (new public formats), additive.
