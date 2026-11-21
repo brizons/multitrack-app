@@ -1,6 +1,6 @@
 [package]
 name = "domain"
-description = "Song package model and timeline compiler: pure functions over data, no I/O."
+description = "Song package and setlist models and the timeline compiler: pure functions over data, no I/O."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
