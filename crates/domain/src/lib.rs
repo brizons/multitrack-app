@@ -16,6 +16,7 @@ pub mod bus;
 pub mod compile;
 pub mod grid;
 pub mod mix;
+pub mod mixer;
 pub mod package;
 pub mod setlist;
 pub mod song;
@@ -30,6 +31,9 @@ pub use grid::{BarBeat, BeatGrid, SourceClick};
 pub use mix::{
     ArrangementMix, MAX_VOLUME_DB, MIX_FORMAT_VERSION, MixFile, MixValidationError, MixerFile,
     MixerFileError, StemMix, Volume,
+};
+pub use mixer::{
+    BUS_SETTINGS_FORMAT_VERSION, BusLevel, BusSettings, BusSettingsError, StemGain, effective_gains,
 };
 pub use package::{
     Arrangement, DEFAULT_ARRANGEMENT_ID, FORMAT_VERSION, IdKind, MAX_BPM, MAX_SONG_HOURS, MIN_BPM,
