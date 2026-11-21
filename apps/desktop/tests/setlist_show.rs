@@ -10,12 +10,14 @@ use app::testing::FakeOutput;
 use app::{AudioOutput, SessionOptions};
 use domain::{
     Arrangement, ClickItem, SectionMarker, SectionType, Setlist, SetlistItem, SongItem,
-    SongPackage, Stem, StemRole, TempoPoint, TimeSignature, TimeSignaturePoint,
+    SongPackage, Stem, StemRole, TempoPoint, TimeSignature, TimeSignaturePoint, Transition,
 };
 use hound::{SampleFormat, WavSpec, WavWriter};
 use library::Library;
 use openvamp_desktop::action::UiAction;
-use openvamp_desktop::show::{Show, Source, replace};
+use openvamp_desktop::library_page::{LibraryAction, LibraryPage};
+use openvamp_desktop::reorder::Half;
+use openvamp_desktop::show::{LoadedSetlist, Show, Source, replace};
 use openvamp_desktop::strip::ItemState;
 use openvamp_desktop::view::PerformView;
 
@@ -577,5 +579,257 @@ fn when_the_setlist_cannot_come_back_nothing_is_loaded_and_both_reasons_show() {
     assert!(
         problems[1].starts_with("\"Sunday\" could not be loaded again: "),
         "{problems:?}"
+    );
+}
+
+// L46: dragging the Perform strip reorders the setlist while it plays.
+
+/// Songs One, Two and Three, titled First, Second and Third, in the setlist
+/// "Sunday" (One links into Two), open on `fake`.
+fn three_songs(fake: &FakeOutput) -> (tempfile::TempDir, LoadedSetlist) {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path();
+    for (folder, title) in [("One", "First"), ("Two", "Second"), ("Three", "Third")] {
+        write_song(&library.join(format!("Songs/{folder}.song")), title, 8_000);
+    }
+    let one = SetlistItem::Song(SongItem {
+        transition: Transition::AutoLink,
+        ..SongItem::new("Songs/One.song")
+    });
+    let items = vec![one, song("Songs/Two.song"), song("Songs/Three.song")];
+    let Source::Setlist { file, .. } = save_setlist(library, "Sunday", items) else {
+        unreachable!("a setlist is saved");
+    };
+    let options = SessionOptions::default();
+    let loaded = LoadedSetlist::open(library, &file, &options, Box::new(fake.clone()))
+        .unwrap_or_else(|_| panic!("the setlist opens"));
+    (dir, loaded)
+}
+
+fn strip_titles(loaded: &LoadedSetlist) -> Vec<String> {
+    loaded
+        .view()
+        .items
+        .into_iter()
+        .map(|item| item.title)
+        .collect()
+}
+
+/// The songs of the setlist `file` of `library`, as its file holds them.
+fn songs_on_disk(library: &Path, file: &str) -> Vec<String> {
+    Library::new(library)
+        .load_setlist(file)
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|item| match item {
+            SetlistItem::Song(song) => song.song,
+            SetlistItem::Click(_) => "click".to_owned(),
+        })
+        .collect()
+}
+
+fn setlist_bytes(library: &Path, file: &str) -> Vec<u8> {
+    fs::read(library.join(library::SETLISTS_FOLDER).join(file)).unwrap()
+}
+
+#[test]
+fn a_tile_dropped_along_the_strip_moves_live_and_its_file_keeps_the_new_order() {
+    let fake = FakeOutput::new();
+    let (dir, mut loaded) = three_songs(&fake);
+    assert_eq!(
+        strip_titles(&loaded),
+        ["First", "Second", "Third"],
+        "every tile has its title"
+    );
+
+    loaded.start_drag();
+    loaded.drag_over(2, 0, Half::Upper);
+    assert_eq!(
+        loaded.view().insertion,
+        Some(0),
+        "the line shows before First"
+    );
+    loaded.drop_dragged(2);
+
+    let view = loaded.view();
+    assert_eq!(view.insertion, None);
+    assert_eq!(strip_titles(&loaded), ["Third", "First", "Second"]);
+    assert_eq!(view.items[1].state, ItemState::Current, "First plays on");
+    assert_eq!(view.problems, Vec::<String>::new());
+    let file = loaded.file.clone();
+    assert_eq!(
+        songs_on_disk(dir.path(), &file),
+        ["Songs/Three.song", "Songs/One.song", "Songs/Two.song"]
+    );
+    assert_eq!(loaded.take_saves(), [(file.clone(), file)]);
+    assert_eq!(loaded.take_saves(), []);
+}
+
+#[test]
+fn a_drop_on_itself_or_with_no_line_of_its_own_moves_and_saves_nothing() {
+    let fake = FakeOutput::new();
+    let (dir, mut loaded) = three_songs(&fake);
+    let bytes = setlist_bytes(dir.path(), &loaded.file);
+
+    // On itself: no line, nothing moves.
+    loaded.drag_over(1, 1, Half::Lower);
+    assert_eq!(loaded.view().insertion, None);
+    loaded.drop_dragged(1);
+    // A line a drag that never dropped left behind is gone once the next
+    // drag starts.
+    loaded.drag_over(1, 2, Half::Lower);
+    assert_eq!(loaded.view().insertion, Some(3));
+    loaded.start_drag();
+    assert_eq!(loaded.view().insertion, None);
+    loaded.drop_dragged(1);
+    // A drop for another tile than the line was worked out for.
+    loaded.drag_over(1, 2, Half::Lower);
+    loaded.drop_dragged(0);
+    assert_eq!(loaded.view().insertion, None);
+    // Dropped outside the strip.
+    loaded.drag_over(1, 0, Half::Upper);
+    assert!(loaded.cancel_drag());
+    assert!(!loaded.cancel_drag());
+
+    assert_eq!(strip_titles(&loaded), ["First", "Second", "Third"]);
+    assert_eq!(setlist_bytes(dir.path(), &loaded.file), bytes);
+    assert_eq!(loaded.take_saves(), []);
+}
+
+/// Waits until the disk threads of `loaded` are idle.
+fn wait_disks(loaded: &LoadedSetlist) {
+    for monitor in loaded.session.disk_monitors() {
+        assert!(monitor.wait_idle(Duration::from_secs(5)));
+    }
+}
+
+#[test]
+fn a_move_during_a_hand_over_is_refused_with_a_notice_until_it_ends_and_saves_nothing() {
+    let fake = FakeOutput::new();
+    let (dir, mut loaded) = three_songs(&fake);
+    for _ in 0..200 {
+        wait_disks(&loaded);
+        loaded.poll();
+        if loaded.snapshot.setlist.next_ready {
+            break;
+        }
+    }
+    assert!(loaded.snapshot.setlist.next_ready, "Second is cued");
+    loaded.send(UiAction::TogglePlay);
+    for _ in 0..100 {
+        wait_disks(&loaded);
+        fake.render(256);
+        loaded.poll();
+        if loaded.snapshot.song.output_frame > 0 {
+            break;
+        }
+    }
+    // Rendered with no poll past First's end: the deck hands over to
+    // Second on its own.
+    for _ in 0..32_000 / 256 + 8 {
+        wait_disks(&loaded);
+        fake.render(256);
+    }
+    let bytes = setlist_bytes(dir.path(), &loaded.file);
+
+    loaded.move_item(2, 0);
+
+    let problems = loaded.view().problems;
+    assert_eq!(
+        problems,
+        ["Refused: the setlist is moving on to the next item; it can be reordered once it has"]
+    );
+    assert_eq!(strip_titles(&loaded), ["First", "Second", "Third"]);
+    assert_eq!(setlist_bytes(dir.path(), &loaded.file), bytes);
+    assert_eq!(loaded.take_saves(), []);
+    loaded.poll();
+    assert_eq!(loaded.snapshot.setlist.current, 1, "Second plays");
+    assert_eq!(
+        loaded.view().problems,
+        Vec::<String>::new(),
+        "the notice goes"
+    );
+    loaded.move_item(2, 0);
+    assert_eq!(strip_titles(&loaded), ["Third", "First", "Second"]);
+}
+
+#[test]
+fn a_file_changed_since_the_setlist_opened_keeps_the_new_order_playing_and_says_it_was_not_saved() {
+    let fake = FakeOutput::new();
+    let (dir, mut loaded) = three_songs(&fake);
+    // The Library screen took Third out of the file since.
+    let library = Library::new(dir.path());
+    let mut setlist = library.load_setlist(&loaded.file).unwrap();
+    setlist.items.pop();
+    library.save_setlist(&setlist).unwrap();
+    let bytes = setlist_bytes(dir.path(), &loaded.file);
+
+    loaded.drag_over(0, 1, Half::Lower);
+    loaded.drop_dragged(0);
+
+    assert_eq!(strip_titles(&loaded), ["Second", "First", "Third"]);
+    assert_eq!(setlist_bytes(dir.path(), &loaded.file), bytes);
+    assert_eq!(
+        loaded.view().problems,
+        [format!(
+            "The new order plays but was not saved to {}: the file changed since the setlist was opened; open it again to play those changes",
+            loaded.file
+        )]
+    );
+    assert_eq!(loaded.take_saves(), []);
+}
+
+#[test]
+fn a_setlist_in_a_file_named_by_hand_follows_its_file_when_a_drop_saves_it() {
+    let fake = FakeOutput::new();
+    let (dir, loaded) = three_songs(&fake);
+    let named = loaded.file.clone();
+    drop(loaded);
+    let folder = dir.path().join(library::SETLISTS_FOLDER);
+    let by_hand = format!("By hand{}", library::SETLIST_EXTENSION);
+    fs::rename(folder.join(&named), folder.join(&by_hand)).unwrap();
+    let options = SessionOptions::default();
+    let mut loaded = LoadedSetlist::open(dir.path(), &by_hand, &options, Box::new(fake.clone()))
+        .unwrap_or_else(|_| panic!("the setlist opens"));
+
+    loaded.drag_over(2, 0, Half::Upper);
+    loaded.drop_dragged(2);
+
+    assert_eq!(loaded.file, named, "it moved to the file its name maps to");
+    assert!(!folder.join(&by_hand).exists());
+    assert_eq!(
+        songs_on_disk(dir.path(), &named),
+        ["Songs/Three.song", "Songs/One.song", "Songs/Two.song"]
+    );
+    assert_eq!(loaded.take_saves(), [(by_hand, named)]);
+}
+
+#[test]
+fn the_library_screen_reads_a_setlist_saved_from_the_strip_again() {
+    let fake = FakeOutput::new();
+    let (dir, mut loaded) = three_songs(&fake);
+    let mut page = LibraryPage::open(dir.path(), Some(&loaded.file)).unwrap();
+
+    loaded.drag_over(2, 0, Half::Upper);
+    loaded.drop_dragged(2);
+    for (from, to) in loaded.take_saves() {
+        page.setlist_saved(&from, &to);
+    }
+
+    let rows: Vec<String> = page
+        .view(None)
+        .editor
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|row| row.title)
+        .collect();
+    assert_eq!(rows, ["Third", "First", "Second"]);
+    // An edit there starts from the order saved, not the one it read first.
+    page.act(LibraryAction::MoveDown(0));
+    assert_eq!(
+        songs_on_disk(dir.path(), &loaded.file),
+        ["Songs/One.song", "Songs/Three.song", "Songs/Two.song"]
     );
 }

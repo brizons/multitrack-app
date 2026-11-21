@@ -5,8 +5,8 @@
 
 use domain::Transition;
 use gpui::{
-    AnyElement, App, Bounds, Context, Div, DragMoveEvent, ElementId, Entity, FontWeight,
-    IntoElement, Pixels, Point, Render, SharedString, Stateful, Window, div, prelude::*, px,
+    AnyElement, App, Context, Div, DragMoveEvent, ElementId, Entity, FontWeight, IntoElement,
+    SharedString, Stateful, div, prelude::*, px,
 };
 use openvamp_desktop::action::Intent;
 use openvamp_desktop::catalog::{TRANSITIONS, transition_name};
@@ -14,11 +14,10 @@ use openvamp_desktop::library_page::{
     ClickDetails, Dragged, EditorRow, EditorView, LibraryAction, LibraryView, RowDetails,
     SetlistRow, SongDetails, SongRow, UnreadableRow,
 };
-use openvamp_desktop::reorder::{Half, half_at};
 
 use crate::screen::Perform;
 use crate::theme;
-use crate::ui::{OneLine, button, chip_button, icon};
+use crate::ui::{DragPreview, OneLine, button, chip_button, drag_preview, half_under, icon};
 
 /// An element id made of words and numbers, such as `arrangement-2-1`.
 fn id(name: String) -> ElementId {
@@ -37,46 +36,11 @@ pub(crate) struct DraggedSetlist {
     label: SharedString,
 }
 
-/// What follows the pointer while a row is dragged: its title, compactly.
-struct DragPreview {
-    label: SharedString,
-}
-
-impl Render for DragPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px(px(12.))
-            .py(px(6.))
-            .rounded(px(8.))
-            .bg(theme::raised())
-            .border_1()
-            .border_color(theme::accent())
-            .shadow_md()
-            .text_size(px(14.))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(theme::text())
-            .child(self.label.clone())
-    }
-}
-
 /// Starts a drag on `screen` and builds what follows the pointer: the
 /// dragged row's `label`.
 fn start_drag(screen: &Entity<Perform>, label: &SharedString, cx: &mut App) -> Entity<DragPreview> {
     screen.update(cx, |screen, cx| screen.library_drag_started(cx));
-    let label = label.clone();
-    cx.new(|_| DragPreview { label })
-}
-
-/// Which half of the row with `bounds` the pointer at `position` is in,
-/// when it is over that row at all.
-fn half_under(bounds: &Bounds<Pixels>, position: Point<Pixels>) -> Option<Half> {
-    bounds.contains(&position).then(|| {
-        half_at(
-            f32::from(bounds.origin.y),
-            f32::from(bounds.size.height),
-            f32::from(position.y),
-        )
-    })
+    drag_preview(label, cx)
 }
 
 /// The line that shows where a dragged row would land: in the gap above

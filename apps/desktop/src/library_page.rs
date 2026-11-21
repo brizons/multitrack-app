@@ -180,6 +180,23 @@ impl LibraryPage {
         Self::open_with_trash(root, file, library::move_to_trash)
     }
 
+    /// The setlist in `from` was saved elsewhere (a move on the Perform
+    /// strip) and is now in `to`: the list is read again, and an editor
+    /// holding it reads it again, so the next edit starts from what was
+    /// saved.
+    pub fn setlist_saved(&mut self, from: &str, to: &str) {
+        if let Err(error) = self.shelf.refresh() {
+            self.notice = Some(error.to_string());
+        }
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.file() == from)
+        {
+            self.select(to);
+        }
+    }
+
     /// The setlist files the editor moved since the last call, as (from,
     /// to): a rename, or a file named by hand moved on its first change.
     pub fn take_moves(&mut self) -> Vec<(String, String)> {

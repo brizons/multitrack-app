@@ -6,10 +6,12 @@
 use app::JumpTiming;
 use domain::Transition;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Div, ElementId, FocusHandle, FontWeight, IntoElement,
-    MouseButton, Rgba, SharedString, Stateful, Window, div, prelude::*, px, relative, svg,
+    AnyElement, App, Bounds, ClickEvent, Context, Div, DragMoveEvent, ElementId, Entity,
+    FocusHandle, FontWeight, IntoElement, MouseButton, Pixels, Point, Rgba, SharedString, Stateful,
+    Window, div, prelude::*, px, relative, svg,
 };
 use openvamp_desktop::action::UiAction;
+use openvamp_desktop::reorder::{Half, half_at};
 use openvamp_desktop::strip::{ItemState, SetlistView, StripItem, TransitionChip};
 use openvamp_desktop::view::{
     FadeButton, Level, NextCard, NowCard, Pad, PerformView, SongMap, StatusView, TransportView,
@@ -870,9 +872,30 @@ fn pad_button(pad: &Pad, cx: &mut Context<Perform>) -> AnyElement {
         .into_any_element()
 }
 
+/// A strip tile being dragged by the pointer.
+pub(crate) struct DraggedTile {
+    index: usize,
+    label: SharedString,
+}
+
+/// The line that shows where a dragged tile would land: in the gap before a
+/// tile, or after the last one.
+fn tile_insertion_line() -> Div {
+    div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .w(px(3.))
+        .rounded(px(2.))
+        .bg(theme::accent())
+}
+
 /// The setlist strip: a tile per item, the chip with its transition
-/// between tiles; a tile selects its item.
+/// between tiles; a tile selects its item, and dragging it along the strip
+/// moves it (L46). The "+" after the tiles neither drags nor takes a drop.
 fn strip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoElement {
+    let insertion = setlist.insertion.filter(|_| cx.has_active_drag());
+    let tiles = setlist.items.len();
     div()
         .id("strip")
         .h(px(84.))
@@ -881,14 +904,32 @@ fn strip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoElement {
         .gap(px(8.))
         .pb(px(6.))
         .overflow_x_scroll()
-        .children(setlist.items.iter().map(|item| {
+        .child(
             div()
                 .flex_none()
                 .flex()
                 .gap(px(8.))
-                .child(strip_tile(item, cx))
-                .children(item.transition.as_ref().map(transition_chip))
-        }))
+                // Room for the line before the first tile.
+                .pl(px(6.))
+                .on_drag_move(
+                    cx.listener(|screen, event: &DragMoveEvent<DraggedTile>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            screen.strip_drag_left(cx);
+                        }
+                    }),
+                )
+                .on_drop(cx.listener(|screen, tile: &DraggedTile, _, cx| {
+                    screen.strip_drop(tile.index, cx);
+                }))
+                .children(setlist.items.iter().map(|item| {
+                    div()
+                        .flex_none()
+                        .flex()
+                        .gap(px(8.))
+                        .child(strip_tile(item, tiles, insertion, cx))
+                        .children(item.transition.as_ref().map(transition_chip))
+                })),
+        )
         .child(
             button("add-to-setlist", cx, Intent::ShowPage(Page::Library))
                 .w(px(52.))
@@ -901,7 +942,13 @@ fn strip(setlist: &SetlistView, cx: &mut Context<Perform>) -> impl IntoElement {
         )
 }
 
-fn strip_tile(item: &StripItem, cx: &mut Context<Perform>) -> AnyElement {
+fn strip_tile(
+    item: &StripItem,
+    tiles: usize,
+    insertion: Option<usize>,
+    cx: &mut Context<Perform>,
+) -> AnyElement {
+    let index = item.index;
     let (border, bg, fg) = match item.state {
         ItemState::Current => (theme::accent(), theme::raised(), theme::text()),
         ItemState::Played => (theme::border(), theme::panel(), theme::text_muted()),
@@ -939,8 +986,36 @@ fn strip_tile(item: &StripItem, cx: &mut Context<Perform>) -> AnyElement {
         .rounded(px(12.))
         .bg(bg)
         .text_color(fg)
+        .relative()
         .cursor_pointer()
-        .on_click(on_click(cx, Intent::Ui(UiAction::SelectItem(item.index))));
+        .on_click(on_click(cx, Intent::Ui(UiAction::SelectItem(index))))
+        .on_drag(
+            DraggedTile {
+                index,
+                label: item.title.clone().into(),
+            },
+            {
+                let screen = cx.entity();
+                move |tile: &DraggedTile, _, _, cx: &mut App| {
+                    screen.update(cx, |screen, cx| screen.strip_drag_started(cx));
+                    drag_preview(&tile.label, cx)
+                }
+            },
+        )
+        .on_drag_move(
+            cx.listener(move |screen, event: &DragMoveEvent<DraggedTile>, _, cx| {
+                if let Some(half) = half_across(&event.bounds, event.event.position) {
+                    let from = event.drag(cx).index;
+                    screen.strip_drag_over(from, index, half, cx);
+                }
+            }),
+        )
+        .when(insertion == Some(index), |tile| {
+            tile.child(tile_insertion_line().left(px(-6.)))
+        })
+        .when(index + 1 == tiles && insertion == Some(tiles), |tile| {
+            tile.child(tile_insertion_line().right(px(-6.)))
+        });
     let tile = if item.state == ItemState::Current {
         tile.border_2().border_color(border)
     } else {
@@ -1230,6 +1305,61 @@ fn brand_mark() -> impl IntoElement {
 
 /// One line of text cut with an ellipsis ("…") when it does not fit.
 ///
+/// What follows the pointer while a row or tile is dragged: its title,
+/// compactly.
+pub(crate) struct DragPreview {
+    label: SharedString,
+}
+
+impl Render for DragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(12.))
+            .py(px(6.))
+            .rounded(px(8.))
+            .bg(theme::raised())
+            .border_1()
+            .border_color(theme::accent())
+            .shadow_md()
+            .text_size(px(14.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme::text())
+            .child(self.label.clone())
+    }
+}
+
+/// The view that follows the pointer while something titled `label` is
+/// dragged.
+pub(crate) fn drag_preview(label: &SharedString, cx: &mut App) -> Entity<DragPreview> {
+    let label = label.clone();
+    cx.new(|_| DragPreview { label })
+}
+
+/// Which half of the row with `bounds` the pointer at `position` is in,
+/// top or bottom, when it is over that row at all.
+pub(crate) fn half_under(bounds: &Bounds<Pixels>, position: Point<Pixels>) -> Option<Half> {
+    bounds.contains(&position).then(|| {
+        half_at(
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.height),
+            f32::from(position.y),
+        )
+    })
+}
+
+/// Which half of the tile with `bounds` the pointer at `position` is in,
+/// left ([`Half::Upper`], before it) or right, when it is over that tile at
+/// all.
+pub(crate) fn half_across(bounds: &Bounds<Pixels>, position: Point<Pixels>) -> Option<Half> {
+    bounds.contains(&position).then(|| {
+        half_at(
+            f32::from(bounds.origin.x),
+            f32::from(bounds.size.width),
+            f32::from(position.x),
+        )
+    })
+}
+
 /// gpui 0.2.2's own `truncate()` sets `whitespace_nowrap`, and a text that
 /// does not wrap keeps the size of its first measurement, taken while its
 /// width is not known yet (the layout's max-content pass): it then draws in

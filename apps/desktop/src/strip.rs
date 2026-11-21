@@ -82,6 +82,10 @@ pub struct SetlistView {
     /// songs at another sample rate, the last setlist problem, a control
     /// the setlist refused, and the device held for another rate.
     pub problems: Vec<String>,
+    /// Where a tile dragged along the strip would land: before the tile at
+    /// this index, or after the last one at the number of items; `None`
+    /// when nothing is dragged or dropping would move nothing.
+    pub insertion: Option<usize>,
 }
 
 impl SetlistView {
@@ -155,6 +159,7 @@ impl SetlistView {
                 .any(|item| item.is_playable()),
             has_next: state.next.is_some(),
             problems: problems(info, snapshot, catalog, refused),
+            insertion: None,
         }
     }
 }

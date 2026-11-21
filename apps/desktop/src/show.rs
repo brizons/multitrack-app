@@ -13,10 +13,13 @@ use app::{
     SetlistCommand, SetlistCommandError, SetlistOpenError, SetlistSession, SetlistSnapshot,
     Snapshot, SongInfo,
 };
+use domain::SetlistItem;
 use library::{Library, SETLIST_EXTENSION, SETLISTS_FOLDER, SetlistError};
 
 use crate::action::{UiAction, command_for, setlist_command_for};
 use crate::catalog::Catalog;
+use crate::editor::{Edit, SetlistEditor};
+use crate::reorder::{Half, drop_index, drop_slot};
 use crate::song::{Closed, Song, stop_and_wait};
 use crate::strip::SetlistView;
 use crate::view::open_error_lines;
@@ -217,6 +220,9 @@ impl Prepared {
                     snapshot,
                     catalog,
                     refused: None,
+                    insertion: None,
+                    unsaved: None,
+                    saves: Vec::new(),
                 })))
             }
         }
@@ -237,9 +243,19 @@ pub struct LoadedSetlist {
     pub snapshot: SetlistSnapshot,
     /// The library's songs, to name the items.
     pub catalog: Catalog,
-    /// The last previous, next or select the setlist refused, until one is
-    /// accepted.
+    /// The last previous, next, select or move the setlist refused, until
+    /// one is accepted.
     pub refused: Option<SetlistCommandError>,
+    /// The tile dragged along the strip and the gap it would land in, while
+    /// dropping there would move it.
+    insertion: Option<(usize, usize)>,
+    /// Why the order last moved on the strip is not in the file, though it
+    /// plays; or the file's place in the stored order that could not be
+    /// written.
+    unsaved: Option<String>,
+    /// The setlist files a move on the strip wrote since the last
+    /// [`Self::take_saves`], as (file before, file after).
+    saves: Vec<(String, String)>,
 }
 
 impl LoadedSetlist {
@@ -296,13 +312,125 @@ impl LoadedSetlist {
 
     /// What the screen shows of the setlist.
     pub fn view(&self) -> SetlistView {
-        SetlistView::new(
+        let mut view = SetlistView::new(
             self.session.info(),
             &self.snapshot,
             &self.catalog,
             self.refused.as_ref(),
-        )
+        );
+        view.insertion = self.insertion.map(|(_, slot)| slot);
+        view.problems.extend(self.unsaved.clone());
+        view
     }
+
+    /// A drag of a strip tile starts: no line shows until it is over a
+    /// tile, whatever an earlier drag that never dropped left behind.
+    pub fn start_drag(&mut self) {
+        self.insertion = None;
+    }
+
+    /// A drag of tile `from` is over tile `over`, in its `half` (the left
+    /// one is [`Half::Upper`]): the line shows where it would land, or
+    /// nowhere when dropping there would move nothing.
+    pub fn drag_over(&mut self, from: usize, over: usize, half: Half) {
+        let slot = drop_slot(over, half);
+        let items = self.session.info().items.len();
+        self.insertion = drop_index(from, slot, items).map(|_| (from, slot));
+    }
+
+    /// The drag of tile `from` was dropped on the strip: it moves to where
+    /// the line shows ([`Self::move_item`]), or nowhere without a line of
+    /// its own.
+    pub fn drop_dragged(&mut self, from: usize) {
+        // Taken either way: a line worked out for another tile never lasts.
+        let Some((shown, slot)) = self.insertion.take() else {
+            return;
+        };
+        let items = self.session.info().items.len();
+        if shown == from
+            && let Some(to) = drop_index(from, slot, items)
+        {
+            self.move_item(from, to);
+        }
+    }
+
+    /// The drag ended anywhere else, or left the strip: nothing moves and
+    /// the line goes. Whether a line was showing.
+    pub fn cancel_drag(&mut self) -> bool {
+        self.insertion.take().is_some()
+    }
+
+    /// Moves item `from` to `to` while the setlist plays (L46,
+    /// [`SetlistCommand::Move`]), then writes the new order to the setlist
+    /// file as the Library screen's editor writes a move. A move the session
+    /// refuses shows as refused, until a control is accepted or the setlist
+    /// moves on, and changes nothing. A move the file cannot take (it
+    /// changed since the setlist opened, or cannot be written) still plays,
+    /// and the problems say it was not saved.
+    pub fn move_item(&mut self, from: usize, to: usize) {
+        let before: Vec<SetlistItem> = self
+            .session
+            .info()
+            .items
+            .iter()
+            .map(|item| item.item.clone())
+            .collect();
+        if let Err(error) = self.session.send(SetlistCommand::Move { from, to }) {
+            self.refused = Some(error);
+            return;
+        }
+        self.refused = None;
+        if from == to {
+            return;
+        }
+        // The snapshot's indexes follow their items at once.
+        self.snapshot = self.session.poll();
+        match save_move(&self.library, &self.file, &before, from, to) {
+            Ok((file, warning)) => {
+                self.saves.push((self.file.clone(), file.clone()));
+                self.file = file;
+                self.unsaved = warning;
+            }
+            Err(reason) => {
+                self.unsaved = Some(format!(
+                    "The new order plays but was not saved to {}: {reason}",
+                    self.file
+                ));
+            }
+        }
+    }
+
+    /// The setlist files a move on the strip wrote since the last call, as
+    /// (file before, file after): the Library screen reads them again.
+    pub fn take_saves(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.saves)
+    }
+}
+
+/// Writes the move of item `from` to `to` to the setlist `file` of the
+/// library folder `library`, which must still hold the items `before`;
+/// returns the file the setlist is in afterwards (a file named by hand moves
+/// to the one its name maps to) and a warning when its place in the stored
+/// order could not be written.
+fn save_move(
+    library: &Path,
+    file: &str,
+    before: &[SetlistItem],
+    from: usize,
+    to: usize,
+) -> Result<(String, Option<String>), String> {
+    let mut editor =
+        SetlistEditor::open(Library::new(library), file).map_err(|error| error.to_string())?;
+    if editor.setlist().items != before {
+        return Err(
+            "the file changed since the setlist was opened; open it again to play those changes"
+                .to_owned(),
+        );
+    }
+    let warning = editor
+        .apply(Edit::Move { from, to })
+        .map_err(|error| error.to_string())?;
+    Ok((editor.file().to_owned(), warning))
 }
 
 /// What plays: a song or a setlist.
@@ -333,6 +461,14 @@ impl Show {
 
     /// The setlist, when one plays.
     pub fn setlist(&self) -> Option<&LoadedSetlist> {
+        match self {
+            Self::Song(_) => None,
+            Self::Setlist(setlist) => Some(setlist),
+        }
+    }
+
+    /// The setlist, when one plays, to change.
+    pub fn setlist_mut(&mut self) -> Option<&mut LoadedSetlist> {
         match self {
             Self::Song(_) => None,
             Self::Setlist(setlist) => Some(setlist),

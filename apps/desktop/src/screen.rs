@@ -25,6 +25,7 @@ use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
 use openvamp_desktop::view::PerformView;
 
 use crate::library_ui::{DraggedItem, DraggedSetlist};
+use crate::ui::DraggedTile;
 use crate::{library_ui, ui};
 
 /// How often the session is polled: about 30 Hz (Decision 3). The timer
@@ -382,6 +383,71 @@ impl Perform {
         }
     }
 
+    /// The setlist playing, when one does.
+    fn loaded_setlist(&mut self) -> Option<&mut LoadedSetlist> {
+        self.loaded.as_mut().and_then(Show::setlist_mut)
+    }
+
+    /// A drag of a strip tile starts.
+    pub fn strip_drag_started(&mut self, cx: &mut Context<Self>) {
+        if let Some(setlist) = self.loaded_setlist() {
+            setlist.start_drag();
+            cx.notify();
+        }
+    }
+
+    /// A drag of strip tile `from` is over tile `over`, in its `half`.
+    pub fn strip_drag_over(
+        &mut self,
+        from: usize,
+        over: usize,
+        half: Half,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(setlist) = self.loaded_setlist() {
+            setlist.drag_over(from, over, half);
+            cx.notify();
+        }
+    }
+
+    /// A drag of a strip tile left the tiles: its line goes until it is
+    /// over a tile again.
+    pub fn strip_drag_left(&mut self, cx: &mut Context<Self>) {
+        if let Some(setlist) = self.loaded_setlist()
+            && setlist.cancel_drag()
+        {
+            cx.notify();
+        }
+    }
+
+    /// Strip tile `from` was dropped on the tiles: the setlist moves it
+    /// while it plays and saves the new order, which the Library screen
+    /// reads again.
+    pub fn strip_drop(&mut self, from: usize, cx: &mut Context<Self>) {
+        let Some(setlist) = self.loaded_setlist() else {
+            return;
+        };
+        setlist.drop_dragged(from);
+        let saves = setlist.take_saves();
+        let root = setlist.library.clone();
+        if let Some(library) = &mut self.library
+            && library.root() == root
+        {
+            for (from, to) in saves {
+                library.setlist_saved(&from, &to);
+            }
+        }
+        cx.notify();
+    }
+
+    /// A strip tile dropped anywhere but the tiles: nothing moves.
+    fn strip_drag_cancelled(&mut self, cx: &mut Context<Self>) {
+        if let Some(setlist) = self.loaded_setlist() {
+            setlist.cancel_drag();
+            cx.notify();
+        }
+    }
+
     /// A drag of a row starts.
     pub fn library_drag_started(&mut self, cx: &mut Context<Self>) {
         if let Some(library) = &mut self.library {
@@ -612,6 +678,9 @@ impl Render for Perform {
             }))
             .on_drop(cx.listener(|screen, _: &DraggedSetlist, _, cx| {
                 screen.library_drag_cancelled(cx);
+            }))
+            .on_drop(cx.listener(|screen, _: &DraggedTile, _, cx| {
+                screen.strip_drag_cancelled(cx);
             }))
             .child(ui::nav(self.page, cx))
             .child(ui::main().child(body))
