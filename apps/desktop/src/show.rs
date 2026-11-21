@@ -213,6 +213,7 @@ impl Prepared {
             } => {
                 let mut session = prepared.start(output)?;
                 let snapshot = session.poll();
+                let known = items_of(&session);
                 Ok(Show::Setlist(Box::new(LoadedSetlist {
                     library,
                     file,
@@ -221,6 +222,7 @@ impl Prepared {
                     catalog,
                     refused: None,
                     insertion: None,
+                    known,
                     unsaved: None,
                     saves: Vec::new(),
                 })))
@@ -249,6 +251,9 @@ pub struct LoadedSetlist {
     /// The tile dragged along the strip and the gap it would land in, while
     /// dropping there would move it.
     insertion: Option<(usize, usize)>,
+    /// The items the setlist file was last known to hold, in its order: as
+    /// opened, or as a move on the strip last saved them.
+    known: Vec<SetlistItem>,
     /// Why the order last moved on the strip is not in the file, though it
     /// plays; or the file's place in the stored order that could not be
     /// written.
@@ -361,20 +366,15 @@ impl LoadedSetlist {
     }
 
     /// Moves item `from` to `to` while the setlist plays (L46,
-    /// [`SetlistCommand::Move`]), then writes the new order to the setlist
-    /// file as the Library screen's editor writes a move. A move the session
+    /// [`SetlistCommand::Move`]), then writes the order playing to the
+    /// setlist file through the Library screen's editor. A move the session
     /// refuses shows as refused, until a control is accepted or the setlist
-    /// moves on, and changes nothing. A move the file cannot take (it
-    /// changed since the setlist opened, or cannot be written) still plays,
-    /// and the problems say it was not saved.
+    /// moves on, and changes nothing. A move the file cannot take still
+    /// plays, and the problems say it was not saved: while the file holds
+    /// what it was last known to hold, the next move saves the whole order
+    /// (after a write that failed, say); a file changed since by someone
+    /// else is left as it is.
     pub fn move_item(&mut self, from: usize, to: usize) {
-        let before: Vec<SetlistItem> = self
-            .session
-            .info()
-            .items
-            .iter()
-            .map(|item| item.item.clone())
-            .collect();
         if let Err(error) = self.session.send(SetlistCommand::Move { from, to }) {
             self.refused = Some(error);
             return;
@@ -385,10 +385,12 @@ impl LoadedSetlist {
         }
         // The snapshot's indexes follow their items at once.
         self.snapshot = self.session.poll();
-        match save_move(&self.library, &self.file, &before, from, to) {
+        let order = items_of(&self.session);
+        match save_order(&self.library, &self.file, &self.known, &order) {
             Ok((file, warning)) => {
                 self.saves.push((self.file.clone(), file.clone()));
                 self.file = file;
+                self.known = order;
                 self.unsaved = warning;
             }
             Err(reason) => {
@@ -407,28 +409,36 @@ impl LoadedSetlist {
     }
 }
 
-/// Writes the move of item `from` to `to` to the setlist `file` of the
-/// library folder `library`, which must still hold the items `before`;
-/// returns the file the setlist is in afterwards (a file named by hand moves
-/// to the one its name maps to) and a warning when its place in the stored
-/// order could not be written.
-fn save_move(
+/// The items `session` plays, in its order.
+fn items_of(session: &SetlistSession) -> Vec<SetlistItem> {
+    session
+        .info()
+        .items
+        .iter()
+        .map(|item| item.item.clone())
+        .collect()
+}
+
+/// Writes `order` to the setlist `file` of the library folder `library`,
+/// which must still hold the items `known`; returns the file the setlist is
+/// in afterwards (a file named by hand moves to the one its name maps to)
+/// and a warning when its place in the stored order could not be written.
+fn save_order(
     library: &Path,
     file: &str,
-    before: &[SetlistItem],
-    from: usize,
-    to: usize,
+    known: &[SetlistItem],
+    order: &[SetlistItem],
 ) -> Result<(String, Option<String>), String> {
     let mut editor =
         SetlistEditor::open(Library::new(library), file).map_err(|error| error.to_string())?;
-    if editor.setlist().items != before {
+    if editor.setlist().items != known {
         return Err(
             "the file changed since the setlist was opened; open it again to play those changes"
                 .to_owned(),
         );
     }
     let warning = editor
-        .apply(Edit::Move { from, to })
+        .apply(Edit::Order(order.to_vec()))
         .map_err(|error| error.to_string())?;
     Ok((editor.file().to_owned(), warning))
 }

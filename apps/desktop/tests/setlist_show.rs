@@ -768,16 +768,60 @@ fn a_file_changed_since_the_setlist_opened_keeps_the_new_order_playing_and_says_
     loaded.drag_over(0, 1, Half::Lower);
     loaded.drop_dragged(0);
 
+    let not_saved = [format!(
+        "The new order plays but was not saved to {}: the file changed since the setlist was opened; open it again to play those changes",
+        loaded.file
+    )];
     assert_eq!(strip_titles(&loaded), ["Second", "First", "Third"]);
     assert_eq!(setlist_bytes(dir.path(), &loaded.file), bytes);
-    assert_eq!(
-        loaded.view().problems,
-        [format!(
-            "The new order plays but was not saved to {}: the file changed since the setlist was opened; open it again to play those changes",
-            loaded.file
-        )]
-    );
+    assert_eq!(loaded.view().problems, not_saved);
     assert_eq!(loaded.take_saves(), []);
+
+    // Every later move plays and keeps away from the changed file.
+    loaded.move_item(2, 0);
+    assert_eq!(strip_titles(&loaded), ["Third", "Second", "First"]);
+    assert_eq!(setlist_bytes(dir.path(), &loaded.file), bytes);
+    assert_eq!(loaded.view().problems, not_saved);
+    assert_eq!(loaded.take_saves(), []);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_move_that_could_not_be_saved_is_saved_with_the_next_one() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fake = FakeOutput::new();
+    let (dir, mut loaded) = three_songs(&fake);
+    let folder = dir.path().join(library::SETLISTS_FOLDER);
+    let bytes = setlist_bytes(dir.path(), &loaded.file);
+    let mode = |mode| fs::Permissions::from_mode(mode);
+
+    // The setlists folder takes no file for a moment.
+    fs::set_permissions(&folder, mode(0o555)).unwrap();
+    loaded.move_item(2, 0);
+    fs::set_permissions(&folder, mode(0o755)).unwrap();
+
+    assert_eq!(strip_titles(&loaded), ["Third", "First", "Second"]);
+    assert_eq!(setlist_bytes(dir.path(), &loaded.file), bytes);
+    let problems = loaded.view().problems;
+    let not_saved = format!("The new order plays but was not saved to {}: ", loaded.file);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].starts_with(&not_saved), "{problems:?}");
+    assert!(!problems[0].contains("changed since"), "{problems:?}");
+    assert_eq!(loaded.take_saves(), []);
+
+    // The file still holds the order it was last known to hold, so the
+    // next move saves the whole order playing.
+    loaded.move_item(2, 1);
+
+    assert_eq!(strip_titles(&loaded), ["Third", "Second", "First"]);
+    assert_eq!(loaded.view().problems, Vec::<String>::new());
+    assert_eq!(
+        songs_on_disk(dir.path(), &loaded.file),
+        ["Songs/Three.song", "Songs/Two.song", "Songs/One.song"]
+    );
+    let file = loaded.file.clone();
+    assert_eq!(loaded.take_saves(), [(file.clone(), file)]);
 }
 
 #[test]
@@ -831,5 +875,35 @@ fn the_library_screen_reads_a_setlist_saved_from_the_strip_again() {
     assert_eq!(
         songs_on_disk(dir.path(), &loaded.file),
         ["Songs/One.song", "Songs/Three.song", "Songs/Two.song"]
+    );
+}
+
+#[test]
+fn an_order_of_other_items_than_the_setlist_holds_is_refused() {
+    use openvamp_desktop::editor::{Edit, EditError, SetlistEditor};
+
+    let (dir, loaded) = three_songs(&FakeOutput::new());
+    let mut editor = SetlistEditor::open(Library::new(dir.path()), &loaded.file).unwrap();
+    let held = editor.setlist().items.clone();
+    let bytes = setlist_bytes(dir.path(), &loaded.file);
+
+    let mut fewer = held.clone();
+    fewer.pop();
+    let mut other = held.clone();
+    other[0] = held[1].clone();
+    for items in [fewer, other] {
+        assert!(matches!(
+            editor.apply(Edit::Order(items)),
+            Err(EditError::NotTheSameItems)
+        ));
+    }
+    assert_eq!(setlist_bytes(dir.path(), &loaded.file), bytes);
+
+    let mut rotated = held;
+    rotated.rotate_left(1);
+    assert_eq!(editor.apply(Edit::Order(rotated)).unwrap(), None);
+    assert_eq!(
+        songs_on_disk(dir.path(), &loaded.file),
+        ["Songs/Two.song", "Songs/Three.song", "Songs/One.song"]
     );
 }

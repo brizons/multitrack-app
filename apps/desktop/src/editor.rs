@@ -53,6 +53,9 @@ pub enum Edit {
     Transition(usize, Transition),
     /// Sets a click-only tile's tempo, meter and bar count (F5.5).
     Click(usize, ClickItem),
+    /// Puts the setlist's own items in this order, each as many times as
+    /// it holds it: moves made on the Perform strip, written at once.
+    Order(Vec<SetlistItem>),
 }
 
 /// Why a change was not made; the setlist and its file are as they were.
@@ -62,6 +65,8 @@ pub enum EditError {
     Edit(SetlistEditError),
     /// The item is a song, not a click-only tile.
     NotAClick(usize),
+    /// An order that does not hold the setlist's items, each as many times.
+    NotTheSameItems,
     /// The setlist could not be saved.
     Save(SetlistError),
 }
@@ -73,6 +78,7 @@ impl fmt::Display for EditError {
             Self::NotAClick(item) => {
                 write!(f, "item {} is a song, not a click-only tile", item + 1)
             }
+            Self::NotTheSameItems => f.write_str("the order does not hold the setlist's items"),
             Self::Save(error) => error.fmt(f),
         }
     }
@@ -211,6 +217,25 @@ fn apply(setlist: &mut Setlist, edit: Edit) -> Result<(), EditError> {
                 return Err(SetlistEditError::IndexOutOfRange { index, len: end }.into());
             }
         },
+        Edit::Order(items) => {
+            if !same_items(&setlist.items, &items) {
+                return Err(EditError::NotTheSameItems);
+            }
+            setlist.items = items;
+        }
     }
     Ok(())
+}
+
+/// Whether `a` and `b` hold the same items, each as many times, in any
+/// order.
+fn same_items(a: &[SetlistItem], b: &[SetlistItem]) -> bool {
+    let mut left: Vec<&SetlistItem> = a.iter().collect();
+    a.len() == b.len()
+        && b.iter().all(|item| {
+            left.iter()
+                .position(|held| *held == item)
+                .map(|found| left.swap_remove(found))
+                .is_some()
+        })
 }
