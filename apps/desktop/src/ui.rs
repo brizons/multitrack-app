@@ -1303,8 +1303,6 @@ fn brand_mark() -> impl IntoElement {
         )
 }
 
-/// One line of text cut with an ellipsis ("…") when it does not fit.
-///
 /// What follows the pointer while a row or tile is dragged: its title,
 /// compactly.
 pub(crate) struct DragPreview {
@@ -1360,6 +1358,8 @@ pub(crate) fn half_across(bounds: &Bounds<Pixels>, position: Point<Pixels>) -> O
     })
 }
 
+/// One line of text cut with an ellipsis ("…") when it does not fit.
+///
 /// gpui 0.2.2's own `truncate()` sets `whitespace_nowrap`, and a text that
 /// does not wrap keeps the size of its first measurement, taken while its
 /// width is not known yet (the layout's max-content pass): it then draws in
