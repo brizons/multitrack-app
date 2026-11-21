@@ -192,9 +192,11 @@ impl ConfigStore {
     /// Saves the global bus settings, unless the file on disk has a newer
     /// `formatVersion` ([`SettingsError::NewerVersion`]).
     pub fn save_bus_settings(&self, settings: &BusSettings) -> Result<(), SettingsError> {
-        let folder = self.create_folder()?;
-        let json = to_json(&folder, BUS_SETTINGS_FILE, settings.to_json())?;
-        write_settings(&folder, BUS_SETTINGS_FILE, &json, BusSettings::from_json)
+        self.save(
+            BUS_SETTINGS_FILE,
+            settings.to_json(),
+            BusSettings::from_json,
+        )
     }
 
     /// Reads the routing of every device.
@@ -214,9 +216,21 @@ impl ConfigStore {
     /// Saves the routing of every device, unless the file on disk has a
     /// newer `formatVersion` ([`SettingsError::NewerVersion`]).
     pub fn save_routing(&self, routing: &RoutingFile) -> Result<(), SettingsError> {
-        let folder = self.create_folder()?;
-        let json = to_json(&folder, ROUTING_FILE, routing.to_json())?;
-        write_settings(&folder, ROUTING_FILE, &json, RoutingFile::from_json)
+        self.save(ROUTING_FILE, routing.to_json(), RoutingFile::from_json)
+    }
+
+    /// Writes `json` as `file`. The folder is created only once the write is
+    /// going ahead: after the settings became JSON, and only when it is
+    /// missing, so no file there can need its version checked.
+    fn save<T>(
+        &self,
+        file: &str,
+        json: Result<String, domain::MixerFileError>,
+        parse: impl FnOnce(&str) -> Result<T, domain::MixerFileError>,
+    ) -> Result<(), SettingsError> {
+        let json = to_json(&self.folder, file, json)?;
+        let folder = self.folder_for_writing()?;
+        write_settings(&folder, file, &json, parse)
     }
 
     /// Reads `file` from the folder; a missing folder means the defaults.
@@ -242,13 +256,19 @@ impl ConfigStore {
     }
 
     /// The canonical folder, created first (with its parents) when missing.
-    fn create_folder(&self) -> Result<PathBuf, SettingsError> {
+    fn folder_for_writing(&self) -> Result<PathBuf, SettingsError> {
         let folder_error = |source| SettingsError::Folder {
             path: self.folder.clone(),
             source,
         };
-        fs::create_dir_all(&self.folder).map_err(folder_error)?;
-        let folder = fs::canonicalize(&self.folder).map_err(folder_error)?;
+        let folder = match fs::canonicalize(&self.folder) {
+            Ok(folder) => folder,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(&self.folder).map_err(folder_error)?;
+                fs::canonicalize(&self.folder).map_err(folder_error)?
+            }
+            Err(source) => return Err(folder_error(source)),
+        };
         if !folder.is_dir() {
             return Err(folder_error(io::Error::from(io::ErrorKind::NotADirectory)));
         }

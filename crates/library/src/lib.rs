@@ -419,6 +419,8 @@ enum ConfinedReadError {
     NotAFile,
     /// The file holds more bytes than the limit.
     TooLarge,
+    /// The file was read but is not UTF-8 text.
+    NotUtf8,
     /// The file could not be resolved, opened or read as UTF-8.
     Io(io::Error),
 }
@@ -444,17 +446,18 @@ fn read_confined(folder: &Path, file: &str, max_bytes: u64) -> Result<String, Co
     if metadata.len() > max_bytes {
         return Err(ConfinedReadError::TooLarge);
     }
-    read_at_most(opened, max_bytes)
+    let bytes = read_at_most(opened, max_bytes)
         .map_err(ConfinedReadError::Io)?
-        .ok_or(ConfinedReadError::TooLarge)
+        .ok_or(ConfinedReadError::TooLarge)?;
+    String::from_utf8(bytes).map_err(|_| ConfinedReadError::NotUtf8)
 }
 
-/// Reads all of `file` as UTF-8, or `None` when it holds more than
-/// `max_bytes` (it may grow after its size was checked).
-fn read_at_most(file: File, max_bytes: u64) -> io::Result<Option<String>> {
-    let mut text = String::new();
-    file.take(max_bytes + 1).read_to_string(&mut text)?;
-    Ok((text.len() as u64 <= max_bytes).then_some(text))
+/// Reads all of `file`, or `None` when it holds more than `max_bytes` (it may
+/// grow after its size was checked).
+fn read_at_most(file: File, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= max_bytes).then_some(bytes))
 }
 
 /// Writes `contents` to a temporary file beside `path`, flushes it to disk,

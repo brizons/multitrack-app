@@ -413,6 +413,16 @@ fn a_settings_file_the_check_cannot_read_is_not_written_over() {
         fs::write(&path, newer).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
     }
+    if fs::read(store.folder().join(BUS_SETTINGS_FILE)).is_ok() {
+        for file in [BUS_SETTINGS_FILE, ROUTING_FILE] {
+            fs::set_permissions(store.folder().join(file), fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+        eprintln!(
+            "note: mode 0o000 does not block reads here (root or CAP_DAC_OVERRIDE); skipping"
+        );
+        return;
+    }
     let results = [
         store.save_bus_settings(&some_settings()),
         store.save_routing(&some_routing()),
@@ -432,6 +442,57 @@ fn a_settings_file_the_check_cannot_read_is_not_written_over() {
             newer
         );
     }
+}
+
+#[test]
+fn a_settings_file_that_is_not_utf8_is_reported_and_replaced_on_save() {
+    let (_dir, store) = new_store();
+    fs::create_dir_all(store.folder()).unwrap();
+    let mut utf16 = vec![0xFF, 0xFE];
+    utf16.extend(r#"{"formatVersion":2}"#.encode_utf16().flat_map(u16::to_le_bytes));
+    for file in [BUS_SETTINGS_FILE, ROUTING_FILE] {
+        fs::write(store.folder().join(file), &utf16).unwrap();
+    }
+
+    let buses = store.load_bus_settings();
+    assert_eq!(buses.settings, BusSettings::new());
+    assert!(
+        matches!(buses.error, Some(SettingsError::NotText { .. })),
+        "{:?}",
+        buses.error
+    );
+    let routing = store.load_routing();
+    assert_eq!(routing.routing, RoutingFile::new());
+    assert!(
+        matches!(routing.error, Some(SettingsError::NotText { .. })),
+        "{:?}",
+        routing.error
+    );
+    for file in [BUS_SETTINGS_FILE, ROUTING_FILE] {
+        assert_eq!(
+            fs::read(store.folder().join(file)).unwrap(),
+            utf16,
+            "left on load"
+        );
+    }
+
+    store.save_bus_settings(&some_settings()).expect("replaced");
+    store.save_routing(&some_routing()).expect("replaced");
+    assert_eq!(store.load_bus_settings().settings, some_settings());
+    assert_eq!(store.load_routing().routing, some_routing());
+}
+
+#[test]
+fn a_refused_save_creates_no_folder() {
+    let (dir, store) = new_store();
+    let mut settings = some_settings();
+    settings.master_volume = Volume::from_db(f64::NAN);
+    let error = store
+        .save_bus_settings(&settings)
+        .expect_err("JSON cannot hold NaN");
+    assert!(matches!(error, SettingsError::Format { .. }), "{error:?}");
+    assert!(!store.folder().exists());
+    assert!(!dir.path().join("config").exists(), "nor its parents");
 }
 
 #[test]

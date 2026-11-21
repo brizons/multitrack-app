@@ -841,6 +841,13 @@ pub(crate) fn read_folder_file(folder: &Path, file: &str) -> Result<String, Setl
             path,
             max_bytes: MAX_SETLIST_FILE_BYTES,
         },
+        ConfinedReadError::NotUtf8 => SetlistError::Read {
+            path,
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            ),
+        },
         ConfinedReadError::Io(source) => SetlistError::Read { path, source },
     })
 }

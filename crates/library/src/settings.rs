@@ -26,7 +26,9 @@ use crate::{ConfinedReadError, read_confined, write_file_atomically};
 pub const MAX_SETTINGS_FILE_BYTES: u64 = 1 << 20;
 
 /// Why a settings file (`mix.json`, the bus settings or the routing) could
-/// not be read or written. Nothing on disk is changed when one is returned.
+/// not be read or written. Nothing on disk is changed when one is returned,
+/// except that a save whose write fails may leave the configuration folder it
+/// created for that write.
 #[derive(Debug, Error)]
 pub enum SettingsError {
     /// The song folder or the configuration folder cannot be opened or
@@ -61,6 +63,13 @@ pub enum SettingsError {
         path: PathBuf,
         /// [`MAX_SETTINGS_FILE_BYTES`].
         max_bytes: u64,
+    },
+    /// The file is not UTF-8 text, so it is not JSON any version of this app
+    /// wrote; a save replaces it.
+    #[error("{} is not UTF-8 text, so it is not a settings file", path.display())]
+    NotText {
+        /// The file.
+        path: PathBuf,
     },
     /// The file cannot be read.
     #[error("cannot read {}: {source}", path.display())]
@@ -169,6 +178,7 @@ fn read_error(folder: &Path, path: PathBuf, error: ConfinedReadError) -> Setting
             path,
             max_bytes: MAX_SETTINGS_FILE_BYTES,
         },
+        ConfinedReadError::NotUtf8 => SettingsError::NotText { path },
         ConfinedReadError::Io(source) => SettingsError::Read { path, source },
     }
 }
@@ -201,11 +211,12 @@ pub(crate) fn write_settings<T>(
 }
 
 /// The text now at `file` inside `folder` (canonical), for the version check
-/// before a write: `None` when nothing there can hold settings (no entry, a
-/// dangling link, a link out of the folder, a FIFO or a folder), which the
-/// write replaces without losing any (a folder then fails to be replaced).
-/// A file that is there but cannot be read (no permission, too large, any
-/// other read error) is [`SettingsError::UncheckedVersion`].
+/// before a write: `None` when nothing there can hold settings this app wrote
+/// (no entry, a dangling link, a link out of the folder, a FIFO, a folder, or
+/// a file that is not UTF-8), which the write replaces without losing any (a
+/// folder then fails to be replaced). A file that is there but cannot be read
+/// (no permission, too large, any other read error) is
+/// [`SettingsError::UncheckedVersion`].
 fn current_text(folder: &Path, file: &str) -> Result<Option<String>, SettingsError> {
     let path = folder.join(file);
     let unchecked = |source| SettingsError::UncheckedVersion {
@@ -224,7 +235,11 @@ fn current_text(folder: &Path, file: &str) -> Result<Option<String>, SettingsErr
     }
     match read_confined(folder, file, MAX_SETTINGS_FILE_BYTES) {
         Ok(text) => Ok(Some(text)),
-        Err(ConfinedReadError::Outside | ConfinedReadError::NotAFile) => Ok(None),
+        // JSON is UTF-8, so a file that is not was never written by any
+        // version of this app: like a malformed file, it is replaced.
+        Err(
+            ConfinedReadError::Outside | ConfinedReadError::NotAFile | ConfinedReadError::NotUtf8,
+        ) => Ok(None),
         Err(ConfinedReadError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(unchecked(read_error(folder, path.clone(), error))),
     }

@@ -232,6 +232,33 @@ fn a_mix_larger_than_the_limit_is_not_read() {
     );
 }
 
+/// A UTF-16 file: a byte-order mark, then `{"formatVersion":2}` in UTF-16LE.
+fn utf16_file() -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend(r#"{"formatVersion":2}"#.encode_utf16().flat_map(u16::to_le_bytes));
+    bytes
+}
+
+#[test]
+fn a_mix_that_is_not_utf8_is_reported_and_replaced_when_the_mix_changes() {
+    let (_dir, folder, song) = song_folder();
+    fs::write(folder.join(MIX_FILE), utf16_file()).unwrap();
+
+    let read = read_mix(&folder, &song);
+    assert_eq!(read.mix, MixFile::new(), "the song plays with the defaults");
+    assert!(
+        matches!(&read.error, Some(SettingsError::NotText { path }) if path.ends_with(MIX_FILE)),
+        "{:?}",
+        read.error
+    );
+    assert_eq!(fs::read(folder.join(MIX_FILE)).unwrap(), utf16_file());
+
+    // JSON is UTF-8, so no version of this app wrote it: a save replaces it.
+    write_mix(&folder, &a_mix()).expect("replaced");
+    assert_eq!(read_mix(&folder, &song).mix, a_mix());
+    assert_eq!(entries(&folder), [MIX_FILE, MANIFEST_FILE]);
+}
+
 #[test]
 fn a_failed_write_leaves_no_temporary_file_and_the_folder_as_it_was() {
     let (_dir, folder, _song) = song_folder();
@@ -314,6 +341,13 @@ mod unix {
         let (_dir, folder, _song) = song_folder();
         fs::write(folder.join(MIX_FILE), r#"{"formatVersion":2}"#).unwrap();
         fs::set_permissions(folder.join(MIX_FILE), fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(folder.join(MIX_FILE)).is_ok() {
+            fs::set_permissions(folder.join(MIX_FILE), fs::Permissions::from_mode(0o644)).unwrap();
+            eprintln!(
+                "note: mode 0o000 does not block reads here (root or CAP_DAC_OVERRIDE); skipping"
+            );
+            return;
+        }
         let result = write_mix(&folder, &a_mix());
         fs::set_permissions(folder.join(MIX_FILE), fs::Permissions::from_mode(0o644)).unwrap();
         assert!(result.is_err());
