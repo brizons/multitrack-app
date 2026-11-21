@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use domain::{DEFAULT_ARRANGEMENT_ID, DEFAULT_SEAM_CROSSFADE};
 use engine::live::{
-    self, DECLICK_FRAMES, DEFAULT_FADE_SECONDS, Deck, DeckController, FadeState, Handoff, JumpKind,
-    JumpTiming, PANIC_MILLISECONDS, Player, SendError, Transport,
+    self, DECLICK_FRAMES, DEFAULT_FADE_SECONDS, Deck, DeckController, DeckStatus, FadeState,
+    Handoff, JumpKind, JumpTiming, PANIC_MILLISECONDS, Player, SendError, Transport,
 };
 use library::{DiskMonitor, Gate};
 use rtrb::Consumer;
@@ -892,6 +892,17 @@ impl Session {
     /// item to start with.
     pub(crate) fn carried(&self) -> (JumpTiming, Duration) {
         (self.jump_timing, self.fade_duration)
+    }
+
+    /// Messages the deck controller accepted so far: a report that has
+    /// applied as many saw them all.
+    pub(crate) fn sent(&self) -> u64 {
+        self.sent
+    }
+
+    /// The deck as the newest report describes it.
+    pub(crate) fn newest_deck(&mut self) -> DeckStatus {
+        self.reports.read().deck
     }
 
     /// Whether the newest report has the current item's transport running.

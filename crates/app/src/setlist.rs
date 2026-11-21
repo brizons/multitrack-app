@@ -10,7 +10,7 @@ use domain::{
     CROSSFADE_SECONDS, ClickItem, SetlistItem, SetlistValidationError, SongItem, SongLookup,
     Transition,
 };
-use engine::live::Handoff;
+use engine::live::{DeckStatus, Handoff};
 use library::{DiskMonitor, Library, SetlistError, SetlistSongs};
 use thiserror::Error;
 
@@ -119,6 +119,19 @@ pub enum SetlistCommand {
     /// Selects the item at this index of [`SetlistInfo::items`]; selecting
     /// the current item stops it at its start.
     Select(usize),
+    /// Moves the item at index `from` of [`SetlistInfo::items`] to `to`,
+    /// while the setlist plays too: the item playing plays on without a
+    /// cut, every index follows its item, and when the item after the
+    /// current one changes, the one cued is dropped and the new next item
+    /// is prepared and cued as any next item is. Moving an item to its own
+    /// place does nothing. The session writes no file: the shell saves the
+    /// new order, which [`SetlistSession::info`] holds.
+    Move {
+        /// Index of the item moved.
+        from: usize,
+        /// Its index once moved.
+        to: usize,
+    },
 }
 
 /// The state of a setlist session, for a shell to draw;
@@ -281,6 +294,12 @@ pub enum SetlistCommandError {
         /// Why.
         error: String,
     },
+    /// A move came while an item hands over to the next one: a crossfade
+    /// runs, or the deck started the next item and the session has not
+    /// followed it yet ([`SetlistSession::poll`] does). Try again once it
+    /// has.
+    #[error("the setlist is moving on to the next item; it can be reordered once it has")]
+    HandingOver,
 }
 
 /// How a playable item is built.
@@ -317,6 +336,14 @@ struct Staged {
     tag: u64,
     info: SongInfo,
     monitor: DiskMonitor,
+}
+
+/// A cued item the session sent back, until a report shows the deck took
+/// that message: the deck may have handed over to it first.
+struct Withdrawn {
+    staged: Staged,
+    /// Messages sent once the withdrawal was.
+    sent: u64,
 }
 
 /// An item prepared on the control thread, not handed over yet.
@@ -366,6 +393,7 @@ impl PreparedSetlist {
             options,
             current: first,
             cued: None,
+            withdrawn: None,
             pending: None,
             reopen: None,
             play_after_reopen: false,
@@ -439,6 +467,11 @@ impl PreparedSetlist {
 /// off ends it at the bar line, and its transition follows. The jump timing
 /// and fade duration the operator chose carry over to the items that
 /// follow.
+///
+/// [`SetlistCommand::Move`] reorders the setlist while it plays: the item
+/// playing goes on, and the next item is cued again when it changed. A move
+/// is refused while a crossfade runs or the deck has started the next item
+/// before a poll followed it ([`SetlistCommandError::HandingOver`]).
 pub struct SetlistSession {
     session: Session,
     info: SetlistInfo,
@@ -446,6 +479,8 @@ pub struct SetlistSession {
     options: SessionOptions,
     current: usize,
     cued: Option<Staged>,
+    /// The item cued last, sent back; never set while one is cued.
+    withdrawn: Option<Withdrawn>,
     pending: Option<Pending>,
     /// An item at another rate waiting for the current one to stop before
     /// the device reopens.
@@ -547,6 +582,11 @@ impl SetlistSession {
         monitors.extend(self.fading.clone());
         monitors.extend(self.cued.iter().map(|staged| staged.monitor.clone()));
         monitors.extend(
+            self.withdrawn
+                .iter()
+                .map(|withdrawn| withdrawn.staged.monitor.clone()),
+        );
+        monitors.extend(
             self.pending
                 .iter()
                 .chain(&self.reopen)
@@ -590,6 +630,7 @@ impl SetlistSession {
             SetlistCommand::Previous => self
                 .previous_playable(target)
                 .ok_or(SetlistCommandError::NoPrevious)?,
+            SetlistCommand::Move { from, to } => return self.move_item(from, to),
             SetlistCommand::Select(item) => {
                 if item >= self.plans.len() {
                     return Err(SetlistCommandError::OutOfRange {
@@ -615,7 +656,11 @@ impl SetlistSession {
     /// [`crate::Session::poll`] does for the current item.
     pub fn poll(&mut self) -> SetlistSnapshot {
         let (report, now) = self.session.begin_poll();
-        self.follow_deck(&report.deck, report.status().transport.is_running());
+        self.follow_deck(
+            &report.deck,
+            report.applied,
+            report.status().transport.is_running(),
+        );
         self.keep_next_ready();
         let song = self.session.end_poll(&report, now);
         let next = self.next_playable(self.current);
@@ -646,20 +691,27 @@ impl SetlistSession {
         }
     }
 
-    /// Follows what the deck did since the last poll: a handoff to the cued
-    /// item, an item that played to its end, a stop that a reopen waits
-    /// for.
-    fn follow_deck(&mut self, deck: &engine::live::DeckStatus, running: bool) {
+    /// Follows what the deck did since the last poll, with `applied`
+    /// messages taken: a handoff to the cued item, an item that played to
+    /// its end, a stop that a reopen waits for.
+    fn follow_deck(&mut self, deck: &DeckStatus, applied: u64, running: bool) {
         if self
             .cued
             .as_ref()
             .is_some_and(|staged| staged.tag == deck.item)
             && let Some(staged) = self.cued.take()
         {
-            self.blend_from = deck.blend.map(|_| self.current);
-            self.fading = deck.blend.map(|_| self.session.disk_monitor());
-            self.session.bind(staged.info, staged.monitor, staged.tag);
-            self.current = staged.index;
+            self.follow_hand_over(staged, deck);
+        }
+        // The deck handed over to the item sent back before it took that
+        // message: that item plays, and the setlist follows it. Once the
+        // deck took the message, nothing hands over to it any more.
+        if let Some(withdrawn) = self.withdrawn.take() {
+            if withdrawn.staged.tag == deck.item {
+                self.follow_hand_over(withdrawn.staged, deck);
+            } else if applied < withdrawn.sent {
+                self.withdrawn = Some(withdrawn);
+            }
         }
         if deck.blend.is_none() {
             self.blend_from = None;
@@ -677,11 +729,22 @@ impl SetlistSession {
             let tag = self.tag();
             if self.session.reopen_with(pending.item, tag).is_ok() {
                 self.current = index;
+                self.withdrawn = None;
                 if play {
                     let _ = self.session.send(Command::Play);
                 }
             }
         }
+    }
+
+    /// The deck plays `staged` now, at the end of the current item: the
+    /// setlist follows it, and a crossfade under way fades the current item
+    /// out.
+    fn follow_hand_over(&mut self, staged: Staged, deck: &DeckStatus) {
+        self.blend_from = deck.blend.map(|_| self.current);
+        self.fading = deck.blend.map(|_| self.session.disk_monitor());
+        self.session.bind(staged.info, staged.monitor, staged.tag);
+        self.current = staged.index;
     }
 
     /// The current item played to its end: its transition decides what
@@ -762,11 +825,68 @@ impl SetlistSession {
                 self.current = target;
             }
         }
+        // The deck plays the item selected, whatever it handed over to.
+        self.withdrawn = None;
         self.blend_from = None;
         if play {
             self.session.send(Command::Play)?;
         }
         Ok(())
+    }
+
+    /// Moves item `from` to `to` ([`SetlistCommand::Move`]): every index
+    /// follows its item, and the next item is cued again if it changed.
+    fn move_item(&mut self, from: usize, to: usize) -> Result<(), SetlistCommandError> {
+        let items = self.plans.len();
+        if let Some(item) = [from, to].into_iter().find(|&item| item >= items) {
+            return Err(SetlistCommandError::OutOfRange { item, items });
+        }
+        if from == to {
+            return Ok(());
+        }
+        if self.handing_over() {
+            return Err(SetlistCommandError::HandingOver);
+        }
+        let plan = self.plans.remove(from);
+        self.plans.insert(to, plan);
+        let item = self.info.items.remove(from);
+        self.info.items.insert(to, item);
+        predict_fallbacks(&self.plans, &mut self.info.items, self.info.sample_rate);
+        let indexes = [
+            Some(&mut self.current),
+            self.cued.as_mut().map(|staged| &mut staged.index),
+            self.withdrawn
+                .as_mut()
+                .map(|withdrawn| &mut withdrawn.staged.index),
+            self.pending.as_mut().map(|pending| &mut pending.index),
+            self.reopen.as_mut().map(|pending| &mut pending.index),
+            self.failed.as_mut(),
+            self.blend_from.as_mut(),
+            self.problem.as_mut().map(|problem| match problem {
+                SetlistProblem::Prepare { item, .. }
+                | SetlistProblem::LateLink { item }
+                | SetlistProblem::Transition { item, .. } => item,
+            }),
+        ];
+        for index in indexes.into_iter().flatten() {
+            *index = moved_index(*index, from, to);
+        }
+        self.keep_next_ready();
+        Ok(())
+    }
+
+    /// Whether an item is handing over to the next one: a crossfade runs,
+    /// or the deck plays an item cued (or just sent back) that the session
+    /// has not followed yet.
+    fn handing_over(&mut self) -> bool {
+        let deck = self.session.newest_deck();
+        let unfollowed = self
+            .cued
+            .as_ref()
+            .into_iter()
+            .chain(self.withdrawn.as_ref().map(|withdrawn| &withdrawn.staged))
+            .any(|staged| staged.tag == deck.item);
+        self.blend_from.is_some() || deck.blend.is_some() || unfollowed
     }
 
     /// Prepares the next playable item ahead and cues it once its start is
@@ -781,14 +901,17 @@ impl SetlistSession {
             self.failed = None;
         }
         // A refused uncue keeps the record, so the setlist still follows
-        // that item and cues no second one; the next poll tries again.
+        // that item and cues no second one; the next poll tries again. One
+        // the deck took is kept as withdrawn until a report shows the deck
+        // applied it, since the deck may hand over to the item first.
         if self
             .cued
             .as_ref()
             .is_some_and(|staged| Some(staged.index) != want)
             && self.session.uncue().is_ok()
         {
-            self.cued = None;
+            let sent = self.session.sent();
+            self.withdrawn = self.cued.take().map(|staged| Withdrawn { staged, sent });
         }
         if let Some(pending) = &self.pending
             && (Some(pending.index) != want
@@ -811,6 +934,10 @@ impl SetlistSession {
                     return;
                 }
             }
+        }
+        // Nothing is cued until the deck took the last item sent back.
+        if self.withdrawn.is_some() {
+            return;
         }
         let rate = self.session.sample_rate();
         let ready = self.pending.as_mut().is_some_and(|pending| {
@@ -913,6 +1040,19 @@ impl fmt::Debug for SetlistSession {
             .field("name", &self.info.name)
             .field("current", &self.current)
             .finish_non_exhaustive()
+    }
+}
+
+/// The index of the item at `index` once item `from` moved to `to`.
+fn moved_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < to && index > from && index <= to {
+        index - 1
+    } else if to < from && index >= to && index < from {
+        index + 1
+    } else {
+        index
     }
 }
 
