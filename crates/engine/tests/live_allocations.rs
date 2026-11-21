@@ -262,11 +262,28 @@ fn mixer_gains_routing_changes_and_32_channels_allocate_nothing() {
             },
         ),
         (40, Command::SetRouting(spread)),
+        // Changes in quick succession restart from the blend heard.
+        (41, Command::SetRouting(Routes::STEREO)),
+        (42, Command::SetRouting(spread)),
         (
             60,
             Command::SetStemBus {
                 stem: 1,
                 bus: Bus::Vocals,
+            },
+        ),
+        (
+            61,
+            Command::SetStemBus {
+                stem: 1,
+                bus: Bus::Drums,
+            },
+        ),
+        (
+            62,
+            Command::SetStemBus {
+                stem: 1,
+                bus: Bus::Guitars,
             },
         ),
         (80, Command::SetClickGain(Gain::new(0.25))),

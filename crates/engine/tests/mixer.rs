@@ -618,3 +618,128 @@ fn a_crossfade_on_eight_outputs_blends_every_output() {
         "B alone after the blend"
     );
 }
+
+/// The largest change between two frames on any output of `out`.
+fn largest_step(out: &[f32], channels: usize) -> (f32, usize, usize) {
+    let mut largest = (0.0f32, 0, 0);
+    for frame in 1..out.len() / channels {
+        for channel in 0..channels {
+            let step =
+                (at(out, channels, frame, channel) - at(out, channels, frame - 1, channel)).abs();
+            if step > largest.0 {
+                largest = (step, frame, channel);
+            }
+        }
+    }
+    largest
+}
+
+/// A drums stem at a constant 0.1 on both sides, and a silent click stem.
+fn steady_drums(channels: u16) -> (Player, Controller) {
+    let song = song(&[("drums", StemRole::Track), ("click", StemRole::Click)]);
+    player(
+        &song,
+        vec![dc("drums", StemRole::Track, 0.1), silent_click()],
+        channels,
+    )
+}
+
+#[test]
+fn routing_changes_in_quick_succession_never_step_more_than_one_ramp_allows() {
+    let (mut player, mut controller) = steady_drums(8);
+    controller.send(Command::Play).unwrap();
+    let mut out = render(&mut player, 8, 2_000);
+    let pair = |left| {
+        routes(
+            &[(
+                Bus::Drums,
+                Destination::Stereo {
+                    left,
+                    right: left + 1,
+                },
+            )],
+            None,
+        )
+    };
+    controller.send(Command::SetRouting(pair(3))).unwrap();
+    out.extend(render(&mut player, 8, 40));
+    controller.send(Command::SetRouting(pair(5))).unwrap();
+    out.extend(render(&mut player, 8, 80));
+    controller
+        .send(Command::SetRouting(Routes::STEREO))
+        .unwrap();
+    out.extend(render(&mut player, 8, 1_000));
+
+    let bound = 0.1 / RAMP as f32 * 1.001;
+    let (step, frame, channel) = largest_step(&out, 8);
+    assert!(
+        step <= bound,
+        "output {} steps by {step} at frame {frame}; one ramp allows {bound}",
+        channel + 1
+    );
+    let last = &out[out.len() - 8..];
+    assert_eq!(
+        last,
+        &[0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "back on 1/2"
+    );
+}
+
+#[test]
+fn moving_a_stem_to_another_bus_while_playing_crossfades_between_their_outputs() {
+    let (mut player, mut controller) = steady_drums(8);
+    player.set_routes(routes(
+        &[
+            (Bus::Drums, Destination::Stereo { left: 3, right: 4 }),
+            (Bus::Vocals, Destination::Stereo { left: 5, right: 6 }),
+        ],
+        None,
+    ));
+    controller.send(Command::Play).unwrap();
+    let mut out = render(&mut player, 8, 2_000);
+    controller
+        .send(Command::SetStemBus {
+            stem: 0,
+            bus: Bus::Vocals,
+        })
+        .unwrap();
+    out.extend(render(&mut player, 8, 40));
+    // Moved again before the first move ended.
+    controller
+        .send(Command::SetStemBus {
+            stem: 0,
+            bus: Bus::Guitars,
+        })
+        .unwrap();
+    out.extend(render(&mut player, 8, 1_000));
+
+    let bound = 0.1 / RAMP as f32 * 1.001;
+    let (step, frame, channel) = largest_step(&out, 8);
+    assert!(
+        step <= bound,
+        "output {} steps by {step} at frame {frame}; one ramp allows {bound}",
+        channel + 1
+    );
+    let last = &out[out.len() - 8..];
+    assert_eq!(
+        last,
+        &[0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "on Guitars, which plays on 1/2"
+    );
+}
+
+#[test]
+fn moving_a_stem_between_buses_both_on_1_2_changes_no_sample() {
+    let (song, stems) = noisy(24_000, 3);
+    let expected =
+        render_offline(&plan(&song, "default"), &stems, &MixSettings::default()).unwrap();
+    let (mut player, mut controller) = player(&song, stems, 2);
+    controller.send(Command::Play).unwrap();
+    let mut out = render(&mut player, 2, 5_000);
+    for (stem, bus) in [(0, Bus::Vocals), (1, Bus::Bass), (0, Bus::Guitars)] {
+        controller.send(Command::SetStemBus { stem, bus }).unwrap();
+        out.extend(render(&mut player, 2, 50));
+    }
+    out.extend(render(&mut player, 2, 24_000 - 5_150));
+    assert_eq!(bits(&out), bits(&expected));
+}

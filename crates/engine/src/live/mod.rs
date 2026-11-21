@@ -62,7 +62,7 @@ use std::fmt;
 
 use domain::DEFAULT_SEAM_CROSSFADE;
 
-pub use deck::{BlendStatus, Deck, DeckController, DeckFull, DeckStatus, Handoff};
+pub use deck::{BlendStatus, Deck, DeckController, DeckError, DeckFull, DeckStatus, Handoff};
 pub use player::Player;
 pub use source::{MemorySource, StemSource, memory_sources};
 pub use status::{ClickSource, FadeState, FadeStatus, JumpKind, QueuedJump, Status, Transport};

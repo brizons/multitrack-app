@@ -77,6 +77,42 @@ impl fmt::Display for DeckFull {
 
 impl std::error::Error for DeckFull {}
 
+/// Why the deck refused a player ([`DeckController::cue`],
+/// [`DeckController::select`]); the player is dropped on the calling thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeckError {
+    /// The message queue is full ([`DeckFull`]).
+    Full,
+    /// The player renders another number of output channels than the deck:
+    /// every player of a deck renders the same.
+    ChannelMismatch {
+        /// The deck's output channels.
+        deck: usize,
+        /// The player's.
+        player: usize,
+    },
+}
+
+impl fmt::Display for DeckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => DeckFull.fmt(f),
+            Self::ChannelMismatch { deck, player } => write!(
+                f,
+                "the player renders {player} output channels and the deck {deck}; every player of a deck renders the same"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeckError {}
+
+impl From<DeckFull> for DeckError {
+    fn from(_: DeckFull) -> Self {
+        Self::Full
+    }
+}
+
 enum Message {
     Command(Command),
     CuedCommand(Command),
@@ -616,17 +652,15 @@ impl DeckController {
     /// `handoff`; a cued item already there comes back. The player should
     /// have the audio at its start buffered ([`Player::playhead_ready`]),
     /// since the deck starts it without waiting.
-    ///
-    /// # Panics
-    ///
-    /// When `player` renders another channel count than the deck's.
-    pub fn cue(&mut self, player: Player, item: u64, handoff: Handoff) -> Result<(), DeckFull> {
-        self.check_channels(&player);
-        self.push(Message::Cue {
+    /// A player rendering another channel count than the deck is refused
+    /// ([`DeckError::ChannelMismatch`]).
+    pub fn cue(&mut self, player: Player, item: u64, handoff: Handoff) -> Result<(), DeckError> {
+        self.check_channels(&player)?;
+        Ok(self.push(Message::Cue {
             player: Box::new(player),
             item,
             handoff,
-        })
+        })?)
     }
 
     /// Queues `command` for the cued item only, such as its stem gains
@@ -647,16 +681,14 @@ impl DeckController {
 
     /// Makes `player` the current item as `item`, stopped at its start; the
     /// current item leaves with its stop ramp.
-    ///
-    /// # Panics
-    ///
-    /// When `player` renders another channel count than the deck's.
-    pub fn select(&mut self, player: Player, item: u64) -> Result<(), DeckFull> {
-        self.check_channels(&player);
-        self.push(Message::Select {
+    /// A player rendering another channel count than the deck is refused
+    /// ([`DeckError::ChannelMismatch`]).
+    pub fn select(&mut self, player: Player, item: u64) -> Result<(), DeckError> {
+        self.check_channels(&player)?;
+        Ok(self.push(Message::Select {
             player: Box::new(player),
             item,
-        })
+        })?)
     }
 
     /// Makes the cued item current, stopped at its start; the current item
@@ -672,12 +704,15 @@ impl DeckController {
         self.returns.pop().ok().map(|player| *player)
     }
 
-    fn check_channels(&self, player: &Player) {
-        assert_eq!(
-            player.channels(),
-            self.channels,
-            "every player of a deck renders the same output channels"
-        );
+    fn check_channels(&self, player: &Player) -> Result<(), DeckError> {
+        if player.channels() == self.channels {
+            Ok(())
+        } else {
+            Err(DeckError::ChannelMismatch {
+                deck: self.channels,
+                player: player.channels(),
+            })
+        }
     }
 
     fn push(&mut self, message: Message) -> Result<(), DeckFull> {
