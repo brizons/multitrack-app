@@ -183,6 +183,12 @@ pub enum Command {
     },
     /// Sets the master volume, for every song (F7.1).
     SetMasterVolume(Volume),
+    /// "Reset to song mix": every stem of the song back to its defaults,
+    /// at unity, unmuted, unsoloed and on its rules-table bus, ramped like
+    /// any mixer change. The bus and master settings stay; the mix file is
+    /// not written, so [`MixerView::mix_changed`] says whether this differs
+    /// from what it holds.
+    ResetMix,
 }
 
 /// What the transport is doing.
@@ -818,7 +824,8 @@ impl Session {
             | Command::SetStemBus { .. }
             | Command::SetBusVolume { .. }
             | Command::SetBusMute { .. }
-            | Command::SetMasterVolume(_) => return self.mixer(command),
+            | Command::SetMasterVolume(_)
+            | Command::ResetMix => return self.mixer(command),
         };
         self.forward(engine_command)?;
         if let Command::SetJumpTiming(timing) = command {
@@ -892,6 +899,7 @@ impl Session {
                 valid(volume)?;
                 self.buses.master_volume = volume;
             }
+            Command::ResetMix => self.mix.mix = domain::ArrangementMix::default(),
             _ => {}
         }
         self.send_gains()

@@ -714,3 +714,64 @@ fn each_setlist_item_plays_its_own_mix_and_bus_changes_reach_the_next_one() {
         Some(true)
     );
 }
+
+#[test]
+fn reset_to_song_mix_puts_every_stem_back_at_its_defaults_and_keeps_the_buses() {
+    let mut on_vocals = StemMix::default();
+    on_vocals.set_bus(Some(Bus::Vocals));
+    let soloed = StemMix {
+        solo: true,
+        ..StemMix::default()
+    };
+    let saved = mix_file(
+        "default",
+        &[
+            ("drums", at(-6.0)),
+            ("bass", muted()),
+            ("keys", soloed),
+            ("guitar", on_vocals),
+        ],
+    );
+    let dir = band(Some(&saved));
+    let fake = FakeOutput::new();
+    let mut session = open(dir.path(), &fake, options());
+    play(&mut session, &fake, 512);
+    for command in [
+        Command::SetStemVolume {
+            stem: PERCUSSION,
+            volume: Volume::from_db(-12.0),
+        },
+        Command::SetBusVolume {
+            bus: Bus::Drums,
+            volume: Volume::from_db(-6.0),
+        },
+        Command::SetMasterVolume(Volume::from_db(-3.0)),
+    ] {
+        session.send(command).unwrap();
+    }
+    let buses = session.bus_settings().clone();
+
+    session.send(Command::ResetMix).unwrap();
+
+    let mixer = session.poll().mixer;
+    assert_eq!(mixer.mix, ArrangementMix::default());
+    assert!(mixer.mix_changed, "the saved mix differs");
+    assert_eq!(mixer.buses, buses, "bus and master settings stay");
+    assert_eq!(
+        mixer.stems[GUITAR].bus,
+        Bus::Guitars,
+        "the rules table's bus"
+    );
+    let expected = gains_of(&ArrangementMix::default(), &buses);
+    let gains: Vec<f32> = mixer.stems.iter().map(|stem| stem.gain).collect();
+    assert_eq!(gains, expected);
+    let out = run(&mut session, &fake, 4 * RAMP);
+    assert_plays(&out, level(&expected));
+
+    // Saved, the arrangement's mix is forgotten.
+    let (folder, to_save) = session.mix_file().expect("a song item has a mix file");
+    assert_eq!(to_save.arrangement("default"), ArrangementMix::default());
+    write_mix(&folder, &to_save).unwrap();
+    session.mix_saved();
+    assert!(!session.poll().mixer.mix_changed);
+}
