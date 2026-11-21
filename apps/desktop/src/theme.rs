@@ -240,6 +240,10 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/openvamp-play.svg"),
     ),
     (
+        "icons/output.svg",
+        include_bytes!("../assets/icons/output.svg"),
+    ),
+    (
         "icons/panic.svg",
         include_bytes!("../assets/icons/panic.svg"),
     ),

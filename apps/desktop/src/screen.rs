@@ -23,13 +23,14 @@ use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
 use openvamp_desktop::library_page::{Dragged, LibraryPage, Opened, library_to_open};
 use openvamp_desktop::mixer::{MixerAction, MixerPage};
+use openvamp_desktop::output_page::{OutputAction, OutputPage};
 use openvamp_desktop::reorder::Half;
 use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
 use openvamp_desktop::view::PerformView;
 
 use crate::library_ui::{DraggedItem, DraggedSetlist};
 use crate::ui::DraggedTile;
-use crate::{library_ui, mixer_ui, ui};
+use crate::{library_ui, mixer_ui, output_ui, ui};
 
 /// How often the session is polled: about 30 Hz (Decision 3). The timer
 /// keeps running while the window is hidden, since a waiting play starts
@@ -60,6 +61,8 @@ pub struct Perform {
     settings: AudioSettings,
     /// The Mixer screen's own state.
     mixer: MixerPage,
+    /// The Audio output screen's own state.
+    output: OutputPage,
     _poll: Task<()>,
     _quit: Subscription,
     _deactivated: Subscription,
@@ -105,6 +108,7 @@ impl Perform {
             library_problem: None,
             settings: AudioSettings::load(ConfigStore::from_environment()),
             mixer: MixerPage::new(),
+            output: OutputPage::new(),
             _poll: poll,
             _quit: quit,
             _deactivated: deactivated,
@@ -369,6 +373,10 @@ impl Perform {
     /// is open yet.
     fn show_page(&mut self, page: Page) {
         self.page = page;
+        if page == Page::Output {
+            self.output
+                .set_devices(CpalOutput::new().devices().unwrap_or_default());
+        }
         if page != Page::Library {
             return;
         }
@@ -412,6 +420,26 @@ impl Perform {
             self.mixer.act(action, show, Instant::now());
             cx.notify();
         }
+    }
+
+    /// Carries out what an Audio output screen control asks for; nothing
+    /// while the question before ending the show is open. Another device
+    /// opens the song again on it.
+    pub fn output_act(&mut self, action: OutputAction, cx: &mut Context<Self>) {
+        if self.asking {
+            return;
+        }
+        let reopen = self
+            .output
+            .act(action, self.loaded.as_mut(), &mut self.settings);
+        if reopen && let Some(show) = &self.loaded {
+            let source = show.source();
+            self.open(&source);
+        }
+        if let Some(show) = &mut self.loaded {
+            show.poll();
+        }
+        cx.notify();
     }
 
     /// Saves bus and master changes that wait for their delay, before the
@@ -708,6 +736,10 @@ impl Render for Perform {
                 .into_any_element()
             }
             (Page::Perform, None) => ui::no_song(&self.problems, cx).into_any_element(),
+            (Page::Output, show) => {
+                let view = self.output.view(show.as_ref(), &self.settings);
+                output_ui::output(&view, cx).into_any_element()
+            }
             (Page::Mixer, show) => match self.mixer.view(show.as_ref()) {
                 Some(view) => mixer_ui::mixer(&view, cx).into_any_element(),
                 None => mixer_ui::no_mixer().into_any_element(),

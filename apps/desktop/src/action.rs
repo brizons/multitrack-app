@@ -52,6 +52,8 @@ pub enum Page {
     Library,
     /// The Mixer screen.
     Mixer,
+    /// The Audio output screen.
+    Output,
 }
 
 /// What the screen's controls and keys ask the screen for.

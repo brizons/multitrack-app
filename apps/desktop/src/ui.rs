@@ -68,7 +68,7 @@ pub fn main() -> Div {
 }
 
 /// The side navigation of the design canvas, with the screens that exist:
-/// Perform, Library and Mixer.
+/// Perform, Library and Mixer, and Audio output at the bottom.
 pub fn nav(page: Page, cx: &mut Context<Perform>) -> impl IntoElement {
     let item = |id: &'static str, name: &'static str, target: Page, cx: &mut Context<Perform>| {
         let (bg, fg) = if page == target {
@@ -97,6 +97,8 @@ pub fn nav(page: Page, cx: &mut Context<Perform>) -> impl IntoElement {
         .child(item("nav-perform", "perform", Page::Perform, cx))
         .child(item("nav-library", "library", Page::Library, cx))
         .child(item("nav-mixer", "mixer", Page::Mixer, cx))
+        .child(div().flex_1())
+        .child(item("nav-output", "output", Page::Output, cx))
 }
 
 /// Covers the whole screen while the question before ending the show is
