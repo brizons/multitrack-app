@@ -7,8 +7,8 @@ use std::mem;
 use std::path::PathBuf;
 
 use domain::{
-    CROSSFADE_SECONDS, ClickItem, SetlistItem, SetlistValidationError, SongItem, SongLookup,
-    Transition,
+    CROSSFADE_SECONDS, ClickItem, Routing, SetlistItem, SetlistValidationError, SongItem,
+    SongLookup, Transition,
 };
 use engine::live::{DeckStatus, Handoff};
 use library::{DiskMonitor, Library, SetlistError, SetlistSongs};
@@ -601,6 +601,13 @@ impl SetlistSession {
                 .map(|pending| pending.item.monitor.clone()),
         );
         monitors
+    }
+
+    /// Plays `routing` from now on, as [`crate::Session::set_routing`]
+    /// does: the routing is the device's, so the current item, the cued one,
+    /// an item fading out and every item after them play with it.
+    pub fn set_routing(&mut self, routing: Routing) -> Result<(), RuntimeError> {
+        self.session.set_routing(routing)
     }
 
     /// Sends `command`. An error from the current item is also kept as

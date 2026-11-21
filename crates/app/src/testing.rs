@@ -149,6 +149,14 @@ impl FakeOutput {
         }
     }
 
+    /// From now on, the device with id `id` has `channels` outputs, as an
+    /// interface set up differently before it is plugged back in.
+    pub fn set_channels(&self, id: &str, channels: u16) {
+        for device in self.lock().devices.iter_mut().filter(|d| d.id == id) {
+            device.channels = channels;
+        }
+    }
+
     /// Puts the device with id `id` back.
     pub fn plug(&self, id: &str) {
         for device in self.lock().devices.iter_mut().filter(|d| d.id == id) {

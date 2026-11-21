@@ -68,6 +68,7 @@ mod error;
 mod item;
 mod output;
 mod renderer;
+mod routing;
 mod session;
 mod setlist;
 mod song;
@@ -83,8 +84,8 @@ pub use output::{
 };
 pub use renderer::AudioRenderer;
 pub use session::{
-    Command, DeviceStatus, FadeView, PreparedSong, QueuedView, Session, SessionOptions, Snapshot,
-    TransportState,
+    Command, DeviceStatus, FadeView, MixerView, PreparedSong, QueuedView, Session, SessionOptions,
+    Snapshot, TransportState,
 };
 pub use setlist::{
     BlendView, CLICK_ONLY_SAMPLE_RATE, ItemInfo, PreparedSetlist, RateFallback, SetlistCommand,
