@@ -80,9 +80,10 @@ impl AudioRenderer {
         (renderer, back)
     }
 
-    /// Fills `out` with interleaved stereo frames (a trailing odd sample is
-    /// left at 0.0) and publishes the session's state. Real-time safe: no
-    /// allocation, no lock, no I/O.
+    /// Fills `out` with interleaved frames of the channels the stream was
+    /// requested with ([`crate::OutputRequest::channels`]; a trailing partial
+    /// frame is left at 0.0) and publishes the session's state. Real-time
+    /// safe: no allocation, no lock, no I/O.
     pub fn render(&mut self, out: &mut [f32]) {
         match self.state.as_mut() {
             Some(state) => state.render(out),

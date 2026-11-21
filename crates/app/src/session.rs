@@ -343,6 +343,7 @@ impl PreparedSong {
             device: options.device.clone().map(DeviceChoice::Named),
             sample_rate: info.sample_rate,
             buffer_frames: options.buffer_frames,
+            channels: 2,
         };
         Self {
             info,
