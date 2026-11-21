@@ -19,10 +19,12 @@ use openvamp_desktop::action::{Intent, Page, UiAction, disarms_removal};
 use openvamp_desktop::ending::{Dialog, EndRequest, Ending, control_acts, end_request};
 use openvamp_desktop::hold::PanicHold;
 use openvamp_desktop::keys::{HeldKeys, KeyAction, KeyPress, Mods, Typed, is_panic_key, typed};
-use openvamp_desktop::library_page::{LibraryPage, Opened, library_to_open};
+use openvamp_desktop::library_page::{Dragged, LibraryPage, Opened, library_to_open};
+use openvamp_desktop::reorder::Half;
 use openvamp_desktop::show::{LoadedSetlist, Show, Source, close, replace};
 use openvamp_desktop::view::PerformView;
 
+use crate::library_ui::{DraggedItem, DraggedSetlist};
 use crate::{library_ui, ui};
 
 /// How often the session is polled: about 30 Hz (Decision 3). The timer
@@ -380,6 +382,46 @@ impl Perform {
         }
     }
 
+    /// A drag of `dragged` is over row `over` of its list, in its `half`.
+    pub fn library_drag_over(
+        &mut self,
+        dragged: Dragged,
+        over: usize,
+        half: Half,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(library) = &mut self.library {
+            library.drag_over(dragged, over, half);
+            cx.notify();
+        }
+    }
+
+    /// The drag of `dragged` was dropped on its list.
+    pub fn library_drop(&mut self, dragged: Dragged, cx: &mut Context<Self>) {
+        if let Some(library) = &mut self.library {
+            library.drop_dragged(dragged);
+        }
+        self.follow_library_moves();
+        cx.notify();
+    }
+
+    /// A drag left its list: its line goes until it is over a row again.
+    pub fn library_drag_left(&mut self, cx: &mut Context<Self>) {
+        if let Some(library) = &mut self.library
+            && library.cancel_drag()
+        {
+            cx.notify();
+        }
+    }
+
+    /// A drag ended anywhere but its list: nothing moves.
+    fn library_drag_cancelled(&mut self, cx: &mut Context<Self>) {
+        if let Some(library) = &mut self.library {
+            library.cancel_drag();
+            cx.notify();
+        }
+    }
+
     /// Opens the library folder `root` on the Library screen, with `file`
     /// in the editor when given.
     fn open_library(&mut self, root: &Path, file: Option<&str>, opened: Opened) {
@@ -556,6 +598,13 @@ impl Render for Perform {
             .on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(Self::key_up))
             .on_modifiers_changed(cx.listener(Self::modifiers_changed))
+            // A row dropped anywhere but its list moves nothing.
+            .on_drop(cx.listener(|screen, _: &DraggedItem, _, cx| {
+                screen.library_drag_cancelled(cx);
+            }))
+            .on_drop(cx.listener(|screen, _: &DraggedSetlist, _, cx| {
+                screen.library_drag_cancelled(cx);
+            }))
             .child(ui::nav(self.page, cx))
             .child(ui::main().child(body))
             .when(self.asking, |root| root.child(ui::shield()))

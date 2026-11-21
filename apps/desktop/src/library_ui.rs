@@ -5,14 +5,16 @@
 
 use domain::Transition;
 use gpui::{
-    AnyElement, Context, Div, ElementId, FontWeight, IntoElement, Stateful, div, prelude::*, px,
+    AnyElement, App, Bounds, Context, Div, DragMoveEvent, ElementId, Entity, FontWeight,
+    IntoElement, Pixels, Point, Render, SharedString, Stateful, Window, div, prelude::*, px,
 };
 use openvamp_desktop::action::Intent;
 use openvamp_desktop::catalog::{TRANSITIONS, transition_name};
 use openvamp_desktop::library_page::{
-    ClickDetails, EditorRow, EditorView, LibraryAction, LibraryView, RowDetails, SetlistRow,
-    SongDetails, SongRow, UnreadableRow,
+    ClickDetails, Dragged, EditorRow, EditorView, LibraryAction, LibraryView, RowDetails,
+    SetlistRow, SongDetails, SongRow, UnreadableRow,
 };
+use openvamp_desktop::reorder::{Half, half_at};
 
 use crate::screen::Perform;
 use crate::theme;
@@ -21,6 +23,69 @@ use crate::ui::{OneLine, button, chip_button, icon};
 /// An element id made of words and numbers, such as `arrangement-2-1`.
 fn id(name: String) -> ElementId {
     ElementId::Name(name.into())
+}
+
+/// An item of the editor being dragged by the pointer.
+pub(crate) struct DraggedItem {
+    index: usize,
+    label: SharedString,
+}
+
+/// A setlist of the list being dragged by the pointer.
+pub(crate) struct DraggedSetlist {
+    index: usize,
+    label: SharedString,
+}
+
+/// What follows the pointer while a row is dragged: its title, compactly.
+struct DragPreview {
+    label: SharedString,
+}
+
+impl Render for DragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(12.))
+            .py(px(6.))
+            .rounded(px(8.))
+            .bg(theme::raised())
+            .border_1()
+            .border_color(theme::accent())
+            .shadow_md()
+            .text_size(px(14.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme::text())
+            .child(self.label.clone())
+    }
+}
+
+fn drag_preview(label: &SharedString, cx: &mut App) -> Entity<DragPreview> {
+    let label = label.clone();
+    cx.new(|_| DragPreview { label })
+}
+
+/// Which half of the row with `bounds` the pointer at `position` is in,
+/// when it is over that row at all.
+fn half_under(bounds: &Bounds<Pixels>, position: Point<Pixels>) -> Option<Half> {
+    bounds.contains(&position).then(|| {
+        half_at(
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.height),
+            f32::from(position.y),
+        )
+    })
+}
+
+/// The line that shows where a dragged row would land: in the gap above
+/// a row, or below the last one.
+fn insertion_line() -> Div {
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .h(px(3.))
+        .rounded(px(2.))
+        .bg(theme::accent())
 }
 
 fn act(action: LibraryAction) -> Intent {
@@ -213,6 +278,7 @@ fn heading(name: &'static str, title: &'static str) -> impl IntoElement {
 
 /// The setlists of the library, the one in the editor marked.
 fn setlists(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
+    let insertion = view.setlist_insertion.filter(|_| cx.has_active_drag());
     panel()
         .w(px(280.))
         .flex_none()
@@ -244,10 +310,21 @@ fn setlists(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
                 .flex()
                 .flex_col()
                 .gap(px(8.))
+                .py(px(6.))
+                .on_drag_move(cx.listener(
+                    |screen, event: &DragMoveEvent<DraggedSetlist>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            screen.library_drag_left(cx);
+                        }
+                    },
+                ))
+                .on_drop(cx.listener(|screen, setlist: &DraggedSetlist, _, cx| {
+                    screen.library_drop(Dragged::Setlist(setlist.index), cx);
+                }))
                 .children(
                     view.setlists
                         .iter()
-                        .map(|row| setlist_row(row, view.setlists.len(), cx)),
+                        .map(|row| setlist_row(row, view.setlists.len(), insertion, cx)),
                 )
                 .children(
                     view.order_problem
@@ -282,7 +359,12 @@ fn setlists(view: &LibraryView, cx: &mut Context<Perform>) -> impl IntoElement {
 }
 
 /// A setlist of the list: the arrows move it, the rest selects it.
-fn setlist_row(row: &SetlistRow, rows: usize, cx: &mut Context<Perform>) -> AnyElement {
+fn setlist_row(
+    row: &SetlistRow,
+    rows: usize,
+    insertion: Option<usize>,
+    cx: &mut Context<Perform>,
+) -> AnyElement {
     let index = row.index;
     let step = |name: &'static str, enabled: bool, action, cx: &mut Context<Perform>| {
         let color = if enabled {
@@ -338,11 +420,38 @@ fn setlist_row(row: &SetlistRow, rows: usize, cx: &mut Context<Perform>) -> AnyE
                 .text_color(theme::text_muted())
                 .child(meta),
         );
+    // The whole row drags, the grip says so; the arrows stay for the
+    // keyboard and as a fallback.
     div()
+        .id(("setlist-drag", index))
+        .relative()
         .flex_none()
         .flex()
         .items_center()
         .gap(px(4.))
+        .cursor_grab()
+        .on_drag(
+            DraggedSetlist {
+                index,
+                label: row.name.clone().into(),
+            },
+            |dragged, _, _, cx| drag_preview(&dragged.label, cx),
+        )
+        .on_drag_move(cx.listener(
+            move |screen, event: &DragMoveEvent<DraggedSetlist>, _, cx| {
+                if let Some(half) = half_under(&event.bounds, event.event.position) {
+                    let from = event.drag(cx).index;
+                    screen.library_drag_over(Dragged::Setlist(from), index, half, cx);
+                }
+            },
+        ))
+        .when(insertion == Some(index), |row| {
+            row.child(insertion_line().top(px(-6.)))
+        })
+        .when(index + 1 == rows && insertion == Some(rows), |row| {
+            row.child(insertion_line().bottom(px(-6.)))
+        })
+        .child(icon("grip", theme::text_faint(), 14.))
         .child(
             div()
                 .flex()
@@ -411,6 +520,7 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                 .child("Pick a setlist, or create one with New."),
         );
     };
+    let insertion = view.insertion.filter(|_| cx.has_active_drag());
     let title: AnyElement = match &view.renaming {
         Some(name) => text_field(name, true, "Setlist name").into_any_element(),
         None => div()
@@ -506,6 +616,17 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                 .flex()
                 .flex_col()
                 .gap(px(8.))
+                .pt(px(6.))
+                .on_drag_move(cx.listener(
+                    |screen, event: &DragMoveEvent<DraggedItem>, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            screen.library_drag_left(cx);
+                        }
+                    },
+                ))
+                .on_drop(cx.listener(|screen, item: &DraggedItem, _, cx| {
+                    screen.library_drop(Dragged::Item(item.index), cx);
+                }))
                 .when(view.rows.is_empty(), |list| {
                     list.child(
                         div()
@@ -536,7 +657,7 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
                 .children(
                     view.rows
                         .iter()
-                        .map(|row| editor_row(row, view.rows.len(), cx)),
+                        .map(|row| editor_row(row, view.rows.len(), insertion, cx)),
                 )
                 .child(
                     div()
@@ -560,8 +681,8 @@ fn editor(view: Option<&EditorView>, cx: &mut Context<Perform>) -> impl IntoElem
 /// Narrowest the setlist's name in the editor's header gets beside the
 /// header's buttons.
 const HEADER_NAME_MIN: f32 = 140.;
-/// Width of the move arrows and the number.
-const NUMBER_WIDTH: f32 = 56.;
+/// Width of the grip, the move arrows and the number.
+const NUMBER_WIDTH: f32 = 64.;
 /// Gap between the columns of the item rows.
 const COLUMN_GAP: f32 = 10.;
 /// Where an item's problems and controls start: under its song.
@@ -601,13 +722,22 @@ fn remove_column<E: Styled>(element: E) -> E {
     element.w(px(32.)).flex_none()
 }
 
-fn editor_row(row: &EditorRow, rows: usize, cx: &mut Context<Perform>) -> AnyElement {
+fn editor_row(
+    row: &EditorRow,
+    rows: usize,
+    insertion: Option<usize>,
+    cx: &mut Context<Perform>,
+) -> AnyElement {
     let index = row.index;
     let (badge, transition_icon) = (
         if row.click { "metronome" } else { "note" },
         transition_icon(row.transition),
     );
+    // The whole row drags, the grip says so; the arrows stay for the
+    // keyboard and as a fallback.
     let mut item = div()
+        .id(("item-drag", index))
+        .relative()
         .flex_none()
         .flex()
         .flex_col()
@@ -615,7 +745,29 @@ fn editor_row(row: &EditorRow, rows: usize, cx: &mut Context<Perform>) -> AnyEle
         .px(px(10.))
         .py(px(8.))
         .rounded(px(10.))
-        .bg(theme::raised());
+        .bg(theme::raised())
+        .cursor_grab()
+        .on_drag(
+            DraggedItem {
+                index,
+                label: row.title.clone().into(),
+            },
+            |dragged, _, _, cx| drag_preview(&dragged.label, cx),
+        )
+        .on_drag_move(
+            cx.listener(move |screen, event: &DragMoveEvent<DraggedItem>, _, cx| {
+                if let Some(half) = half_under(&event.bounds, event.event.position) {
+                    let from = event.drag(cx).index;
+                    screen.library_drag_over(Dragged::Item(from), index, half, cx);
+                }
+            }),
+        )
+        .when(insertion == Some(index), |item| {
+            item.child(insertion_line().top(px(-6.)))
+        })
+        .when(index + 1 == rows && insertion == Some(rows), |item| {
+            item.child(insertion_line().bottom(px(-6.)))
+        });
     item = if row.selected {
         item.border_2().border_color(theme::text())
     } else {
@@ -644,6 +796,7 @@ fn editor_row(row: &EditorRow, rows: usize, cx: &mut Context<Perform>) -> AnyEle
                     .flex()
                     .items_center()
                     .gap(px(2.))
+                    .child(icon("grip", theme::text_faint(), 14.))
                     .child(
                         div()
                             .flex()
