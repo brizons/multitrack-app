@@ -978,8 +978,12 @@ fn strip_tile(item: &StripItem, cx: &mut Context<Perform>) -> AnyElement {
                             .text_color(theme::text_faint())
                             .child(item.number.clone()),
                     )
+                    // The title takes the room the number and tag leave: a
+                    // width from its own measurement could stay at the one
+                    // gpui 0.2.2 took first, before the tile had a width.
                     .child(
                         div()
+                            .flex_1()
                             .min_w_0()
                             .one_line()
                             .text_size(px(16.))
