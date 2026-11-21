@@ -82,10 +82,26 @@ impl Destination {
     /// Whether every output is from 1 to `outputs` and a pair uses two
     /// different outputs.
     pub fn fits(self, outputs: u16) -> bool {
-        let in_range = |output: u16| (1..=outputs).contains(&output);
+        self.problems(outputs).is_empty()
+    }
+
+    /// What keeps the destination from fitting a device with `outputs`
+    /// outputs, in order: each output outside 1 to `outputs`, once, then a
+    /// pair that uses one output twice. The one rule behind
+    /// [`Destination::fits`] and [`Routing::validate`].
+    fn problems(self, outputs: u16) -> Vec<DestinationProblem> {
+        let out_of_range = |output: u16| {
+            (!(1..=outputs).contains(&output)).then_some(DestinationProblem::OutOfRange(output))
+        };
         match self {
-            Self::Mono(output) => in_range(output),
-            Self::Stereo { left, right } => left != right && in_range(left) && in_range(right),
+            Self::Mono(output) => out_of_range(output).into_iter().collect(),
+            Self::Stereo { left, right } if left == right => out_of_range(left)
+                .into_iter()
+                .chain([DestinationProblem::SamePair(left)])
+                .collect(),
+            Self::Stereo { left, right } => {
+                [left, right].into_iter().filter_map(out_of_range).collect()
+            }
         }
     }
 
@@ -98,6 +114,15 @@ impl Destination {
             Self::Mono(1)
         }
     }
+}
+
+/// Why a destination does not fit a device ([`Destination::problems`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestinationProblem {
+    /// The output is 0 or above the device's output count.
+    OutOfRange(u16),
+    /// A stereo pair uses this output for both channels.
+    SamePair(u16),
 }
 
 impl TryFrom<Vec<u16>> for Destination {
@@ -308,40 +333,27 @@ impl Routing {
             .map(|(&bus, &destination)| (RouteTarget::Bus(bus), destination))
             .chain(self.master.map(|master| (RouteTarget::Master, master)));
         for (target, destination) in targets {
-            check_destination(target, destination, usable, &mut errors);
+            errors.extend(
+                destination
+                    .problems(usable)
+                    .into_iter()
+                    .map(|problem| match problem {
+                        DestinationProblem::OutOfRange(output) => RoutingError::OutputOutOfRange {
+                            target,
+                            output,
+                            outputs: usable,
+                        },
+                        DestinationProblem::SamePair(output) => {
+                            RoutingError::SameOutputPair { target, output }
+                        }
+                    }),
+            );
         }
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
         }
-    }
-}
-
-fn check_destination(
-    target: RouteTarget,
-    destination: Destination,
-    outputs: u16,
-    errors: &mut Vec<RoutingError>,
-) {
-    let mut seen = Vec::with_capacity(2);
-    for output in destination.outputs() {
-        if !seen.contains(&output) && !(1..=outputs).contains(&output) {
-            errors.push(RoutingError::OutputOutOfRange {
-                target,
-                output,
-                outputs,
-            });
-        }
-        seen.push(output);
-    }
-    if let Destination::Stereo { left, right } = destination
-        && left == right
-    {
-        errors.push(RoutingError::SameOutputPair {
-            target,
-            output: left,
-        });
     }
 }
 

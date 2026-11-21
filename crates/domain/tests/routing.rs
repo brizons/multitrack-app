@@ -412,3 +412,25 @@ fn routing_file_validation_names_each_device() {
         "device \"USB interface\": bus Drums goes to output 9, but the device has outputs 1 to 8"
     );
 }
+
+#[test]
+fn a_pair_on_one_missing_output_reports_the_output_once_and_the_pair() {
+    let mut routing = Routing::preset(8);
+    routing.buses.insert(Bus::Drums, pair(9, 9));
+    assert_eq!(
+        routing.validate(),
+        Err(vec![
+            RoutingError::OutputOutOfRange {
+                target: RouteTarget::Bus(Bus::Drums),
+                output: 9,
+                outputs: 8
+            },
+            RoutingError::SameOutputPair {
+                target: RouteTarget::Bus(Bus::Drums),
+                output: 9
+            },
+        ])
+    );
+    assert!(!pair(9, 9).fits(8) && !pair(3, 3).fits(8) && !Mono(0).fits(8));
+    assert!(pair(1, 8).fits(8) && Mono(8).fits(8));
+}
