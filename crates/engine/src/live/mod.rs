@@ -21,11 +21,19 @@
 //! the next position), so a streaming source can have the audio in memory in
 //! time.
 //!
+//! A [`Deck`] plays a setlist on one audio thread: its current player and a
+//! cued one, handed over sample-exactly at the current item's end (AutoLink)
+//! or blended linearly over its last frames (Crossfade); see the [`Deck`]
+//! docs. [`Player::set_end_fade`] fades an item's track stems out before its
+//! end, and [`Player::set_infinite_at_start`] keeps a click-only tile's bar
+//! repeating.
+//!
 //! Real-time rules: `process` allocates nothing, takes no locks, and does no
 //! I/O. Every buffer is sized at construction from the maximum buffer size,
 //! and every gain change (fade, click on/off, pause, stop, panic) ramps per
 //! frame.
 
+mod deck;
 mod player;
 mod ramp;
 mod source;
@@ -36,6 +44,7 @@ use std::fmt;
 
 use domain::DEFAULT_SEAM_CROSSFADE;
 
+pub use deck::{BlendStatus, Deck, DeckController, DeckFull, DeckStatus, Handoff};
 pub use player::Player;
 pub use source::{MemorySource, StemSource, memory_sources};
 pub use status::{ClickSource, FadeState, FadeStatus, JumpKind, QueuedJump, Status, Transport};

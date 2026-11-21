@@ -9,7 +9,9 @@
 //! [`live::Player`] plays the same song in real time, buffer by buffer, and
 //! takes live commands (jumps, loops, fade, panic) from a
 //! [`live::Controller`]. With no live command it produces the same samples as
-//! [`render_offline`] for the compiled plan.
+//! [`render_offline`] for the compiled plan. A [`live::Deck`] plays two
+//! players for a setlist and hands over from one to the next (AutoLink,
+//! Crossfade).
 //!
 //! Guide cues ([`domain::CueEvent`]) are not rendered yet: no voice samples
 //! exist, so the plan's cues are ignored. A `guide` stem plays as plain audio.

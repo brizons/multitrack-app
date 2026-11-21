@@ -67,6 +67,20 @@ impl Ramp {
         };
     }
 
+    /// Starts moving from the current level to `to` over exactly `frames`
+    /// frames (one when `frames` is 0 and the level changes), so the last
+    /// of them is exactly `to`.
+    pub(crate) fn retarget_over(&mut self, to: f32, frames: u64) {
+        let from = self.level();
+        let len = if from == to { 0 } else { frames.max(1) };
+        *self = Self {
+            from,
+            to,
+            len,
+            pos: 0,
+        };
+    }
+
     fn value(&self, pos: u64) -> f32 {
         if pos >= self.len {
             self.to

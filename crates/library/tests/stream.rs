@@ -638,3 +638,13 @@ fn a_deferred_jump_to_the_position_the_arrangement_enters_anyway_does_not_repeat
         "two choruses, then the verse"
     );
 }
+
+/// S3: a click-only tile streams nothing, and its monitor says so.
+#[test]
+fn a_default_disk_monitor_watches_no_thread_and_is_always_idle() {
+    let monitor = library::DiskMonitor::default();
+    assert!(!monitor.is_running());
+    assert!(monitor.is_idle());
+    assert!(monitor.wait_idle(std::time::Duration::ZERO));
+    assert_eq!(monitor.decode_errors(), 0);
+}

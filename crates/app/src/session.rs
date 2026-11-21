@@ -1,4 +1,5 @@
-//! A session: one song playing on one audio device.
+//! A session: one song, or the current item of a setlist, playing on one
+//! audio device.
 
 use std::mem;
 use std::path::Path;
@@ -6,15 +7,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use domain::{DEFAULT_ARRANGEMENT_ID, DEFAULT_SEAM_CROSSFADE};
-use engine::MixSettings;
 use engine::live::{
-    self, Controller, DECLICK_FRAMES, DEFAULT_FADE_SECONDS, FadeState, JumpKind, JumpTiming,
-    PANIC_MILLISECONDS, Player, PlayerConfig, SendError, Transport,
+    self, DECLICK_FRAMES, DEFAULT_FADE_SECONDS, Deck, DeckController, FadeState, Handoff, JumpKind,
+    JumpTiming, PANIC_MILLISECONDS, Player, SendError, Transport,
 };
-use library::{DiskMonitor, Gate, StreamConfig, StreamingSong, open_streaming};
+use library::{DiskMonitor, Gate};
 use rtrb::Consumer;
 
 use crate::error::{OpenError, RuntimeError};
+use crate::item::Item;
 use crate::output::{
     AudioOutput, DEFAULT_BUFFER_FRAMES, DeviceChoice, LossReason, MAX_BUFFER_FRAMES,
     MIN_BUFFER_FRAMES, OutputCheck, OutputError, OutputRequest, OutputStream, StreamHealth,
@@ -281,7 +282,11 @@ pub struct Session {
     request: OutputRequest,
     /// Name of the device the session plays on.
     device: String,
-    controller: Controller,
+    deck: DeckController,
+    /// The current item, as the deck knows it.
+    item: u64,
+    /// The jump timing last sent, carried over to the next setlist item.
+    jump_timing: JumpTiming,
     reports: triple_buffer::Output<Report>,
     monitor: DiskMonitor,
     link: Link,
@@ -292,8 +297,8 @@ pub struct Session {
     last_error: Option<RuntimeError>,
     decode_errors_seen: u64,
     deferral_seen: Option<(usize, u32)>,
-    /// Commands the controller accepted; a report that has applied as many
-    /// describes the playhead they left.
+    /// Messages the deck controller accepted; a report that has applied as
+    /// many describes the playhead they left.
     sent: u64,
 }
 
@@ -304,7 +309,7 @@ pub struct Session {
 /// [`Self::start`] opens the device once it is free.
 pub struct PreparedSong {
     info: SongInfo,
-    controller: Controller,
+    deck: DeckController,
     reports: triple_buffer::Output<Report>,
     monitor: DiskMonitor,
     state: Box<AudioState>,
@@ -314,6 +319,43 @@ pub struct PreparedSong {
 }
 
 impl PreparedSong {
+    /// `item` as the first item, `tag`, of a deck, on no device yet.
+    pub(crate) fn new(item: Item, tag: u64, options: &SessionOptions) -> Self {
+        let Item {
+            info,
+            player,
+            controller: _,
+            monitor,
+        } = item;
+        let (deck, controller) = Deck::new(player, tag, options.buffer_frames as usize);
+        let first = Report {
+            deck: deck.status(),
+            ready: false,
+            applied: 0,
+        };
+        let (input, reports) = triple_buffer::triple_buffer(&first);
+        let mut state = Box::new(AudioState {
+            deck,
+            reports: input,
+        });
+        state.publish();
+        let request = OutputRequest {
+            device: options.device.clone().map(DeviceChoice::Named),
+            sample_rate: info.sample_rate,
+            buffer_frames: options.buffer_frames,
+        };
+        Self {
+            info,
+            deck: controller,
+            reports,
+            monitor,
+            state,
+            request,
+            start_timeout: options.start_timeout,
+            reconnect_interval: options.reconnect_interval,
+        }
+    }
+
     /// The song and the arrangement it will play.
     pub fn song(&self) -> &SongInfo {
         &self.info
@@ -332,7 +374,7 @@ impl PreparedSong {
     pub fn start(self, mut output: Box<dyn AudioOutput>) -> Result<Session, OpenError> {
         let Self {
             info,
-            controller,
+            deck,
             reports,
             monitor,
             state,
@@ -363,7 +405,9 @@ impl PreparedSong {
             output,
             request,
             device: stream.info().device.clone(),
-            controller,
+            deck,
+            item: 0,
+            jump_timing: JumpTiming::default(),
             reports,
             monitor,
             link: Link::Streaming { stream, home },
@@ -398,75 +442,9 @@ impl Session {
     /// only the device itself can still refuse it in
     /// [`PreparedSong::start`].
     pub fn prepare(song_dir: &Path, options: SessionOptions) -> Result<PreparedSong, OpenError> {
-        let buffer_frames = options.buffer_frames;
-        if !(MIN_BUFFER_FRAMES..=MAX_BUFFER_FRAMES).contains(&buffer_frames) {
-            return Err(OpenError::BufferSize {
-                frames: buffer_frames,
-            });
-        }
-        // One value feeds both configurations, so the stream always keeps
-        // what the player's seams read (advisory A3).
-        let stream_config = StreamConfig {
-            seam_crossfade: options.seam_crossfade,
-            gate: options.disk_gate.clone(),
-            ..StreamConfig::default()
-        };
-        let StreamingSong {
-            song,
-            warnings,
-            sources,
-            monitor,
-            capacity,
-        } = open_streaming(song_dir, &stream_config)?;
-        let sample_rate = song.sample_rate();
-        if capacity.ahead_frames < u64::from(MAX_BUFFER_FRAMES) {
-            return Err(OpenError::RateTooLow {
-                sample_rate,
-                ahead_frames: capacity.ahead_frames,
-            });
-        }
-        let player_config = PlayerConfig {
-            sample_rate,
-            max_frames: buffer_frames as usize,
-            seam_crossfade: options.seam_crossfade,
-        };
-        let (player, controller) = Player::new(
-            &song,
-            &options.arrangement,
-            &MixSettings::default(),
-            &player_config,
-            sources,
-        )?;
-        let warnings = warnings.iter().map(ToString::to_string).collect();
-        let info = SongInfo::new(&song, &options.arrangement, warnings)
-            .expect("`Player::new` accepted the arrangement");
-
-        let first = Report {
-            status: player.status(),
-            ready: false,
-            applied: 0,
-        };
-        let (input, reports) = triple_buffer::triple_buffer(&first);
-        let mut state = Box::new(AudioState {
-            player,
-            reports: input,
-        });
-        state.publish();
-        let request = OutputRequest {
-            device: options.device.clone().map(DeviceChoice::Named),
-            sample_rate,
-            buffer_frames,
-        };
-        Ok(PreparedSong {
-            info,
-            controller,
-            reports,
-            monitor,
-            state,
-            request,
-            start_timeout: options.start_timeout,
-            reconnect_interval: options.reconnect_interval,
-        })
+        check_buffer(options.buffer_frames)?;
+        let item = Item::open_song(song_dir, &options.arrangement, &options)?;
+        Ok(PreparedSong::new(item, 0, &options))
     }
 
     /// The open song and the arrangement being played.
@@ -500,12 +478,26 @@ impl Session {
     /// jumps as [`Snapshot::last_error`]. Shells call it about 30 times a
     /// second; nothing advances between calls.
     pub fn poll(&mut self) -> Snapshot {
+        let (report, now) = self.begin_poll();
+        self.end_poll(&report, now)
+    }
+
+    /// The first half of [`Self::poll`]: drops the players the deck handed
+    /// back, watches the device, and reads the newest report.
+    pub(crate) fn begin_poll(&mut self) -> (Report, Instant) {
         let now = Instant::now();
+        while let Some(player) = self.deck.returned() {
+            drop(player);
+        }
         self.watch_device(now);
-        let report = *self.reports.read();
-        self.advance_start(&report, now);
-        self.watch_disk(&report);
-        self.snapshot(&report)
+        (*self.reports.read(), now)
+    }
+
+    /// The second half of [`Self::poll`], on the report the first half read.
+    pub(crate) fn end_poll(&mut self, report: &Report, now: Instant) -> Snapshot {
+        self.advance_start(report, now);
+        self.watch_disk(report);
+        self.snapshot(report)
     }
 
     fn dispatch(&mut self, command: Command) -> Result<(), RuntimeError> {
@@ -531,6 +523,9 @@ impl Session {
             Command::Panic => live::Command::Panic,
         };
         self.forward(engine_command)?;
+        if let Command::SetJumpTiming(timing) = command {
+            self.jump_timing = timing;
+        }
         if let Command::SetFadeDuration(duration) = command {
             let frames = self.fade_frames(duration).max(DECLICK_FRAMES);
             self.fade_duration =
@@ -558,7 +553,7 @@ impl Session {
         self.clear_error(|error| matches!(error, RuntimeError::StartTimeout { .. }));
         let report = *self.reports.read();
         let silent = matches!(
-            report.status.transport,
+            report.status().transport,
             Transport::Stopped | Transport::Paused
         );
         if silent && !self.can_start(&report) {
@@ -578,7 +573,7 @@ impl Session {
         let Some(start) = self.start else {
             return;
         };
-        if report.status.transport.is_running() {
+        if report.status().transport.is_running() {
             self.start = None;
             return;
         }
@@ -604,9 +599,19 @@ impl Session {
         report.ready && report.applied >= self.sent
     }
 
-    /// Queues `command` for the player and counts it.
+    /// Queues `command` for the current item and counts it. A jump target
+    /// is checked against the item's arrangement.
     fn push(&mut self, command: live::Command) -> Result<(), SendError> {
-        self.controller.send(command)?;
+        let positions = self.song.positions.len();
+        if let live::Command::QueueJump { position } = command
+            && position >= positions
+        {
+            return Err(SendError::UnknownPosition {
+                position,
+                positions,
+            });
+        }
+        self.deck.send(command)?;
         self.sent += 1;
         Ok(())
     }
@@ -642,11 +647,17 @@ impl Session {
                 positions,
             },
         })?;
+        self.apply_if_held();
+        Ok(())
+    }
+
+    /// While the device is lost the control thread holds the deck, so it
+    /// applies what was sent at once.
+    fn apply_if_held(&mut self) {
         if let Link::Held { state, .. } = &mut self.link {
-            state.player.process(&mut []);
+            state.deck.process(&mut []);
             state.publish();
         }
-        Ok(())
     }
 
     fn watch_device(&mut self, now: Instant) {
@@ -691,15 +702,15 @@ impl Session {
     /// back, so the pause ramp renders into a buffer nobody hears. A stop or
     /// a panic under way finishes the same way.
     fn pause_now(&mut self, state: &mut AudioState) {
-        state.player.process(&mut []);
+        state.deck.process(&mut []);
         let _ = self.push(live::Command::Pause);
         let max_frames = self.request.buffer_frames as usize;
         let mut scratch = vec![0.0f32; 2 * max_frames];
         let longest =
             u64::from(self.song.sample_rate) * PANIC_MILLISECONDS / 1_000 + DECLICK_FRAMES;
         for _ in 0..=longest.div_ceil(max_frames as u64) {
-            state.player.process(&mut scratch);
-            if !state.player.status().transport.is_running() {
+            state.deck.process(&mut scratch);
+            if !state.deck.status().current.transport.is_running() {
                 break;
             }
         }
@@ -782,7 +793,7 @@ impl Session {
     /// Records new decode failures, and new deferrals of the queued jump
     /// until the jump is over (see [`Snapshot::last_error`]).
     fn watch_disk(&mut self, report: &Report) {
-        let status = &report.status;
+        let status = report.status();
         let errors = self.monitor.decode_errors();
         if errors > self.decode_errors_seen {
             self.decode_errors_seen = errors;
@@ -807,7 +818,7 @@ impl Session {
     }
 
     fn snapshot(&self, report: &Report) -> Snapshot {
-        let status = &report.status;
+        let status = report.status();
         let transport = match status.transport {
             Transport::Stopped | Transport::Paused if self.start.is_some() => {
                 TransportState::Starting
@@ -862,6 +873,195 @@ impl Session {
             decode_errors: self.monitor.decode_errors(),
             last_error: self.last_error.clone(),
         }
+    }
+}
+
+/// What a setlist needs from the session it plays its items in.
+impl Session {
+    /// The current item, as the deck knows it.
+    pub(crate) fn item(&self) -> u64 {
+        self.item
+    }
+
+    /// The rate the output runs at.
+    pub(crate) fn sample_rate(&self) -> u32 {
+        self.request.sample_rate
+    }
+
+    /// The jump timing and fade duration the operator chose, for the next
+    /// item to start with.
+    pub(crate) fn carried(&self) -> (JumpTiming, Duration) {
+        (self.jump_timing, self.fade_duration)
+    }
+
+    /// Whether the newest report has the current item's transport running.
+    pub(crate) fn is_running(&mut self) -> bool {
+        self.reports.read().status().transport.is_running()
+    }
+
+    /// The deck plays item `item` now: the snapshot describes it with
+    /// `song`, and its disk is watched through `monitor`. A waiting play
+    /// and the problems that belonged to the item before end with it.
+    pub(crate) fn bind(&mut self, song: SongInfo, monitor: DiskMonitor, item: u64) {
+        self.song = song;
+        self.monitor = monitor;
+        self.item = item;
+        self.start = None;
+        self.decode_errors_seen = 0;
+        self.deferral_seen = None;
+        if matches!(
+            self.last_error,
+            Some(
+                RuntimeError::DecodeFailed { .. }
+                    | RuntimeError::JumpWaiting { .. }
+                    | RuntimeError::StartTimeout { .. }
+            )
+        ) {
+            self.last_error = None;
+        }
+    }
+
+    /// Cues `player` as item `item`, to follow the current one with
+    /// `handoff`.
+    pub(crate) fn cue(
+        &mut self,
+        player: Player,
+        item: u64,
+        handoff: Handoff,
+    ) -> Result<(), RuntimeError> {
+        let sent = self.deck.cue(player, item, handoff);
+        self.count(sent.is_ok(), "Cue")
+    }
+
+    /// Sends the cued item back.
+    pub(crate) fn uncue(&mut self) -> Result<(), RuntimeError> {
+        let sent = self.deck.uncue();
+        self.count(sent.is_ok(), "Uncue")
+    }
+
+    /// Makes `item` the current item as `tag`, stopped at its start; the
+    /// item playing so far leaves with its stop ramp.
+    pub(crate) fn select(&mut self, item: Item, tag: u64) -> Result<(), RuntimeError> {
+        let Item {
+            info,
+            player,
+            monitor,
+            ..
+        } = item;
+        let sent = self.deck.select(player, tag);
+        self.count(sent.is_ok(), "Select")?;
+        self.bind(info, monitor, tag);
+        Ok(())
+    }
+
+    /// Makes the cued item, `tag`, current, stopped at its start.
+    pub(crate) fn select_cued(
+        &mut self,
+        song: SongInfo,
+        monitor: DiskMonitor,
+        tag: u64,
+    ) -> Result<(), RuntimeError> {
+        let sent = self.deck.select_cued();
+        self.count(sent.is_ok(), "SelectCued")?;
+        self.bind(song, monitor, tag);
+        Ok(())
+    }
+
+    /// Counts a message the deck accepted, or reports the full queue.
+    fn count(&mut self, sent: bool, message: &str) -> Result<(), RuntimeError> {
+        if !sent {
+            let error = RuntimeError::QueueFull {
+                command: message.to_owned(),
+            };
+            self.last_error = Some(error.clone());
+            return Err(error);
+        }
+        self.sent += 1;
+        self.apply_if_held();
+        Ok(())
+    }
+
+    /// Plays `item` as `tag` at its own sample rate: makes `item` current,
+    /// closes the stream (the current item has stopped), and opens the same
+    /// device again at the new rate. A device that refuses is held as a lost
+    /// one, so the session keeps trying and says why
+    /// ([`RuntimeError::DeviceReopenFailed`]); choosing an item at a rate
+    /// the device takes brings it back.
+    ///
+    /// The item goes to the deck first: when the deck refuses it (its queue
+    /// is full), nothing else changes, so the session keeps describing and
+    /// playing the item it had at the rate it had, and the refusal is
+    /// returned and kept as [`Snapshot::last_error`].
+    pub(crate) fn reopen_with(&mut self, item: Item, tag: u64) -> Result<(), RuntimeError> {
+        let Item {
+            info,
+            player,
+            monitor,
+            ..
+        } = item;
+        let rate = info.sample_rate;
+        // Should the audio thread take it before the stream closes, the
+        // item waits there stopped: silent, whatever the rate.
+        let sent = self.deck.select(player, tag);
+        self.count(sent.is_ok(), "Select")?;
+        let state = match mem::replace(&mut self.link, Link::Lost) {
+            Link::Streaming { stream, home } => {
+                drop(stream);
+                take_back(home)
+            }
+            Link::Held { state, .. } => Some(state),
+            Link::Lost => None,
+        };
+        let Some(mut state) = state else {
+            self.last_error = Some(RuntimeError::PlayerLost);
+            return Err(RuntimeError::PlayerLost);
+        };
+        state.deck.process(&mut []);
+        state.publish();
+        self.bind(info, monitor, tag);
+        self.request.sample_rate = rate;
+        let now = Instant::now();
+        let (renderer, home) = AudioRenderer::new(state);
+        match self.output.open(&self.request, renderer) {
+            Ok(stream) => {
+                self.device = stream.info().device.clone();
+                self.link = Link::Streaming { stream, home };
+                self.clear_error(|error| {
+                    matches!(
+                        error,
+                        RuntimeError::DeviceLost { .. } | RuntimeError::DeviceReopenFailed { .. }
+                    )
+                });
+                Ok(())
+            }
+            Err(error) => {
+                let Some(state) = take_back(home) else {
+                    self.last_error = Some(RuntimeError::PlayerLost);
+                    return Err(RuntimeError::PlayerLost);
+                };
+                let absent = matches!(
+                    error,
+                    OutputError::NoDevice | OutputError::DeviceNotFound { .. }
+                );
+                self.link = Link::Held {
+                    state,
+                    reason: LossReason::StreamInvalidated,
+                    reopen_error: (!absent).then_some(error),
+                    retry_at: now + self.reconnect_interval,
+                };
+                self.last_error = self.device_error();
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Refuses a buffer size outside what F8.5 allows.
+pub(crate) fn check_buffer(frames: u32) -> Result<(), OpenError> {
+    if (MIN_BUFFER_FRAMES..=MAX_BUFFER_FRAMES).contains(&frames) {
+        Ok(())
+    } else {
+        Err(OpenError::BufferSize { frames })
     }
 }
 

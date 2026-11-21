@@ -11,18 +11,28 @@
 //! between, [`PreparedSong::check`] asks the output whether it would take
 //! the song ([`OutputCheck`]) without opening anything.
 //!
+//! A [`SetlistSession`] plays a setlist from a `library::Library` the same
+//! way, with [`SetlistCommand`]s (the item commands, next, previous,
+//! select) and [`SetlistSnapshot`]s that add the setlist's state to the
+//! current item's [`Snapshot`]. Before it plays, [`SetlistSession::info`]
+//! lists the items that cannot play and the songs at another sample rate;
+//! see [`SetlistSession`] for how items follow each other.
+//!
 //! # Threads
 //!
-//! - The **control thread** owns the [`Session`]: commands travel to the
-//!   audio thread over the player's lock-free queue, and every snapshot is
-//!   read from a `triple_buffer` the audio thread writes.
+//! - The **control thread** owns the [`Session`]: commands, and the next
+//!   setlist item's player, travel to the audio thread over the deck's
+//!   lock-free queue (`engine::live::Deck`), and every snapshot is read from
+//!   a `triple_buffer` the audio thread writes.
 //! - The **audio thread** belongs to the output adapter. It calls
 //!   [`AudioRenderer::render`], which renders one buffer and publishes the
-//!   player's state: no allocation, no lock, no I/O.
-//! - The **disk thread** belongs to the streamed song (`library`).
+//!   deck's state: no allocation, no lock, no I/O.
+//! - The **disk threads** belong to the streamed songs (`library`): the
+//!   current item's and the next one's.
 //!
-//! The player is only ever dropped on the control thread: a closed stream's
-//! renderer hands it back instead of dropping it, because dropping it joins
+//! A player is only ever dropped on the control thread: a closed stream's
+//! renderer hands the deck back instead of dropping it, and the deck hands
+//! back every player it no longer needs, because dropping one joins
 //! the disk thread.
 //!
 //! # Rules the session adds to the engine
@@ -55,9 +65,11 @@
 #![warn(missing_docs)]
 
 mod error;
+mod item;
 mod output;
 mod renderer;
 mod session;
+mod setlist;
 mod song;
 pub mod testing;
 
@@ -73,5 +85,10 @@ pub use renderer::AudioRenderer;
 pub use session::{
     Command, DeviceStatus, FadeView, PreparedSong, QueuedView, Session, SessionOptions, Snapshot,
     TransportState,
+};
+pub use setlist::{
+    BlendView, CLICK_ONLY_SAMPLE_RATE, ItemInfo, PreparedSetlist, SetlistCommand,
+    SetlistCommandError, SetlistInfo, SetlistOpenError, SetlistProblem, SetlistSession,
+    SetlistSnapshot, SetlistState,
 };
 pub use song::{PositionInfo, SongInfo};

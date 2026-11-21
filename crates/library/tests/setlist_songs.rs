@@ -226,3 +226,31 @@ fn song_folder_resolves_a_song_inside_the_library() {
         })
     ));
 }
+
+/// S3: a setlist plays on one device rate, so the songs' rates are known
+/// before it starts.
+#[test]
+fn each_song_that_loads_reports_its_sample_rate_and_a_missing_one_none() {
+    let dir = tempfile::tempdir().unwrap();
+    write_song(&dir.path().join("Songs/Present.song"));
+    let other = dir.path().join("Songs/Other.song");
+    fs::create_dir_all(&other).unwrap();
+    write_int(&other.join("track.wav"), 16, 1, 2_000, &[0; 2_000]);
+    write_manifest(
+        &other,
+        &manifest(2_000, &[("track", "track.wav", StemRole::Track)]),
+    );
+    let library = Library::new(dir.path());
+    let setlist = setlist(vec![
+        song("Songs/Present.song"),
+        song("Songs/Other.song"),
+        song("Songs/Missing.song"),
+    ]);
+
+    let songs = library.setlist_songs(&setlist).unwrap();
+
+    assert_eq!(songs.sample_rate("Songs/Present.song"), Some(RATE));
+    assert_eq!(songs.sample_rate("Songs/Other.song"), Some(2_000));
+    assert_eq!(songs.sample_rate("Songs/Missing.song"), None);
+    assert_eq!(songs.sample_rate("Songs/Never Named.song"), None);
+}

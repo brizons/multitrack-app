@@ -145,6 +145,9 @@ struct Hint {
 /// Plays one arrangement in real time; see the [module docs](super).
 pub struct Player {
     entries: Vec<Entry>,
+    /// `suffix[p]`: frames from the start of position `p` to the end of the
+    /// arrangement; one more entry than `entries`, holding 0.
+    suffix: Vec<u64>,
     song_length: u64,
     grid: BeatGrid,
     max_frames: usize,
@@ -188,6 +191,17 @@ pub struct Player {
     last_hint: Option<Hint>,
     /// Commands taken from the queue so far.
     applied: u64,
+    /// Times the arrangement played to its end (not a stop or a panic).
+    ends: u64,
+    /// Frames before the end over which the track stems fade out.
+    end_fade: Option<u64>,
+    /// The end fade's own gain on the track stems, on top of the operator's
+    /// fade; 1.0 at rest.
+    end_gain: Ramp,
+    /// Whether the end fade is running: the item can end within its window.
+    end_fading: bool,
+    /// Whether the infinite loop is on after every return to the start.
+    infinite_at_start: bool,
 }
 
 impl Player {
@@ -261,9 +275,14 @@ impl Player {
         let (producer, commands) = RingBuffer::new(COMMAND_CAPACITY);
         let click_level = if settings.click.enabled { 1.0 } else { 0.0 };
         let positions = entries.len();
+        let mut suffix = vec![0; positions + 1];
+        for (index, entry) in entries.iter().enumerate().rev() {
+            suffix[index] = suffix[index + 1] + entry.len;
+        }
 
         let mut player = Self {
             entries,
+            suffix,
             song_length: song.length(),
             grid: BeatGrid::new(song),
             max_frames,
@@ -297,6 +316,11 @@ impl Player {
             voice_epoch: 0,
             last_hint: None,
             applied: 0,
+            ends: 0,
+            end_fade: None,
+            end_gain: Ramp::at(1.0),
+            end_fading: false,
+            infinite_at_start: false,
         };
         player.update_hints();
         Ok((
@@ -359,6 +383,106 @@ impl Player {
             },
             underruns: self.underruns,
         }
+    }
+
+    /// Fades the `track` stems out over the last `frames` frames before the
+    /// arrangement ends, so they are silent on its last frame (F5.3). Click
+    /// and guide stems and the generated click keep playing to the end.
+    ///
+    /// The window is the last `frames` frames as the player predicts them,
+    /// the earliest the arrangement can end: honouring a queued jump or
+    /// loop, but also where it ends should that jump wait for its audio.
+    /// The fade starts while playing, exactly `frames` before that end. When
+    /// the end moves out of the window (a jump back or a loop executes, or
+    /// the infinite loop comes on), the fade is cancelled: the stems return
+    /// over [`super::DECLICK_FRAMES`] (for a full swing) to the level of the
+    /// operator's fade, and the fade starts again before the new end. When
+    /// the end moves closer, the fade speeds up to stay silent on the last
+    /// frame.
+    ///
+    /// It is a gain of its own on the stems, on top of the operator's
+    /// [`Command::ToggleFade`]: the stems play at the operator's level times
+    /// the end fade, so a fade the operator engaged stays engaged whatever
+    /// the end fade does, and [`Status::fade`] reports the operator's fade
+    /// only. `None`, the default, plays the end as it is. Call it before the
+    /// player plays.
+    pub fn set_end_fade(&mut self, frames: Option<u64>) {
+        self.end_fade = frames;
+    }
+
+    /// Switches the infinite loop on or off now and at every return to the
+    /// start (a stop, a panic), as [`Command::SetInfinite`] would right after
+    /// it. A click-only tile without a bar count uses it to repeat its one
+    /// bar until the operator moves on. Off by default.
+    pub fn set_infinite_at_start(&mut self, on: bool) {
+        self.infinite_at_start = on;
+        self.infinite = on;
+    }
+
+    /// Applies `command` at once, as if it had come through the queue: for
+    /// the thread that owns the player, such as a [`super::Deck`] driving
+    /// it. It is not counted by [`Self::applied_commands`]. Real-time safe.
+    pub(crate) fn command(&mut self, command: Command) {
+        self.apply(command);
+    }
+
+    /// Output frames the arrangement plays before it ends if no other
+    /// command arrives: the rest of the current position and the positions
+    /// after it, or, with a jump or loop queued, the frames to its boundary
+    /// and the positions from its target on. `None` while the infinite loop
+    /// is on. An estimate when a queued jump is deferred: the arrangement
+    /// then plays on. Real-time safe.
+    pub(crate) fn frames_to_end(&self) -> Option<u64> {
+        if self.infinite {
+            return None;
+        }
+        Some(match self.queued {
+            Some(queued) => {
+                (self.jump_frame(queued) - self.output_frame) + self.suffix[queued.target]
+            }
+            None => {
+                let entry = self.entries[self.voice.position];
+                (entry.len - self.voice.offset) + self.suffix[self.voice.position + 1]
+            }
+        })
+    }
+
+    /// The earliest output frame, from now, where the arrangement can end
+    /// if no other command arrives: where [`Self::frames_to_end`] says, or,
+    /// when a queued jump or loop is deferred for its audio, where the
+    /// arrangement ends without it. A jump to another position that
+    /// switches the infinite loop off can end it too. `None` when nothing
+    /// can end it. Real-time safe.
+    pub(crate) fn earliest_end(&self) -> Option<u64> {
+        let entry = self.entries[self.voice.position];
+        let natural = (!self.infinite)
+            .then(|| (entry.len - self.voice.offset) + self.suffix[self.voice.position + 1]);
+        let jumped = self.queued.and_then(|queued| {
+            let leaves_loop = queued.kind == JumpKind::Jump && queued.target != self.voice.position;
+            (!self.infinite || leaves_loop)
+                .then(|| (self.jump_frame(queued) - self.output_frame) + self.suffix[queued.target])
+        });
+        match (natural, jumped) {
+            (Some(natural), Some(jumped)) => Some(natural.min(jumped)),
+            (natural, jumped) => natural.or(jumped),
+        }
+    }
+
+    /// Times the arrangement played to its end while playing and returned
+    /// to the start there. An end reached while a pause, stop or panic
+    /// ramps out does not count: the operator stopped the item.
+    pub(crate) fn ends(&self) -> u64 {
+        self.ends
+    }
+
+    /// The transport state.
+    pub(crate) fn transport(&self) -> Transport {
+        self.transport
+    }
+
+    /// Output frames played since the last start.
+    pub(crate) fn output_frame(&self) -> u64 {
+        self.output_frame
     }
 
     /// How many commands the player has taken from its [`Controller`]'s
@@ -460,6 +584,7 @@ impl Player {
         let mut done = 0;
         loop {
             self.handle_boundaries();
+            self.update_end_fade();
             self.update_hints();
             if done == frames || !self.transport.is_running() {
                 return;
@@ -506,6 +631,11 @@ impl Player {
             }
             if self.voice.offset == self.entries[self.voice.position].len {
                 let Some(next) = self.natural_next() else {
+                    // An end reached while a pause, stop or panic ramps
+                    // out is the operator's stop, not the item ending.
+                    if self.transport == Transport::Playing {
+                        self.ends += 1;
+                    }
                     self.reset();
                     return;
                 };
@@ -537,7 +667,53 @@ impl Player {
         ) {
             frames = frames.min(self.transport_gain.remaining());
         }
+        if let Some(due) = self.end_fade_due()
+            && due > 0
+        {
+            frames = frames.min(due);
+        }
         frames
+    }
+
+    /// Frames until the end fade must start, while it is set and not
+    /// running, the transport plays, and the arrangement can end; 0 when
+    /// it is due now.
+    fn end_fade_due(&self) -> Option<u64> {
+        let window = self.end_fade?;
+        if self.end_fading || self.transport != Transport::Playing {
+            return None;
+        }
+        Some(self.earliest_end()?.saturating_sub(window))
+    }
+
+    /// Keeps the end fade on the arrangement's predicted end (see
+    /// [`Self::set_end_fade`]): starts it when it is due, ramping the end
+    /// gain from where it stands to silence over exactly the frames left;
+    /// speeds it up when the end came closer; and cancels it, ramping the
+    /// stems back, when the end left the window or can no longer come.
+    fn update_end_fade(&mut self) {
+        let Some(window) = self.end_fade else {
+            return;
+        };
+        if self.end_fading {
+            match self.earliest_end() {
+                Some(left) if left <= window => {
+                    if left < self.end_gain.remaining() {
+                        self.end_gain.retarget_over(0.0, left);
+                    }
+                }
+                _ => {
+                    self.end_fading = false;
+                    self.end_gain.retarget(1.0, DECLICK_FRAMES);
+                }
+            }
+            return;
+        }
+        if self.end_fade_due() == Some(0) {
+            let left = self.earliest_end().unwrap_or(0);
+            self.end_fading = true;
+            self.end_gain.retarget_over(0.0, left);
+        }
     }
 
     /// Output frame of the first boundary, at or after `queued.not_before`,
@@ -693,16 +869,18 @@ impl Player {
         self.tails.clear();
         self.active.clear();
         self.queued = None;
-        self.infinite = false;
+        self.infinite = self.infinite_at_start;
         self.fade = Ramp::at(1.0);
         self.fade_out = false;
+        self.end_gain = Ramp::at(1.0);
+        self.end_fading = false;
     }
 
     /// Renders `out.len() / 2` frames with no boundary inside them.
     fn render_block(&mut self, out: &mut [f32]) {
         let n = out.len() / 2;
         for i in 0..n {
-            self.track_gain[i] = self.fade.next();
+            self.track_gain[i] = self.fade.next() * self.end_gain.next();
             self.click_gain[i] = self.click.next();
             self.master[i] = self.master_gain * self.transport_gain.next();
         }

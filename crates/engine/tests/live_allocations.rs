@@ -1,5 +1,7 @@
 //! S3 real-time checklist for the live player: "No memory allocation or
-//! deallocation." in `Player::process`, whatever the commands do.
+//! deallocation." in `Player::process`, whatever the commands do, and in
+//! `Deck::process` through an AutoLink, a crossfade, a selection and the
+//! players it hands back.
 //!
 //! This test binary installs a counting global allocator; `unsafe` is needed
 //! only to forward to the system allocator and stays in this test.
@@ -12,7 +14,7 @@ use std::cell::Cell;
 use common::{four_sections, mono, noise, stereo};
 use domain::StemRole;
 use engine::MixSettings;
-use engine::live::{Command, JumpTiming, Player, PlayerConfig, memory_sources};
+use engine::live::{Command, Deck, Handoff, JumpTiming, Player, PlayerConfig, memory_sources};
 
 struct Counting;
 
@@ -106,4 +108,109 @@ fn process_allocates_nothing_through_every_live_command() {
 
     assert_eq!(allocations, 0, "process allocated or freed memory");
     assert!(player.status().output_frame > 0, "the player kept playing");
+}
+
+#[test]
+fn the_deck_allocates_nothing_through_an_autolink_a_crossfade_and_a_selection() {
+    let frames = 1_152_000;
+    let song = four_sections(vec![("drums", StemRole::Track), ("keys", StemRole::Track)]).build();
+    let buffer = 256;
+    let player = |seed: u64| {
+        let stems = vec![
+            mono("drums", StemRole::Track, noise(seed, frames)),
+            stereo("keys", StemRole::Track, noise(seed + 1, 2 * frames)),
+        ];
+        let (mut player, _controller) = Player::new(
+            &song,
+            "default",
+            &MixSettings::default(),
+            &PlayerConfig::new(48_000, buffer),
+            memory_sources(stems).unwrap(),
+        )
+        .unwrap();
+        player.set_end_fade(Some(240_000));
+        player
+    };
+    let (mut deck, mut control) = Deck::new(player(1), 1, buffer);
+    control.cue(player(3), 2, Handoff::AutoLink).unwrap();
+    control.send(Command::Play).unwrap();
+
+    let calls = frames / buffer;
+    let mut output = vec![0.0f32; 2 * buffer];
+    let mut allocations = 0;
+    let mut returned = Vec::new();
+    let mut step = 0;
+    for call in 0..3 * calls + 400 {
+        // Messages carry boxed players, built and queued outside the count.
+        let status = deck.status();
+        if step == 0 && status.item == 2 {
+            control
+                .cue(player(5), 3, Handoff::Crossfade { frames: 240_000 })
+                .unwrap();
+            step = 1;
+        } else if step == 1 && status.item == 3 && status.blend.is_none() {
+            control.send(Command::QueueJump { position: 2 }).unwrap();
+            step = 2;
+        } else if step == 2 && call % 200 == 0 {
+            control.select(player(7), 4).unwrap();
+            control.send(Command::Play).unwrap();
+            step = 3;
+        }
+        COUNT.with(|count| count.set(Some(0)));
+        deck.process(&mut output);
+        allocations += COUNT.with(|count| count.replace(None)).unwrap_or(0);
+        while let Some(player) = control.returned() {
+            returned.push(player);
+        }
+    }
+
+    assert_eq!(allocations, 0, "the deck allocated or freed memory");
+    assert_eq!(
+        step, 3,
+        "the script ran: AutoLink, crossfade, then a selection"
+    );
+    assert_eq!(returned.len(), 3, "every replaced player came back");
+    assert_eq!(deck.status().item, 4);
+}
+
+#[test]
+fn the_end_fade_allocates_nothing_when_it_starts_cancels_and_starts_again() {
+    let frames = 1_152_000;
+    let song = four_sections(vec![("drums", StemRole::Track), ("guide", StemRole::Guide)]).build();
+    let stems = vec![
+        mono("drums", StemRole::Track, noise(1, frames)),
+        mono("guide", StemRole::Guide, noise(2, frames)),
+    ];
+    let buffer = 256;
+    let (mut player, mut controller) = Player::new(
+        &song,
+        "default",
+        &MixSettings::default(),
+        &PlayerConfig::new(48_000, buffer),
+        memory_sources(stems).unwrap(),
+    )
+    .unwrap();
+    // Five seconds at 48 kHz: the window opens 240 000 frames before the end.
+    player.set_end_fade(Some(240_000));
+    let calls = |frame: usize| frame / buffer;
+    let script = [
+        (0, Command::Play),
+        // In the window (the song ends at 1 152 000): back to the chorus.
+        (calls(1_000_000), Command::QueueJump { position: 2 }),
+        // In the window again, near the new end: loop on, then off.
+        (calls(1_500_000), Command::SetInfinite(true)),
+        (calls(1_600_000), Command::SetInfinite(false)),
+        (calls(1_700_000), Command::LiveLoop),
+    ];
+    let mut output = vec![0.0f32; 2 * buffer];
+    let mut allocations = 0;
+    for call in 0..calls(2_400_000) {
+        for &(_, command) in script.iter().filter(|(at, _)| *at == call) {
+            controller.send(command).unwrap();
+        }
+        COUNT.with(|count| count.set(Some(0)));
+        player.process(&mut output);
+        allocations += COUNT.with(|count| count.replace(None)).unwrap_or(0);
+    }
+    assert_eq!(allocations, 0, "the end fade allocated or freed memory");
 }

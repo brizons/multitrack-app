@@ -31,6 +31,12 @@ pub const IDLE: Duration = Duration::from_secs(10);
 /// sections in order; `jumpy` plays intro, chorus, verse, outro, so every
 /// seam jumps in the source.
 pub fn write_song(dir: &Path, rate: u32) {
+    write_song_with(dir, rate, 0);
+}
+
+/// [`write_song`] with every stem's noise seeded `seed` further on, so two
+/// songs written with different seeds sound different.
+pub fn write_song_with(dir: &Path, rate: u32, seed: u64) {
     let bar = 2 * u64::from(rate);
     let length = 7 * bar;
     let section = |id: &str, section_type, number, start| SectionMarker {
@@ -82,9 +88,89 @@ pub fn write_song(dir: &Path, rate: u32) {
     fs::create_dir_all(dir.join("stems")).unwrap();
     fs::write(dir.join("song.json"), package.to_json().unwrap()).unwrap();
     let frames = length as usize;
-    write_wav(&dir.join("stems/drums.wav"), 1, rate, &noise(1, frames));
-    write_float(&dir.join("stems/keys.wav"), rate, &noise(2, 2 * frames));
-    write_wav(&dir.join("stems/guide.wav"), 1, rate, &noise(3, frames));
+    write_wav(
+        &dir.join("stems/drums.wav"),
+        1,
+        rate,
+        &noise(1 + seed, frames),
+    );
+    write_float(
+        &dir.join("stems/keys.wav"),
+        rate,
+        &noise(2 + seed, 2 * frames),
+    );
+    write_wav(
+        &dir.join("stems/guide.wav"),
+        1,
+        rate,
+        &noise(3 + seed, frames),
+    );
+}
+
+/// Writes a one-section song of `frames` frames at `rate` whose output is
+/// exactly `track + guide` on both channels: a float track stem at `track`,
+/// a float guide stem at `guide`, and a silent click stem, which replaces
+/// the generated click.
+pub fn write_steady(dir: &Path, rate: u32, frames: usize, track: f32, guide: f32) {
+    let stem = |id: &str, role| Stem {
+        id: id.to_owned(),
+        file: format!("stems/{id}.wav"),
+        part: id.to_owned(),
+        role,
+    };
+    let package = SongPackage {
+        format_version: 1,
+        title: "Steady".to_owned(),
+        artist: None,
+        sample_rate: rate,
+        key: None,
+        tempo_map: vec![TempoPoint { at: 0, bpm: 120.0 }],
+        time_signature_map: vec![TimeSignaturePoint {
+            at: 0,
+            numerator: 4,
+            denominator: 4,
+        }],
+        stems: vec![
+            stem("track", StemRole::Track),
+            stem("guide", StemRole::Guide),
+            stem("click", StemRole::Click),
+        ],
+        sections: vec![SectionMarker {
+            id: "verse".to_owned(),
+            section_type: SectionType::Verse,
+            number: None,
+            start: 0,
+        }],
+        arrangements: vec![Arrangement {
+            id: "default".to_owned(),
+            name: "Default".to_owned(),
+            sections: vec!["verse".to_owned()],
+            infinite_loop: Vec::new(),
+        }],
+    };
+    fs::create_dir_all(dir.join("stems")).unwrap();
+    fs::write(dir.join("song.json"), package.to_json().unwrap()).unwrap();
+    for (id, value) in [("track", track), ("guide", guide), ("click", 0.0)] {
+        write_mono_float(
+            &dir.join(format!("stems/{id}.wav")),
+            rate,
+            &vec![value; frames],
+        );
+    }
+}
+
+fn write_mono_float(path: &Path, rate: u32, samples: &[f32]) {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: rate,
+        bits_per_sample: 32,
+        sample_format: SampleFormat::Float,
+    };
+    let mut writer = WavWriter::create(path, spec).unwrap();
+    for &sample in samples {
+        writer.write_sample(sample).unwrap();
+    }
+    writer.finalize().unwrap();
 }
 
 fn noise(seed: u64, count: usize) -> Vec<i16> {

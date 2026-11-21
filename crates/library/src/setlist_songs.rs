@@ -18,6 +18,7 @@ use crate::{Library, LoadError, SetlistError, is_plain_relative, open_package, r
 #[derive(Debug, Default)]
 pub struct SetlistSongs {
     outlines: BTreeMap<String, SongOutline>,
+    rates: BTreeMap<String, u32>,
     unavailable: Vec<SongUnavailable>,
 }
 
@@ -68,6 +69,14 @@ impl SetlistSongs {
     pub fn unavailable(&self) -> &[SongUnavailable] {
         &self.unavailable
     }
+
+    /// The sample rate of the song at `song`, a path as the setlist writes
+    /// it; `None` when the setlist does not name it or the library cannot
+    /// provide it. A setlist plays on one device rate, so a shell can tell
+    /// before it starts which songs run at another one.
+    pub fn sample_rate(&self, song: &str) -> Option<u32> {
+        self.rates.get(song).copied()
+    }
 }
 
 impl SongLookup for SetlistSongs {
@@ -109,8 +118,9 @@ impl Library {
                 continue;
             }
             match song_outline(&root, &item.song) {
-                Ok(outline) => {
+                Ok((outline, rate)) => {
                     songs.outlines.insert(item.song.clone(), outline);
+                    songs.rates.insert(item.song.clone(), rate);
                 }
                 Err(unavailable) => songs.unavailable.push(unavailable),
             }
@@ -143,12 +153,16 @@ fn locate_song(root: &Path, song: &str) -> Result<PathBuf, SongUnavailable> {
 }
 
 /// Reads and checks the song package at `song` as [`crate::load_song`]
-/// does, opening its stems only to read their headers.
-fn song_outline(root: &Path, song: &str) -> Result<SongOutline, SongUnavailable> {
+/// does, opening its stems only to read their headers; returns its outline
+/// and sample rate.
+fn song_outline(root: &Path, song: &str) -> Result<(SongOutline, u32), SongUnavailable> {
     let folder = locate_song(root, song)?;
     let (validated, _stems) = open_package(&folder).map_err(|source| SongUnavailable::Load {
         song: song.to_owned(),
         source,
     })?;
-    Ok(SongOutline::from(&validated.song))
+    Ok((
+        SongOutline::from(&validated.song),
+        validated.song.sample_rate(),
+    ))
 }

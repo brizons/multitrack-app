@@ -2,7 +2,8 @@
 //! allocation or deallocation." in `AudioRenderer::render`, which runs the
 //! player, asks the sources whether the playhead is ready, and publishes the
 //! snapshot, while the session is stopped, starting, playing, jumping,
-//! fading and panicking.
+//! fading and panicking, and while a setlist links one song to the next and
+//! crossfades into a third.
 //!
 //! This test binary installs a counting global allocator that counts only on
 //! the test thread while it calls `render`; `unsafe` is needed only to
@@ -16,9 +17,12 @@ use std::sync::{Arc, Mutex};
 
 use app::{
     AudioOutput, AudioRenderer, Command, DeviceInfo, JumpTiming, OutputError, OutputRequest,
-    OutputStream, Session, SessionOptions, StreamHealth, StreamInfo,
+    OutputStream, Session, SessionOptions, SetlistCommand, SetlistSession, StreamHealth,
+    StreamInfo,
 };
-use common::{IDLE, RATE, write_song};
+use common::{IDLE, RATE, write_song, write_song_with};
+use domain::{Setlist, SetlistItem, SongItem, Transition};
+use library::Library;
 
 struct Counting;
 
@@ -148,4 +152,64 @@ fn rendering_a_session_allocates_nothing() {
     }
     assert_eq!(allocations, 0);
     assert!(session.poll().output_frame > 0, "the song played");
+}
+
+#[test]
+fn rendering_a_setlist_through_an_autolink_and_a_crossfade_allocates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, seed) in [("A", 0), ("B", 10), ("C", 20)] {
+        write_song_with(&dir.path().join(format!("Songs/{name}.song")), RATE, seed);
+    }
+    let library = Library::new(dir.path());
+    let item = |song: &str, transition| {
+        SetlistItem::Song(SongItem {
+            transition,
+            ..SongItem::new(song)
+        })
+    };
+    let mut setlist = Setlist::new("Allocations");
+    setlist.items = vec![
+        item("Songs/A.song", Transition::AutoLink),
+        item("Songs/B.song", Transition::Crossfade),
+        item("Songs/C.song", Transition::CueNext),
+    ];
+    let entry = library.save_setlist(&setlist).unwrap();
+    let capture = Capture::default();
+    let mut session = SetlistSession::open(
+        &library,
+        &entry.file,
+        Box::new(capture.clone()),
+        SessionOptions {
+            buffer_frames: 256,
+            ..SessionOptions::default()
+        },
+    )
+    .unwrap();
+
+    let mut out = vec![0.0f32; 2 * 256];
+    let mut allocations = 0;
+    let mut items = Vec::new();
+    let mut blended = false;
+    let mut renderer = capture.renderer.lock().unwrap();
+    let renderer = renderer.as_mut().unwrap();
+    // Three 14-second songs, the last two overlapping by five seconds.
+    for buffer in 0..1_200 {
+        if buffer == 2 {
+            session.send(SetlistCommand::Item(Command::Play)).unwrap();
+        }
+        for monitor in session.disk_monitors() {
+            assert!(monitor.wait_idle(IDLE));
+        }
+        COUNT.with(|count| count.set(Some(0)));
+        renderer.render(&mut out);
+        allocations += COUNT.with(|count| count.replace(None)).unwrap();
+        let snapshot = session.poll();
+        blended |= snapshot.setlist.blend.is_some();
+        if items.last() != Some(&snapshot.setlist.current) {
+            items.push(snapshot.setlist.current);
+        }
+    }
+    assert_eq!(allocations, 0);
+    assert_eq!(items, [0, 1, 2], "A linked to B, which crossfaded into C");
+    assert!(blended, "the crossfade ran");
 }
