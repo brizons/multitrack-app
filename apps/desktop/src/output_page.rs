@@ -329,13 +329,7 @@ impl OutputPage {
         let presets = PRESETS
             .into_iter()
             .filter(|&preset| preset <= outputs)
-            .map(|preset| {
-                let label = match preset {
-                    2 => "2 outputs: split mode".to_owned(),
-                    preset => outputs_text(preset),
-                };
-                (preset, label)
-            })
+            .map(|preset| (preset, outputs_text(preset)))
             .collect();
         let mut notices: Vec<String> = settings.notices().to_vec();
         if let Some(show) = show {

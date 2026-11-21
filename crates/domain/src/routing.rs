@@ -178,14 +178,14 @@ impl Routing {
     /// | Outputs | Click & Guide | Drums | Bass | Keys & Pads | Guitars | Vocals |
     /// |---------|---------------|-------|------|-------------|---------|--------|
     /// | 1       | 1             | 1     | 1    | 1           | 1       | 1      |
-    /// | 2       | split mode: 1 | 2     | 2    | 2           | 2       | 2      |
+    /// | 2       | 1/2           | 1/2   | 1/2  | 1/2         | 1/2     | 1/2    |
     /// | 3       | 1             | 2/3   | 2/3  | 2/3         | 2/3     | 2/3    |
     /// | 4–5     | 1/2           | 3/4   | 3/4  | 3/4         | 3/4     | 3/4    |
     /// | 6–7     | 1             | 2     | 3    | 4           | 5       | 6      |
     /// | 8–32    | 1             | 2     | 3    | 5/6         | 4       | 7/8    |
     ///
-    /// With 2 outputs split mode is on and every bus is stored on 1/2, so
-    /// turning split mode off plays plain stereo.
+    /// With 2 outputs it is plain stereo ([`Routing::stereo`]), split mode
+    /// off; split mode (F8.4) stays a switch the user turns on.
     ///
     /// **Assumption (S2), from the design canvas's routing data:** Click &
     /// Guide alone on output 1 for the band's in-ears, and from six outputs
@@ -199,7 +199,7 @@ impl Routing {
         use Destination::Mono;
         let (split_mode, destinations) = match outputs {
             1 => (false, [Mono(1); 6]),
-            2 => (true, [Destination::MAIN; 6]),
+            2 => (false, [Destination::MAIN; 6]),
             3 => (
                 false,
                 [

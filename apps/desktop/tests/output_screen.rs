@@ -193,8 +193,10 @@ fn a_click_makes_a_mono_output_a_pair_and_a_third_output_starts_over_on_its_own(
 
 #[test]
 fn a_click_in_split_mode_turns_it_off_and_edits_the_buses_as_stored() {
-    let split = Routing::preset(2);
-    assert!(split.split_mode);
+    let split = Routing {
+        split_mode: true,
+        ..Routing::preset(2)
+    };
 
     let routing = click_cell(&split, Bus::Vocals, 1);
 
@@ -265,15 +267,27 @@ fn a_cell_click_applies_live_and_is_saved_for_the_device() {
 fn split_mode_is_offered_for_2_output_devices_and_switches_live() {
     let mut bench = Bench::on("fake:1");
     let view = bench.view();
-    assert_eq!(view.split_mode, Some(true), "the 2-output preset");
+    assert_eq!(view.split_mode, Some(false), "the 2-output preset: stereo");
+    assert_eq!(view.hint, "Tap a cell to send a bus to an output");
+    assert_eq!(cells(&view, Bus::Drums), [1, 2]);
+
+    bench.act(OutputAction::ToggleSplit);
+
+    let view = bench.view();
+    assert_eq!(view.split_mode, Some(true));
+    assert!(bench.routing().split_mode);
     assert_eq!(view.hint, "Split mode is on: only outputs 1 and 2 are used");
     assert_eq!(cells(&view, Bus::ClickGuide), [1]);
     assert_eq!(cells(&view, Bus::Drums), [2]);
+    let split = Routing {
+        split_mode: true,
+        ..Routing::stereo(2)
+    };
+    assert_eq!(bench.saved("fake:1"), Some(split));
 
     bench.act(OutputAction::ToggleSplit);
 
     assert_eq!(bench.view().split_mode, Some(false));
-    assert!(!bench.routing().split_mode);
     assert_eq!(cells(&bench.view(), Bus::Drums), [1, 2]);
     assert_eq!(bench.saved("fake:1"), Some(Routing::stereo(2)));
 }
@@ -293,7 +307,7 @@ fn a_preset_for_fewer_outputs_and_reset_back_to_the_devices_own() {
         presets,
         [
             (1, "1 output"),
-            (2, "2 outputs: split mode"),
+            (2, "2 outputs"),
             (3, "3 outputs"),
             (4, "4 outputs"),
             (6, "6 outputs"),
@@ -337,7 +351,7 @@ fn choosing_another_device_reopens_the_song_on_it_with_its_routing() {
     assert!(!view.device_menu);
     assert_eq!(view.device, "Laptop · 2 outputs");
     assert_eq!(bench.routing(), Routing::preset(2));
-    assert_eq!(view.split_mode, Some(true));
+    assert_eq!(view.split_mode, Some(false));
 }
 
 #[test]

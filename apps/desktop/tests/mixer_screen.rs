@@ -411,17 +411,29 @@ fn the_buses_layer_shows_each_bus_with_its_output_from_the_routing() {
 
 #[test]
 fn split_mode_shows_click_and_guide_on_output_1_and_the_rest_on_output_2() {
-    let bench = Bench::new();
+    let mut bench = Bench::new();
+    let outputs = |bench: &Bench| -> Vec<String> {
+        bench
+            .view()
+            .buses
+            .into_iter()
+            .map(|bus| bus.output)
+            .collect()
+    };
+    // A 2-output device starts in plain stereo.
+    assert_eq!(outputs(&bench), ["Out 1/2"; 6]);
 
-    let outputs: Vec<String> = bench
-        .view()
-        .buses
-        .into_iter()
-        .map(|bus| bus.output)
-        .collect();
+    bench
+        .show
+        .set_routing(Routing {
+            split_mode: true,
+            ..Routing::preset(2)
+        })
+        .unwrap();
+    bench.show.poll();
 
     assert_eq!(
-        outputs,
+        outputs(&bench),
         ["Out 1", "Out 2", "Out 2", "Out 2", "Out 2", "Out 2"]
     );
     assert_eq!(bench.view().outputs, "2 outputs");
