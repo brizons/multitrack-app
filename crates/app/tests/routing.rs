@@ -271,23 +271,126 @@ fn a_routing_changed_while_playing_moves_the_buses_over_the_gain_ramp() {
     );
 }
 
+/// Runs callbacks until the stream has opened `opened` times; returns what
+/// the old stream played meanwhile.
+fn until_reopened(session: &mut Session, fake: &FakeOutput, opened: usize) -> Vec<f32> {
+    let mut old = Vec::new();
+    for _ in 0..40 {
+        if fake.opened().len() == opened {
+            return old;
+        }
+        old.extend(step(session, fake).0);
+    }
+    panic!("the stream never opened again");
+}
+
+/// The largest step between two frames of `out` on any of its `channels`.
+fn largest_step(out: &[f32], channels: usize) -> f32 {
+    let frames: Vec<&[f32]> = out.chunks_exact(channels).collect();
+    frames
+        .windows(2)
+        .flat_map(|pair| (0..channels).map(move |c| (pair[1][c] - pair[0][c]).abs()))
+        .fold(0.0, f32::max)
+}
+
+/// A hard edge would step by the whole band; a ramp of the 256-frame
+/// declick steps by a 256th of it, and the routing crossfade by a 160th.
+const RAMP_STEP: f32 = ALL / 64.0;
+
 #[test]
-fn a_routing_that_needs_more_outputs_reopens_the_stream_with_them() {
+fn a_routing_that_needs_more_outputs_ramps_out_reopens_the_stream_and_ramps_back_in() {
     let dir = band();
     let fake = device(8);
     let mut session = open(dir.path(), &fake, Some(Routing::stereo(8)));
     assert_eq!(fake.opened()[0].channels, 2);
     let out = play(&mut session, &fake, 512);
     assert_eq!(last(&out, 2), [ALL, ALL]);
+    let before = session.poll().source_frame;
     session.set_routing(Routing::preset(8)).unwrap();
-    assert_eq!(fake.opened().len(), 2);
+    assert_eq!(fake.opened().len(), 1, "the stream ramps out first");
+
+    let old = until_reopened(&mut session, &fake, 2);
     assert_eq!(fake.opened()[1].channels, 8);
-    let out = run(&mut session, &fake, 1_024);
+    assert_eq!(last(&old, 2), [0.0, 0.0], "silent when the stream closes");
+    let edge = largest_step(&[&out[out.len() - 2..], &old[..]].concat(), 2);
+    assert!(edge <= RAMP_STEP, "the old stream steps by {edge}");
+    let held = session.poll().source_frame;
+    assert!(held > before, "the playhead held where the ramp ended");
+
+    let new = run(&mut session, &fake, 2_048);
+    assert!(
+        new[..8].iter().all(|sample| sample.abs() <= RAMP_STEP),
+        "the new stream starts from silence: {:?}",
+        &new[..8]
+    );
+    let edge = largest_step(&new, 8);
+    assert!(edge <= RAMP_STEP, "the new stream steps by {edge}");
     assert_eq!(
-        last(&out, 8),
+        last(&new, 8),
         [GUIDE, DRUMS, BASS, GUITAR, KEYS, KEYS, VOCALS, VOCALS]
     );
+    let snapshot = session.poll();
+    assert_eq!(snapshot.transport, TransportState::Playing);
+    assert!(snapshot.source_frame > held, "it plays on from there");
+}
+
+#[test]
+fn a_buffer_size_changed_while_playing_ramps_out_and_back_in() {
+    let dir = band();
+    let fake = device(2);
+    let mut session = open(dir.path(), &fake, None);
+    let out = play(&mut session, &fake, 512);
+    session.set_buffer_frames(512).unwrap();
+    assert_eq!(fake.opened().len(), 1, "the stream ramps out first");
+    let old = until_reopened(&mut session, &fake, 2);
+    assert_eq!(fake.opened()[1].buffer_frames, 512);
+    assert_eq!(last(&old, 2), [0.0, 0.0]);
+    let edge = largest_step(&[&out[out.len() - 2..], &old[..]].concat(), 2);
+    assert!(edge <= RAMP_STEP, "the old stream steps by {edge}");
+    let new = run(&mut session, &fake, 2_048);
+    assert!(new[..2].iter().all(|sample| sample.abs() <= RAMP_STEP));
+    assert!(largest_step(&new, 2) <= RAMP_STEP);
+    assert_eq!(last(&new, 2), [ALL, ALL]);
     assert_eq!(session.poll().transport, TransportState::Playing);
+}
+
+#[test]
+fn a_pause_sent_while_the_stream_ramps_out_keeps_it_paused_once_it_opens_again() {
+    let dir = band();
+    let fake = device(2);
+    let mut session = open(dir.path(), &fake, None);
+    play(&mut session, &fake, 512);
+    session.set_buffer_frames(512).unwrap();
+    session.send(Command::Pause).unwrap();
+    until_reopened(&mut session, &fake, 2);
+    let out = run(&mut session, &fake, 1_024);
+    assert!(out.iter().all(|&sample| sample == 0.0));
+    let paused = session.poll();
+    assert_eq!(paused.transport, TransportState::Paused);
+
+    // Play from there plays on.
+    let out = play(&mut session, &fake, 1_024);
+    assert_eq!(last(&out, 2), [ALL, ALL]);
+    assert!(session.poll().source_frame > paused.source_frame);
+}
+
+#[test]
+fn a_paused_session_reopens_at_once_and_stays_paused() {
+    let dir = band();
+    let fake = device(2);
+    let mut session = open(dir.path(), &fake, None);
+    play(&mut session, &fake, 512);
+    session.send(Command::Pause).unwrap();
+    run(&mut session, &fake, 1_024);
+    let paused = session.poll();
+    assert_eq!(paused.transport, TransportState::Paused);
+    session.set_buffer_frames(128).unwrap();
+    assert_eq!(fake.opened().len(), 2, "nothing to ramp out");
+    let out = run(&mut session, &fake, 1_024);
+    assert!(out.iter().all(|&sample| sample == 0.0));
+    let still = session.poll();
+    assert_eq!(still.transport, TransportState::Paused);
+    assert_eq!(still.source_frame, paused.source_frame);
 }
 
 /// Unplugs the device, polls until the session holds the player, plugs it

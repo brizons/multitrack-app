@@ -10,12 +10,12 @@ use app::{
     Command, DeviceStatus, MAX_BUFFER_FRAMES, RuntimeError, SessionOptions, SetlistCommand,
     SetlistSession, TransportState,
 };
-use common::{bits, offline, open, play_for, start, write_song, write_song_with};
+use common::{bits, offline, open, play_for, start, step, write_song, write_song_with};
 use domain::{DEFAULT_SEAM_CROSSFADE, Setlist, SetlistItem, SongItem, Transition};
 use library::Library;
 
 #[test]
-fn the_buffer_size_changes_while_playing_and_the_audio_goes_on_sample_exact() {
+fn the_buffer_size_changes_while_playing_and_the_song_goes_on_from_where_it_held() {
     let dir = tempfile::tempdir().unwrap();
     write_song(dir.path(), common::RATE);
     let expected = offline(dir.path(), "default", DEFAULT_SEAM_CROSSFADE);
@@ -30,9 +30,22 @@ fn the_buffer_size_changes_while_playing_and_the_audio_goes_on_sample_exact() {
     );
     let (first, _) = start(&mut session, &fake, 64);
     let (before, _) = play_for(&mut session, &fake, 64, 20_000);
+    let heard = [first, before].concat();
+    assert_eq!(
+        bits(&heard),
+        bits(&expected[..heard.len()]),
+        "sample-exact up to the change"
+    );
 
     session.set_buffer_frames(MAX_BUFFER_FRAMES).unwrap();
-    assert_eq!(fake.opened().len(), 2, "the stream opened again");
+    assert_eq!(fake.opened().len(), 1, "the stream ramps out first");
+    let monitor = session.disk_monitor();
+    let mut old = Vec::new();
+    while fake.opened().len() == 1 {
+        assert!(old.len() < 2 * 64 * 64, "the stream opens again");
+        old.extend(step(&mut session, &fake, &monitor, 64).0);
+    }
+    assert_eq!(&old[old.len() - 2..], [0.0, 0.0], "silent when it closes");
     assert_eq!(fake.opened()[1].buffer_frames, MAX_BUFFER_FRAMES);
     let snapshot = session.poll();
     let DeviceStatus::Connected(info) = &snapshot.device else {
@@ -40,21 +53,19 @@ fn the_buffer_size_changes_while_playing_and_the_audio_goes_on_sample_exact() {
     };
     assert_eq!(info.buffer_frames, MAX_BUFFER_FRAMES);
     assert_eq!(info.latency().as_secs_f64(), 1_024.0 / 8_000.0, "128 ms");
-    assert_eq!(snapshot.transport, TransportState::Playing, "it plays on");
+    let held = snapshot.source_frame;
 
-    let played = first.len() + before.len();
-    let (after, _) = play_for(
-        &mut session,
-        &fake,
-        MAX_BUFFER_FRAMES as usize,
-        (expected.len() - played) / 2,
-    );
-    let all = [first, before, after].concat();
-    assert_eq!(
-        bits(&all[..expected.len()]),
-        bits(&expected),
-        "no frame lost or repeated across the change"
-    );
+    // Past the ramp back in, the song plays sample-exact from where the
+    // ramp out held it: no frame lost or repeated.
+    let mut last = (Vec::new(), snapshot);
+    for _ in 0..4 {
+        last = step(&mut session, &fake, &monitor, MAX_BUFFER_FRAMES as usize);
+    }
+    let (out, snapshot) = last;
+    assert_eq!(snapshot.transport, TransportState::Playing, "it plays on");
+    let end = 2 * snapshot.source_frame as usize;
+    assert!(end / 2 > held as usize + 1_024);
+    assert_eq!(bits(&out), bits(&expected[end - out.len()..end]));
 
     // The same size again opens nothing.
     session.set_buffer_frames(MAX_BUFFER_FRAMES).unwrap();

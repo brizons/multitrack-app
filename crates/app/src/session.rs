@@ -391,6 +391,17 @@ enum Link {
     Lost,
 }
 
+/// A stream to open again once the transport has ramped out, so the
+/// device never stops or starts mid-signal.
+#[derive(Debug, Clone, Copy)]
+struct Reopen {
+    /// Play again once the stream is open.
+    resume: bool,
+    /// Messages sent when the ramp out was: a report that applied as many
+    /// shows how it went.
+    after: u64,
+}
+
 /// Where a play request stands.
 #[derive(Debug, Clone, Copy)]
 enum Start {
@@ -446,6 +457,10 @@ pub struct Session {
     /// give yet (the queue to the audio thread was full): every poll sends
     /// what is missing until they do.
     gains_pending: bool,
+    /// The stream opens again once this ramp out is over.
+    reopen: Option<Reopen>,
+    /// The operator's last transport command was a pause, stop or panic.
+    halted: bool,
 }
 
 /// A song folder opened for streaming with its player built, ready to play
@@ -578,6 +593,8 @@ impl PreparedSong {
             withdrawn_mix: None,
             click_gain,
             gains_pending: false,
+            reopen: None,
+            halted: false,
         };
         match session.open_held(state) {
             Ok((stream, home)) => {
@@ -652,9 +669,11 @@ impl Session {
     /// and to the outputs the players render ([`SessionOptions::routing`]):
     /// while the transport plays, every bus moves over the 20 ms gain ramp.
     /// A routing that needs more outputs than the stream opened with
-    /// reopens the stream with them, which interrupts the audio for as long
-    /// as the device takes to open again; one the device refuses then is
-    /// held as a lost device ([`RuntimeError::DeviceReopenFailed`]). Saving
+    /// opens the stream again with them: a playing transport pauses with
+    /// its ramp first and plays on from where it held once the stream is
+    /// open, so the device never stops or starts mid-signal; a device that
+    /// refuses then is held as a lost one
+    /// ([`RuntimeError::DeviceReopenFailed`]). Saving
     /// it for the device stays with the shell
     /// (`library::ConfigStore::save_routing`).
     pub fn set_routing(&mut self, routing: Routing) -> Result<(), RuntimeError> {
@@ -675,10 +694,12 @@ impl Session {
 
     /// Plays with a buffer of `frames` frames per callback from now on,
     /// [`MIN_BUFFER_FRAMES`] to [`MAX_BUFFER_FRAMES`] (F8.5); the latency it
-    /// adds is [`StreamInfo::latency`]. The stream opens again with it and
-    /// the transport goes on where it was, after a gap as long as the
-    /// device takes to open; the players stay as they are, since they render
-    /// any buffer in pieces of the size they were built with. A device that
+    /// adds is [`StreamInfo::latency`]. The stream opens again with it: a
+    /// playing transport pauses with its ramp first and plays on from where
+    /// it held once the stream is open (a pause, stop or panic sent
+    /// meanwhile wins), a silent one opens at once. The players stay as
+    /// they are, since they render any buffer in pieces of the size they
+    /// were built with. A device that
     /// refuses the size is held as a lost one, saying why
     /// ([`RuntimeError::DeviceReopenFailed`]), until a size it takes is set.
     pub fn set_buffer_frames(&mut self, frames: u32) -> Result<(), RuntimeError> {
@@ -750,6 +771,7 @@ impl Session {
 
     /// The second half of [`Self::poll`], on the report the first half read.
     pub(crate) fn end_poll(&mut self, report: &Report, now: Instant) -> Snapshot {
+        self.advance_reopen(report);
         self.advance_start(report, now);
         self.watch_disk(report);
         self.snapshot(report)
@@ -757,8 +779,22 @@ impl Session {
 
     fn dispatch(&mut self, command: Command) -> Result<(), RuntimeError> {
         match command {
-            Command::Play => return self.play(),
-            Command::Pause | Command::Stop | Command::Panic => self.start = None,
+            Command::Play => {
+                self.halted = false;
+                // Play waits for the stream that is about to open again.
+                if let Some(reopen) = &mut self.reopen {
+                    reopen.resume = true;
+                    return Ok(());
+                }
+                return self.play();
+            }
+            Command::Pause | Command::Stop | Command::Panic => {
+                self.halted = true;
+                self.start = None;
+                if let Some(reopen) = &mut self.reopen {
+                    reopen.resume = false;
+                }
+            }
             _ => {}
         }
         let engine_command = match command {
@@ -1047,6 +1083,9 @@ impl Session {
         };
         drop(stream);
         self.start = None;
+        // The device is gone: it opens with the session's request when it is
+        // back, and the transport stays paused, as after any loss.
+        self.reopen = None;
         let Some(mut state) = take_back(home) else {
             self.last_error = Some(RuntimeError::PlayerLost);
             return;
@@ -1180,9 +1219,60 @@ impl Session {
         }
     }
 
-    /// Closes the stream and opens the device again with the session's
-    /// request; the transport goes on where it was.
+    /// Opens the stream again with the session's request, without an edge:
+    /// a transport that plays pauses first, with its ramp, holding the
+    /// position, and plays on from there once the stream is open again
+    /// ([`Self::advance_reopen`]); a silent one reopens at once. A held deck
+    /// opens with the new request when the device is back.
     fn reopen_stream(&mut self) {
+        if !matches!(self.link, Link::Streaming { .. }) {
+            return;
+        }
+        if let Some(reopen) = &mut self.reopen {
+            reopen.after = self.sent;
+            return;
+        }
+        let transport = self.reports.read().status().transport;
+        if !transport.is_running() {
+            self.reopen_now();
+            return;
+        }
+        // A pause, stop or panic on its way ends silent on its own.
+        let resume = transport == Transport::Playing && !self.halted;
+        if resume && let Err(error) = self.forward(live::Command::Pause) {
+            // The queue is full: the stream reopens as it is.
+            self.last_error = Some(error);
+            self.reopen_now();
+            return;
+        }
+        self.reopen = Some(Reopen {
+            resume,
+            after: self.sent,
+        });
+    }
+
+    /// Opens the stream again once the report shows the ramp out over, and
+    /// plays on when the transport played before it.
+    fn advance_reopen(&mut self, report: &Report) {
+        let Some(reopen) = self.reopen else {
+            return;
+        };
+        if report.applied < reopen.after || report.status().transport.is_running() {
+            return;
+        }
+        self.reopen = None;
+        self.reopen_now();
+        if reopen.resume
+            && matches!(self.link, Link::Streaming { .. })
+            && let Err(error) = self.play()
+        {
+            self.last_error = Some(error);
+        }
+    }
+
+    /// Closes the stream and opens the device again with the session's
+    /// request.
+    fn reopen_now(&mut self) {
         let state = match mem::replace(&mut self.link, Link::Lost) {
             Link::Streaming { stream, home } => {
                 drop(stream);
@@ -1518,6 +1608,8 @@ impl Session {
         self.bind(info, monitor, tag);
         self.mix = mix;
         self.request.sample_rate = rate;
+        // This open takes any new request too.
+        self.reopen = None;
         self.open_or_hold(state, LossReason::StreamInvalidated);
         match self.link {
             Link::Lost => Err(RuntimeError::PlayerLost),
