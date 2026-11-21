@@ -8,6 +8,12 @@
 //! queries bars and clicks in source time through [`BeatGrid`]. A [`Setlist`]
 //! orders songs and click-only tiles; [`Setlist::validate`] checks it against
 //! what a [`SongLookup`] knows about the library's songs.
+//!
+//! Stems play through six [`Bus`]es: [`bus_for_stem`] picks one from the
+//! rules table, and an arrangement's [`ArrangementMix`] (stored in a song's
+//! `mix.json`, a [`MixFile`]) can send a stem elsewhere. [`effective_gains`]
+//! combines that mix with the global [`BusSettings`] into one gain per stem,
+//! and a [`Routing`] sends each bus to a device's outputs.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -18,6 +24,7 @@ pub mod grid;
 pub mod mix;
 pub mod mixer;
 pub mod package;
+pub mod routing;
 pub mod setlist;
 pub mod song;
 mod timeline;
@@ -40,6 +47,10 @@ pub use package::{
     ManifestError, MapKind, SectionMarker, SectionType, SongPackage, Stem, StemInfo,
     StemPathProblem, StemRole, TempoPoint, TimeSignaturePoint, Validated, ValidationError,
     ValidationWarning, validate,
+};
+pub use routing::{
+    Destination, MAX_OUTPUTS, ROUTING_FORMAT_VERSION, RouteTarget, Routing, RoutingError,
+    RoutingFile, RoutingValidationError,
 };
 pub use setlist::{
     ArrangementOutline, CROSSFADE_SECONDS, ClickItem, PositionBound, SETLIST_FORMAT_VERSION,
