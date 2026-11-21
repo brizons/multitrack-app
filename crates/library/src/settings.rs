@@ -8,7 +8,8 @@
 //! defaults. A file that cannot be read or parsed is reported, the defaults
 //! are used instead, and the file is left as it is until the user changes a
 //! setting, when the new one replaces it. A file with a newer `formatVersion`
-//! is never written over. Every write goes to a temporary file beside the
+//! is never written over, nor is a file whose version cannot be checked
+//! because it cannot be read. Every write goes to a temporary file beside the
 //! target, which is flushed to disk and then renamed over it, so a file is
 //! always either complete or untouched.
 
@@ -92,6 +93,19 @@ pub enum SettingsError {
         /// The version this version writes.
         supported: u32,
     },
+    /// A file is where the settings go, but it could not be read to check its
+    /// `formatVersion` (no permission, too large, or another read error), so
+    /// it was not written over.
+    #[error(
+        "{} was not written over, because its formatVersion could not be checked: {source}",
+        path.display()
+    )]
+    UncheckedVersion {
+        /// The file.
+        path: PathBuf,
+        /// Why it could not be read.
+        source: Box<SettingsError>,
+    },
     /// The file could not be written. An existing file is left as it was.
     #[error("cannot write {}: {source}", path.display())]
     Write {
@@ -160,8 +174,10 @@ fn read_error(folder: &Path, path: PathBuf, error: ConfinedReadError) -> Setting
 }
 
 /// Writes `json` as `file` inside `folder` (canonical), atomically, unless the
-/// file there now has a newer `formatVersion`: `parse` reads it to find out.
-/// A file that cannot be read or parsed is replaced.
+/// file there now has a newer `formatVersion` ([`SettingsError::NewerVersion`]),
+/// which `parse` reads to find out, or cannot be read to check it
+/// ([`SettingsError::UncheckedVersion`]). A file that reads but does not
+/// parse, or has an older version, is replaced.
 pub(crate) fn write_settings<T>(
     folder: &Path,
     file: &str,
@@ -169,7 +185,7 @@ pub(crate) fn write_settings<T>(
     parse: impl FnOnce(&str) -> Result<T, MixerFileError>,
 ) -> Result<(), SettingsError> {
     let path = folder.join(file);
-    if let Ok(text) = read_confined(folder, file, MAX_SETTINGS_FILE_BYTES)
+    if let Some(text) = current_text(folder, file)?
         && let Err(MixerFileError::UnsupportedFormatVersion {
             found, supported, ..
         }) = parse(&text)
@@ -182,6 +198,36 @@ pub(crate) fn write_settings<T>(
         });
     }
     write_file_atomically(&path, json).map_err(|source| SettingsError::Write { path, source })
+}
+
+/// The text now at `file` inside `folder` (canonical), for the version check
+/// before a write: `None` when nothing there can hold settings (no entry, a
+/// dangling link, a link out of the folder, a FIFO or a folder), which the
+/// write replaces without losing any (a folder then fails to be replaced).
+/// A file that is there but cannot be read (no permission, too large, any
+/// other read error) is [`SettingsError::UncheckedVersion`].
+fn current_text(folder: &Path, file: &str) -> Result<Option<String>, SettingsError> {
+    let path = folder.join(file);
+    let unchecked = |source| SettingsError::UncheckedVersion {
+        path: path.clone(),
+        source: Box::new(source),
+    };
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(unchecked(SettingsError::Read {
+                path: path.clone(),
+                source,
+            }));
+        }
+    }
+    match read_confined(folder, file, MAX_SETTINGS_FILE_BYTES) {
+        Ok(text) => Ok(Some(text)),
+        Err(ConfinedReadError::Outside | ConfinedReadError::NotAFile) => Ok(None),
+        Err(ConfinedReadError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(unchecked(read_error(folder, path.clone(), error))),
+    }
 }
 
 /// `to_json`'s result for `file` inside `folder`, as a [`SettingsError`].

@@ -99,6 +99,48 @@ fn windows_keeps_the_settings_in_appdata() {
 }
 
 #[test]
+fn a_relative_home_or_appdata_gives_no_folder() {
+    for home in ["ana", "./ana", "~/ana"] {
+        assert_eq!(
+            config_folder(Platform::MacOs, env(&[("HOME", home)])),
+            None,
+            "{home:?}"
+        );
+        assert_eq!(
+            config_folder(Platform::Linux, env(&[("HOME", home)])),
+            None,
+            "{home:?}"
+        );
+        assert_eq!(
+            config_folder(
+                Platform::Linux,
+                env(&[("XDG_CONFIG_HOME", "cfg"), ("HOME", home)])
+            ),
+            None,
+            "{home:?}"
+        );
+    }
+    for appdata in [r"AppData\Roaming", "C:AppData", r"\Users\ana", "/Users/ana"] {
+        assert_eq!(
+            config_folder(Platform::Windows, env(&[("APPDATA", appdata)])),
+            None,
+            "{appdata:?}"
+        );
+    }
+    for appdata in [
+        r"C:\Users\ana\AppData\Roaming",
+        "c:/Users/ana/AppData/Roaming",
+        r"\\server\share\ana\AppData",
+    ] {
+        assert_eq!(
+            config_folder(Platform::Windows, env(&[("APPDATA", appdata)])),
+            Some(Path::new(appdata).join("OpenVamp")),
+            "{appdata:?}"
+        );
+    }
+}
+
+#[test]
 fn linux_follows_xdg_config_home_then_dot_config() {
     assert_eq!(
         config_folder(
@@ -324,6 +366,72 @@ fn a_newer_file_is_reported_and_never_overwritten() {
         );
     }
     assert_eq!(entries(store.folder()), [BUS_SETTINGS_FILE, ROUTING_FILE]);
+}
+
+#[test]
+fn a_settings_file_too_large_to_check_is_not_written_over() {
+    let (_dir, store) = new_store();
+    fs::create_dir_all(store.folder()).unwrap();
+    let large = format!(
+        r#"{{ "formatVersion": 9, "pad": "{}" }}"#,
+        "x".repeat(library::MAX_SETTINGS_FILE_BYTES as usize)
+    );
+    for file in [BUS_SETTINGS_FILE, ROUTING_FILE] {
+        fs::write(store.folder().join(file), &large).unwrap();
+    }
+    let errors = [
+        store
+            .save_bus_settings(&some_settings())
+            .expect_err("unchecked"),
+        store.save_routing(&some_routing()).expect_err("unchecked"),
+    ];
+    for error in &errors {
+        assert!(
+            matches!(error, SettingsError::UncheckedVersion { source, .. } if matches!(**source, SettingsError::TooLarge { .. })),
+            "{error:?}"
+        );
+    }
+    for file in [BUS_SETTINGS_FILE, ROUTING_FILE] {
+        assert_eq!(
+            fs::read_to_string(store.folder().join(file)).unwrap(),
+            large
+        );
+    }
+    assert_eq!(entries(store.folder()), [BUS_SETTINGS_FILE, ROUTING_FILE]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_settings_file_the_check_cannot_read_is_not_written_over() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, store) = new_store();
+    fs::create_dir_all(store.folder()).unwrap();
+    let newer = r#"{"formatVersion":2}"#;
+    for file in [BUS_SETTINGS_FILE, ROUTING_FILE] {
+        let path = store.folder().join(file);
+        fs::write(&path, newer).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let results = [
+        store.save_bus_settings(&some_settings()),
+        store.save_routing(&some_routing()),
+    ];
+    for file in [BUS_SETTINGS_FILE, ROUTING_FILE] {
+        fs::set_permissions(store.folder().join(file), fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    for result in &results {
+        assert!(
+            matches!(result, Err(SettingsError::UncheckedVersion { .. })),
+            "{result:?}"
+        );
+    }
+    for file in [BUS_SETTINGS_FILE, ROUTING_FILE] {
+        assert_eq!(
+            fs::read_to_string(store.folder().join(file)).unwrap(),
+            newer
+        );
+    }
 }
 
 #[test]

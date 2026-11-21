@@ -16,7 +16,7 @@
 //! ([`ConfigStore::new`]). The folder is created on the first write; until
 //! then, and whenever a file is missing, the settings are the defaults.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -66,28 +66,51 @@ impl Platform {
 ///   `XDG_CONFIG_HOME` is unset, empty or relative, as the XDG Base
 ///   Directory specification says.
 ///
-/// `None` when the variable it needs is unset or empty. Nothing on disk is
-/// looked at.
+/// `None` when the variable it needs is unset, empty or relative, so the
+/// settings never land below the current folder. Whether a path is absolute
+/// follows `platform`, not the system this runs on: `/` starts one on macOS
+/// and Linux, and a drive (`C:\`) or a share (`\\server`) on Windows. Nothing
+/// on disk is looked at.
 pub fn config_folder(
     platform: Platform,
     var: impl Fn(&str) -> Option<OsString>,
 ) -> Option<PathBuf> {
-    let set = |name: &str| {
+    let absolute = |name: &str| {
         var(name)
-            .filter(|value| !value.is_empty())
+            .filter(|value| is_absolute_on(platform, value))
             .map(PathBuf::from)
     };
     match platform {
-        Platform::MacOs => set("HOME").map(|home| {
+        Platform::MacOs => absolute("HOME").map(|home| {
             home.join("Library")
                 .join("Application Support")
                 .join("OpenVamp")
         }),
-        Platform::Windows => set("APPDATA").map(|appdata| appdata.join("OpenVamp")),
-        Platform::Linux => set("XDG_CONFIG_HOME")
-            .filter(|folder| folder.has_root())
-            .or_else(|| set("HOME").map(|home| home.join(".config")))
+        Platform::Windows => absolute("APPDATA").map(|appdata| appdata.join("OpenVamp")),
+        Platform::Linux => absolute("XDG_CONFIG_HOME")
+            .or_else(|| absolute("HOME").map(|home| home.join(".config")))
             .map(|folder| folder.join("openvamp")),
+    }
+}
+
+/// Whether `path` is absolute on `platform`: it starts with `/` on macOS and
+/// Linux, and with a drive and a separator (`C:\`, `c:/`) or two separators
+/// (a share, `\\server`) on Windows.
+fn is_absolute_on(platform: Platform, path: &OsStr) -> bool {
+    let path = path.to_string_lossy();
+    let separator = |c: char| c == '\\' || c == '/';
+    match platform {
+        Platform::MacOs | Platform::Linux => path.starts_with('/'),
+        Platform::Windows => {
+            let mut chars = path.chars();
+            match (chars.next(), chars.next(), chars.next()) {
+                (Some(drive), Some(':'), Some(slash)) => {
+                    drive.is_ascii_alphabetic() && separator(slash)
+                }
+                (Some(first), Some(second), _) => separator(first) && separator(second),
+                _ => false,
+            }
+        }
     }
 }
 

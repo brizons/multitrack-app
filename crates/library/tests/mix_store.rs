@@ -266,9 +266,36 @@ fn a_missing_song_folder_is_reported() {
     assert!(!missing.exists(), "a song folder is never created");
 }
 
+#[test]
+fn a_mix_too_large_to_check_is_not_written_over() {
+    let (_dir, folder, _song) = song_folder();
+    let large = format!(
+        r#"{{ "formatVersion": 2, "pad": "{}" }}"#,
+        "x".repeat(MAX_SETTINGS_FILE_BYTES as usize)
+    );
+    fs::write(folder.join(MIX_FILE), &large).unwrap();
+    let error = write_mix(&folder, &a_mix()).expect_err("the version cannot be checked");
+    match &error {
+        SettingsError::UncheckedVersion { path, source } => {
+            assert!(path.ends_with(MIX_FILE));
+            assert!(
+                matches!(**source, SettingsError::TooLarge { .. }),
+                "{source:?}"
+            );
+        }
+        other => panic!("expected an unchecked version, got {other:?}"),
+    }
+    assert!(
+        error.to_string().contains("was not written over"),
+        "{error}"
+    );
+    assert_eq!(fs::read_to_string(folder.join(MIX_FILE)).unwrap(), large);
+    assert_eq!(entries(&folder), [MIX_FILE, MANIFEST_FILE]);
+}
+
 #[cfg(unix)]
 mod unix {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -280,6 +307,28 @@ mod unix {
             .status()
             .unwrap();
         assert!(status.success(), "mkfifo {}", path.display());
+    }
+
+    #[test]
+    fn a_newer_mix_the_check_cannot_read_is_not_written_over() {
+        let (_dir, folder, _song) = song_folder();
+        fs::write(folder.join(MIX_FILE), r#"{"formatVersion":2}"#).unwrap();
+        fs::set_permissions(folder.join(MIX_FILE), fs::Permissions::from_mode(0o000)).unwrap();
+        let result = write_mix(&folder, &a_mix());
+        fs::set_permissions(folder.join(MIX_FILE), fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(folder.join(MIX_FILE)).unwrap(),
+            r#"{"formatVersion":2}"#
+        );
+        assert!(
+            matches!(
+                result,
+                Err(SettingsError::UncheckedVersion { ref source, .. })
+                    if matches!(**source, SettingsError::Read { .. })
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]
