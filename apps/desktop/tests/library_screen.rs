@@ -1409,7 +1409,76 @@ fn a_drag_disarms_the_removal() {
     page.act(LibraryAction::RemoveSetlist);
     assert_eq!(remove_label(&page), ARMED);
 
-    page.drag_over(Dragged::Setlist(0), 2, Half::Lower);
+    page.start_drag();
+    assert_eq!(remove_label(&page), "Remove", "starting a drag disarms");
 
-    assert_eq!(remove_label(&page), "Remove");
+    page.act(LibraryAction::RemoveSetlist);
+    assert_eq!(remove_label(&page), ARMED);
+    page.drag_over(Dragged::Setlist(0), 2, Half::Lower);
+    assert_eq!(remove_label(&page), "Remove", "dragging over a row disarms");
+}
+
+#[test]
+fn a_new_drag_dropped_before_it_is_over_a_row_uses_no_old_line() {
+    let (dir, mut page) = four_items();
+    let insertion = |page: &LibraryPage| page.view(None).editor.unwrap().insertion;
+    let files = setlist_files(dir.path());
+
+    // A drag that ended where no drop arrived leaves its line behind; the
+    // same row dragged again and dropped at once lands nowhere.
+    page.drag_over(Dragged::Item(2), 0, Half::Upper);
+    assert_eq!(insertion(&page), Some(0));
+    page.start_drag();
+    assert_eq!(insertion(&page), None, "a new drag starts with no line");
+    page.drop_dragged(Dragged::Item(2));
+    assert_eq!(setlist_files(dir.path()), files);
+
+    // A drop for another row than the line was worked out for clears it.
+    page.drag_over(Dragged::Item(2), 0, Half::Upper);
+    page.drop_dragged(Dragged::Item(1));
+    assert_eq!(insertion(&page), None);
+    page.drop_dragged(Dragged::Item(2));
+    assert_eq!(setlist_files(dir.path()), files);
+}
+
+#[test]
+fn after_a_drop_the_open_details_stay_on_the_same_item() {
+    let selected_item = |page: &LibraryPage| {
+        let row = page
+            .view(None)
+            .editor
+            .unwrap()
+            .rows
+            .iter()
+            .position(|row| row.selected)
+            .expect("a row is selected");
+        on_disk(page).items[row].clone()
+    };
+    for (selected, from, to) in [
+        // The moved item, down and up.
+        (0, 0, 3),
+        (3, 3, 0),
+        // An item it passes, inside the span and at its far end.
+        (2, 0, 3),
+        (3, 0, 3),
+        (1, 3, 0),
+        (0, 3, 0),
+        // An item outside the span.
+        (3, 0, 2),
+        (0, 3, 1),
+    ] {
+        let (_dir, mut page) = four_items();
+        page.act(LibraryAction::SelectRow(selected));
+        let item = selected_item(&page);
+        let before = on_disk(&page).items;
+
+        page.act(LibraryAction::DropItem { from, to });
+
+        assert_ne!(on_disk(&page).items, before, "{from} moved to {to}");
+        assert_eq!(
+            selected_item(&page),
+            item,
+            "row {selected} selected, {from} dropped at {to}"
+        );
+    }
 }

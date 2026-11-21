@@ -382,6 +382,14 @@ impl Perform {
         }
     }
 
+    /// A drag of a row starts.
+    pub fn library_drag_started(&mut self, cx: &mut Context<Self>) {
+        if let Some(library) = &mut self.library {
+            library.start_drag();
+            cx.notify();
+        }
+    }
+
     /// A drag of `dragged` is over row `over` of its list, in its `half`.
     pub fn library_drag_over(
         &mut self,

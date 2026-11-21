@@ -246,10 +246,19 @@ impl LibraryPage {
         self.insertion = drop_index(from, slot, len).map(|_| (dragged, slot));
     }
 
+    /// A drag starts: no line shows until it is over a row, whatever an
+    /// earlier drag that never dropped left behind. Dragging disarms the
+    /// remove controls.
+    pub fn start_drag(&mut self) {
+        self.armed = None;
+        self.insertion = None;
+    }
+
     /// The drag of `dragged` was dropped on its list: it moves to where
     /// the insertion line shows ([`LibraryAction::DropItem`],
     /// [`LibraryAction::DropSetlist`]), or nowhere without a line.
     pub fn drop_dragged(&mut self, dragged: Dragged) {
+        // Taken either way: a line worked out for another row never lasts.
         let Some((shown, slot)) = self.insertion.take() else {
             return;
         };

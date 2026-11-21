@@ -59,7 +59,10 @@ impl Render for DragPreview {
     }
 }
 
-fn drag_preview(label: &SharedString, cx: &mut App) -> Entity<DragPreview> {
+/// Starts a drag on `screen` and builds what follows the pointer: the
+/// dragged row's `label`.
+fn start_drag(screen: &Entity<Perform>, label: &SharedString, cx: &mut App) -> Entity<DragPreview> {
+    screen.update(cx, |screen, cx| screen.library_drag_started(cx));
     let label = label.clone();
     cx.new(|_| DragPreview { label })
 }
@@ -435,7 +438,12 @@ fn setlist_row(
                 index,
                 label: row.name.clone().into(),
             },
-            |dragged, _, _, cx| drag_preview(&dragged.label, cx),
+            {
+                let screen = cx.entity();
+                move |dragged: &DraggedSetlist, _, _, cx: &mut App| {
+                    start_drag(&screen, &dragged.label, cx)
+                }
+            },
         )
         .on_drag_move(cx.listener(
             move |screen, event: &DragMoveEvent<DraggedSetlist>, _, cx| {
@@ -752,7 +760,12 @@ fn editor_row(
                 index,
                 label: row.title.clone().into(),
             },
-            |dragged, _, _, cx| drag_preview(&dragged.label, cx),
+            {
+                let screen = cx.entity();
+                move |dragged: &DraggedItem, _, _, cx: &mut App| {
+                    start_drag(&screen, &dragged.label, cx)
+                }
+            },
         )
         .on_drag_move(
             cx.listener(move |screen, event: &DragMoveEvent<DraggedItem>, _, cx| {
