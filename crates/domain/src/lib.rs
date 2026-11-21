@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod bus;
 pub mod compile;
 pub mod grid;
 pub mod package;
@@ -19,6 +20,7 @@ pub mod setlist;
 pub mod song;
 mod timeline;
 
+pub use bus::{Bus, DEFAULT_BUS, bus_for_name, bus_for_stem};
 pub use compile::{
     ClickEvent, ClickLevel, CompileError, CompileOptions, CueEvent, CueTiming,
     DEFAULT_SEAM_CROSSFADE, RenderPlan, Segment, compile, seam_fade,
